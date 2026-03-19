@@ -1,0 +1,12 @@
+Source: ros-jazzy-ros2-medkit-gateway
+Section: misc
+Priority: optional
+Maintainer: bburda <bartoszburda93@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), libcpp-httplib-dev, libssl-dev, nlohmann-json3-dev, ros-jazzy-action-msgs, ros-jazzy-ament-cmake, ros-jazzy-ament-cmake-clang-format <!nocheck>, ros-jazzy-ament-cmake-clang-tidy <!nocheck>, ros-jazzy-ament-cmake-gtest <!nocheck>, ros-jazzy-ament-index-cpp, ros-jazzy-ament-lint-auto <!nocheck>, ros-jazzy-ament-lint-common <!nocheck>, ros-jazzy-rcl-interfaces, ros-jazzy-rclcpp, ros-jazzy-ros2-medkit-msgs, ros-jazzy-ros2-medkit-serialization, ros-jazzy-rosidl-typesupport-cpp, ros-jazzy-rosidl-typesupport-introspection-cpp, ros-jazzy-sensor-msgs, ros-jazzy-std-msgs, ros-jazzy-std-srvs, ros-jazzy-yaml-cpp-vendor, ros-jazzy-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-ros2-medkit-gateway
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libcpp-httplib-dev, libssl-dev, nlohmann-json3-dev, ros-jazzy-action-msgs, ros-jazzy-ament-index-cpp, ros-jazzy-rcl-interfaces, ros-jazzy-rclcpp, ros-jazzy-ros2-medkit-msgs, ros-jazzy-ros2-medkit-serialization, ros-jazzy-rosidl-parser, ros-jazzy-rosidl-runtime-py, ros-jazzy-rosidl-typesupport-cpp, ros-jazzy-rosidl-typesupport-introspection-cpp, ros-jazzy-sensor-msgs, ros-jazzy-std-msgs, ros-jazzy-std-srvs, ros-jazzy-yaml-cpp-vendor, ros-jazzy-ros-workspace
+Description: HTTP gateway for ros2_medkit diagnostics system
