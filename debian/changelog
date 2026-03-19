@@ -1,0 +1,60 @@
+ros-jazzy-ros2-medkit-gateway (0.3.0-2noble) noble; urgency=high
+
+  * Gateway plugin framework with dynamic C++ plugin loading (#237 <https://github.com/selfpatch/ros2_medkit/pull/237>)
+  * Software updates plugin with 8 SOVD-compliant endpoints (#237 <https://github.com/selfpatch/ros2_medkit/pull/237>, #231 <https://github.com/selfpatch/ros2_medkit/pull/231>)
+  * SSE-based periodic data subscriptions for real-time streaming without polling (#223 <https://github.com/selfpatch/ros2_medkit/pull/223>)
+  * Global ``DELETE /api/v1/faults`` endpoint (#228 <https://github.com/selfpatch/ros2_medkit/pull/228>)
+  * Return HEALED/PREPASSED faults via status filter (#218 <https://github.com/selfpatch/ros2_medkit/pull/218>)
+  * Bulk data upload and delete endpoints (#216 <https://github.com/selfpatch/ros2_medkit/pull/216>)
+  * Token-bucket rate limiting middleware, configurable per-endpoint (#220 <https://github.com/selfpatch/ros2_medkit/pull/220>)
+  * Reduce lock contention in ConfigurationManager (#194 <https://github.com/selfpatch/ros2_medkit/pull/194>)
+  * Cache component topic map to avoid per-request graph rebuild (#212 <https://github.com/selfpatch/ros2_medkit/pull/212>)
+  * Require cpp-httplib >= 0.14 in pkg-config check (#230 <https://github.com/selfpatch/ros2_medkit/pull/230>)
+  * Add missing ``ament_index_cpp`` dependency to ``package.xml`` (#191 <https://github.com/selfpatch/ros2_medkit/pull/191>)
+  * Unit tests for HealthHandlers, DataHandlers, and AuthHandlers (#232 <https://github.com/selfpatch/ros2_medkit/pull/232>, #234 <https://github.com/selfpatch/ros2_medkit/pull/234>, #233 <https://github.com/selfpatch/ros2_medkit/pull/233>)
+  * Standardize include guards to ``#pragma once`` (#192 <https://github.com/selfpatch/ros2_medkit/pull/192>)
+  * Use ``foreach`` loop for CMake coverage flags (#193 <https://github.com/selfpatch/ros2_medkit/pull/193>)
+  * Migrate ``ament_target_dependencies`` to compat shim for Rolling (#242 <https://github.com/selfpatch/ros2_medkit/pull/242>)
+  * Multi-distro CI support for ROS 2 Humble, Jazzy, and Rolling (#219 <https://github.com/selfpatch/ros2_medkit/pull/219>, #242 <https://github.com/selfpatch/ros2_medkit/pull/242>)
+  * Contributors: @bburda, @eclipse0922, @mfaferek93
+
+ -- bburda <bartoszburda93@gmail.com>  Thu, 26 Feb 2026 23:00:00 -0000
+
+ros-jazzy-ros2-medkit-gateway (0.2.0-2noble) noble; urgency=high
+
+  * Initial rosdistro release
+  * HTTP REST gateway for ros2_medkit diagnostics system
+  * SOVD-compatible entity discovery with four entity types:
+    
+      * Areas, Components, Apps, Functions
+      * HATEOAS links and capabilities in all responses
+      * Relationship endpoints (subareas, subcomponents, related-apps, hosts)
+    
+  * Three discovery modes:
+    
+      * Runtime-only: automatic ROS 2 graph introspection
+      * Manifest-only: YAML manifest with validation (11 rules)
+      * Hybrid: manifest as source of truth + runtime linking
+    
+  * REST API endpoints:
+    
+      * Fault management: GET/POST/DELETE /api/v1/faults
+      * Data access: topic sampling via GenericSubscription
+      * Operations: service calls and action goals via GenericClient
+      * Configuration: parameter get/set via ROS 2 parameter API
+      * Snapshots: GET /api/v1/faults/{code}/snapshots
+      * Rosbag: GET /api/v1/faults/{code}/snapshots/bag
+    
+  * Server-Sent Events (SSE) at /api/v1/faults/stream:
+    
+      * Multi-client support with thread-safe event queue
+      * Keepalive, Last-Event-ID reconnection, configurable max_clients
+    
+  * JWT-based authentication with configurable policies
+  * HTTPS/TLS support via OpenSSL and cpp-httplib
+  * Native C++ ROS 2 serialization via ros2_medkit_serialization (no CLI dependencies)
+  * Contributors: Bartosz Burda, Michal Faferek
+
+ -- bburda <bartoszburda93@gmail.com>  Fri, 06 Feb 2026 23:00:00 -0000
+
+
