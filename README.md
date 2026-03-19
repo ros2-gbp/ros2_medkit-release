@@ -1,249 +1,145 @@
-# ros2_medkit
+# ros2_medkit_integration_tests
 
-[![CI](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml/badge.svg)](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/selfpatch/ros2_medkit/branch/main/graph/badge.svg)](https://codecov.io/gh/selfpatch/ros2_medkit)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selfpatch.github.io/ros2_medkit/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![ROS 2 Jazzy](https://img.shields.io/badge/ROS%202-Jazzy-blue)](https://docs.ros.org/en/jazzy/)
-[![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-blue)](https://docs.ros.org/en/humble/)
-[![ROS 2 Rolling](https://img.shields.io/badge/ROS%202-Rolling-orange)](https://docs.ros.org/en/rolling/)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/6CXPMApAyq)
-[![Quality Level 3](https://img.shields.io/badge/Quality-Level%203-yellow)](QUALITY_DECLARATION.md)
+Integration tests, demo nodes, and shared test utilities for ros2_medkit.
 
-<p align="center">
-  <img src="hero-full.gif" alt="Robots break. Now you'll know why." width="600">
-</p>
+## Overview
 
-<p align="center">
-  <b>Automotive-grade diagnostics for ROS 2 robots.</b><br>
-  When your robot fails, find out why — in minutes, not hours.
-</p>
+This package contains everything needed to validate the ros2_medkit system
+end-to-end:
 
-<p align="center">
-  Fault correlation · Black-box recording · REST API · <a href="https://github.com/selfpatch/ros2_medkit_mcp">AI via MCP</a>
-</p>
+- **Demo nodes** -- automotive-themed C++ nodes (sensors, actuators, services,
+  actions) that produce realistic ROS 2 traffic for testing
+- **Feature tests** -- focused tests that validate individual API features
+  (data access, operations, faults, SSE, CORS, auth, etc.)
+- **Scenario tests** -- end-to-end stories that exercise multi-step workflows
+  (fault lifecycle, action execution, discovery modes, subscriptions, etc.)
+- **Shared test library** (`ros2_medkit_test_utils`) -- base test case,
+  launch helpers, and assertion utilities shared across all test files
 
-## 🚀 Quick Start
+## Package Structure
 
-**Try the full demo** (Docker, no ROS 2 needed):
-
-```bash
-git clone https://github.com/selfpatch/selfpatch_demos.git
-cd selfpatch_demos/demos/turtlebot3_integration
-./run-demo.sh --headless
-# → API: http://localhost:8080/api/v1/  Web UI: http://localhost:3000
+```
+ros2_medkit_integration_tests/
+  demo_nodes/           # C++ demo node sources
+  launch/               # demo_nodes.launch.py
+  ros2_medkit_test_utils/
+    __init__.py
+    constants.py        # DEFAULT_PORT, timeouts
+    coverage.py         # GCOV_PREFIX helpers for CI
+    gateway_test_case.py  # GatewayTestCase base class
+    launch_helpers.py   # create_test_launch(), DEMO_NODE_REGISTRY
+  test/
+    features/           # Focused API feature tests
+    scenarios/          # End-to-end workflow tests
 ```
 
-**Build from source** (ROS 2 Jazzy, Humble, or Rolling):
+## Running Tests
 
 ```bash
-git clone --recurse-submodules https://github.com/selfpatch/ros2_medkit.git
-cd ros2_medkit
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install && source install/setup.bash
-ros2 launch ros2_medkit_gateway gateway.launch.py
-# → http://localhost:8080/api/v1/areas
-```
-
-For more examples, see our [Postman collection](postman/).
-
-## ✨ Features
-
-| Feature | Status | Description |
-|---------|--------|-------------|
-| 🔍 Discovery | **Available** | Automatically discover running nodes, topics, services, and actions |
-| 📊 Data | **Available** | Read and write topic data via REST |
-| ⚙️ Operations | **Available** | Call services and actions with execution tracking |
-| 🔧 Configurations | **Available** | Read, write, and reset node parameters |
-| 🚨 Faults | **Available** | Query, inspect, and clear faults with environment data and snapshots |
-| 📦 Bulk Data | **Available** | Upload, download, and manage files (calibration, firmware, rosbags) |
-| 📡 Subscriptions | **Available** | Stream live data and fault events via SSE |
-| 🔄 Software Updates | **Available** | Async prepare/execute lifecycle with pluggable backends |
-| 🔒 Authentication | **Available** | JWT-based RBAC (viewer, operator, configurator, admin) |
-| 📋 Logs | Planned | Log sources, entries, and configuration |
-| 🔁 Entity Lifecycle | Planned | Start, restart, shutdown control |
-| 🔐 Modes & Locking | Planned | Target mode control and resource locking |
-| 📝 Scripts | Planned | Diagnostic script upload and execution |
-| 🧹 Clear Data | Planned | Clear cached and learned diagnostic data |
-| 📞 Communication Logs | Planned | Protocol-level communication logging |
-
-## 📖 Overview
-
-ros2_medkit models a robot as a **diagnostic entity tree**:
-
-| Entity | Description | Example |
-|--------|-------------|---------|
-| **Area** | Physical or logical domain | `base`, `arm`, `safety`, `navigation` |
-| **Component** | Hardware or software component within an area | `motor_controller`, `lidar_driver` |
-| **Function** | Capability provided by one or more components | `localization`, `obstacle_detection` |
-| **App** | Deployable software unit | node, container, process |
-
-Compatible with the **SOVD (Service-Oriented Vehicle Diagnostics)** model — same concepts across robots, vehicles, and embedded systems.
-
-## 📋 Requirements
-
-- **OS:** Ubuntu 24.04 LTS (Jazzy / Rolling) or Ubuntu 22.04 LTS (Humble)
-- **ROS 2:** Jazzy Jalisco, Humble Hawksbill, or Rolling (experimental)
-- **Compiler:** GCC 11+ (C++17 support)
-- **Build System:** colcon + ament_cmake
-
-## 📚 Documentation
-
-- 📖 [Full Documentation](https://selfpatch.github.io/ros2_medkit/)
-- 🗺️ [Roadmap](https://selfpatch.github.io/ros2_medkit/roadmap.html)
-- 📋 [GitHub Milestones](https://github.com/selfpatch/ros2_medkit/milestones)
-
-## 💬 Community
-
-We'd love to have you join our community!
-
-- **💬 Discord** — [Join our server](https://discord.gg/6CXPMApAyq) for discussions, help, and announcements
-- **🐛 Issues** — [Report bugs or request features](https://github.com/selfpatch/ros2_medkit/issues)
-- **💡 Discussions** — [GitHub Discussions](https://github.com/selfpatch/ros2_medkit/discussions) for Q&A and ideas
-
----
-
-## 🛠️ Development
-
-This section is for contributors and developers who want to build and test ros2_medkit locally.
-
-### Pre-commit Hooks
-
-This project uses [pre-commit](https://pre-commit.com/) to automatically run
-`clang-format`, `flake8`, and other checks on staged files before each commit.
-
-```bash
-pip install pre-commit
-pre-commit install
-```
-
-To run all hooks against every file (useful after first setup):
-
-```bash
-pre-commit run --all-files
-```
-
-### Installing Dependencies
-
-```bash
-rosdep install --from-paths src --ignore-src -r -y
-```
-
-### Building
-
-```bash
+# Build everything
 colcon build --symlink-install
-```
-
-### Testing
-
-Run all tests:
-
-```bash
 source install/setup.bash
-colcon test
+
+# All integration tests
+colcon test --packages-select ros2_medkit_integration_tests
 colcon test-result --verbose
+
+# Single test
+colcon test --packages-select ros2_medkit_integration_tests \
+  --ctest-args -R test_data_read
+
+# Feature tests only
+colcon test --packages-select ros2_medkit_integration_tests \
+  --ctest-args -L feature
+
+# Scenario tests only
+colcon test --packages-select ros2_medkit_integration_tests \
+  --ctest-args -L scenario
 ```
 
-Run linters:
+## Demo Nodes
+
+Launch all demo nodes for manual testing or the web UI:
 
 ```bash
-source install/setup.bash
-colcon test --ctest-args -L linters
-colcon test-result --verbose
+ros2 launch ros2_medkit_integration_tests demo_nodes.launch.py
 ```
 
-Run only unit tests (everything except integration):
+| Node | Namespace | Type | Description |
+|------|-----------|------|-------------|
+| `temp_sensor` | `/powertrain/engine` | Publisher | Engine temperature (2 Hz) |
+| `rpm_sensor` | `/powertrain/engine` | Publisher | RPM readings (2 Hz) |
+| `pressure_sensor` | `/chassis/brakes` | Publisher | Brake pressure (2 Hz) |
+| `status_sensor` | `/body/door/front_left` | Publisher | Door open/closed (0.5 Hz) |
+| `lidar_sensor` | `/perception/lidar` | Publisher + Fault reporter | LaserScan with fault detection |
+| `actuator` | `/chassis/brakes` | Subscriber + Publisher | Brake actuator (command/feedback) |
+| `controller` | `/body/lights` | Subscriber + Publisher | Light controller (command/status) |
+| `calibration` | `/powertrain/engine` | Service | Trigger-based calibration |
+| `long_calibration` | `/powertrain/engine` | Action | Fibonacci-based long-running action |
+
+## Writing New Tests
+
+### Feature Test Template
+
+Feature tests validate a single API capability:
+
+```python
+from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
+from ros2_medkit_test_utils.launch_helpers import create_test_launch
+
+def generate_test_description():
+    return create_test_launch(
+        demo_nodes=['temp_sensor'],
+        fault_manager=False,
+    )
+
+class TestMyFeature(GatewayTestCase):
+    MIN_EXPECTED_APPS = 1
+    REQUIRED_APPS = {'temp_sensor'}
+
+    def test_something(self):
+        data = self.get_json('/apps')
+        self.assertGreater(len(data['items']), 0)
+```
+
+### Scenario Test Template
+
+Scenario tests exercise multi-step workflows with numbered test methods:
+
+```python
+class TestMyScenario(GatewayTestCase):
+    MIN_EXPECTED_APPS = 2
+    REQUIRED_APPS = {'lidar_sensor'}
+
+    def test_01_first_step(self):
+        """Step 1 description. @verifies REQ_XXX"""
+        ...
+
+    def test_02_second_step(self):
+        """Step 2 depends on step 1."""
+        ...
+```
+
+### Key GatewayTestCase Methods
+
+- `get_json(path)` -- GET request, assert 200, return parsed JSON
+- `delete_request(path, expected_status)` -- DELETE with status check
+- `assert_entity_exists(entity_type, entity_id)` -- GET entity, assert exists
+- `assert_entity_list_contains(entity_type, ids)` -- assert IDs in list
+- `wait_for_fault(endpoint, fault_code)` -- poll until fault appears
+- `wait_for_operation(endpoint, op_id)` -- poll until operation discovered
+- `create_execution(endpoint, op_id, input_data)` -- POST to create execution
+- `wait_for_execution_status(endpoint, statuses)` -- poll execution status
+
+## Requirements Traceability
+
+Tests are tagged with `# @verifies REQ_XXX` in docstrings. Run the
+verification script to update the traceability matrix:
 
 ```bash
-source install/setup.bash
-colcon test --ctest-args -E test_integration
-colcon test-result --verbose
+python scripts/generate_verification.py
 ```
 
-Run only integration tests:
+## License
 
-```bash
-source install/setup.bash
-colcon test --ctest-args -R test_integration
-colcon test-result --verbose
-```
-
-### Code Coverage
-
-To generate code coverage reports locally:
-
-1. Build with coverage flags enabled:
-
-```bash
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
-```
-
-2. Run tests:
-
-```bash
-source install/setup.bash
-colcon test --ctest-args -LE linter
-```
-
-3. Generate coverage report:
-
-```bash
-lcov --capture --directory build --output-file coverage.raw.info --ignore-errors mismatch,negative
-lcov --extract coverage.raw.info '*/ros2_medkit/src/*/src/*' '*/ros2_medkit/src/*/include/*' --output-file coverage.info --ignore-errors unused
-lcov --list coverage.info
-```
-
-4. (Optional) Generate HTML report:
-
-```bash
-genhtml coverage.info --output-directory coverage_html
-```
-
-Then open `coverage_html/index.html` in your browser.
-
-### CI/CD
-
-All pull requests and pushes to main are automatically built and tested using GitHub Actions.
-The CI workflow runs a build matrix across **ROS 2 Jazzy** (Ubuntu 24.04), **ROS 2 Humble** (Ubuntu 22.04), and **ROS 2 Rolling** (Ubuntu 24.04, allow-failure) and consists of the following jobs:
-
-**build-and-test** (matrix: Jazzy + Humble + Rolling):
-
-- Full build and unit/integration tests on all distros
-- Rolling jobs are allowed to fail (best-effort forward-compatibility)
-- Code linting and formatting checks (clang-format, clang-tidy) — Jazzy only
-
-**coverage** (Jazzy only):
-
-- Builds with coverage instrumentation (Debug mode)
-- Runs unit tests only (for stable coverage metrics)
-- Generates lcov coverage report (available as artifact)
-- Uploads coverage to Codecov (only on push to main)
-
-After every run the workflow uploads test results and coverage reports as artifacts for debugging and review.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Whether it's bug reports, feature requests, documentation improvements, or code contributions — we appreciate your help.
-
-1. Read our [Contributing Guidelines](CONTRIBUTING.md)
-2. Check out [good first issues](https://github.com/selfpatch/ros2_medkit/labels/good%20first%20issue) for beginners
-3. Follow our [Code of Conduct](CODE_OF_CONDUCT.md)
-
-## 🔒 Security
-
-If you discover a security vulnerability, please follow the responsible disclosure process in [SECURITY.md](SECURITY.md).
-
-## 📄 License
-
-This project is licensed under the **Apache License 2.0** — see the [LICENSE](LICENSE) file for details.
-
----
-
-<p align="center">
-  Made with ❤️ by the <a href="https://github.com/selfpatch">selfpatch</a> community
-  <br>
-  <a href="https://discord.gg/6CXPMApAyq">💬 Join us on Discord</a>
-</p>
+Apache-2.0
