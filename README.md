@@ -1,249 +1,351 @@
-# ros2_medkit
+# ros2_medkit_fault_manager
 
-[![CI](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml/badge.svg)](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/selfpatch/ros2_medkit/branch/main/graph/badge.svg)](https://codecov.io/gh/selfpatch/ros2_medkit)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selfpatch.github.io/ros2_medkit/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![ROS 2 Jazzy](https://img.shields.io/badge/ROS%202-Jazzy-blue)](https://docs.ros.org/en/jazzy/)
-[![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-blue)](https://docs.ros.org/en/humble/)
-[![ROS 2 Rolling](https://img.shields.io/badge/ROS%202-Rolling-orange)](https://docs.ros.org/en/rolling/)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/6CXPMApAyq)
-[![Quality Level 3](https://img.shields.io/badge/Quality-Level%203-yellow)](QUALITY_DECLARATION.md)
+Central fault manager node for the ros2_medkit fault management system.
 
-<p align="center">
-  <img src="hero-full.gif" alt="Robots break. Now you'll know why." width="600">
-</p>
+## Overview
 
-<p align="center">
-  <b>Automotive-grade diagnostics for ROS 2 robots.</b><br>
-  When your robot fails, find out why — in minutes, not hours.
-</p>
+The FaultManager node provides a central point for fault aggregation and lifecycle management.
+It receives fault reports from multiple sources, aggregates them by `fault_code`, and provides
+query and clearing interfaces.
 
-<p align="center">
-  Fault correlation · Black-box recording · REST API · <a href="https://github.com/selfpatch/ros2_medkit_mcp">AI via MCP</a>
-</p>
+## Quick Start
 
-## 🚀 Quick Start
-
-**Try the full demo** (Docker, no ROS 2 needed):
+By default, faults are confirmed immediately when reported - no additional configuration needed.
 
 ```bash
-git clone https://github.com/selfpatch/selfpatch_demos.git
-cd selfpatch_demos/demos/turtlebot3_integration
-./run-demo.sh --headless
-# → API: http://localhost:8080/api/v1/  Web UI: http://localhost:3000
+# Start the fault manager
+ros2 launch ros2_medkit_fault_manager fault_manager.launch.py
+
+# Report a fault - it's immediately CONFIRMED
+ros2 service call /fault_manager/report_fault ros2_medkit_msgs/srv/ReportFault \
+  "{fault_code: 'MOTOR_OVERHEAT', event_type: 0, severity: 2, description: 'Motor temp exceeded', source_id: '/motor_node'}"
+
+# Query faults
+ros2 service call /fault_manager/list_faults ros2_medkit_msgs/srv/ListFaults \
+  "{statuses: ['CONFIRMED']}"
+
+# Clear a fault
+ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
+  "{fault_code: 'MOTOR_OVERHEAT'}"
 ```
 
-**Build from source** (ROS 2 Jazzy, Humble, or Rolling):
+## Services
 
-```bash
-git clone --recurse-submodules https://github.com/selfpatch/ros2_medkit.git
-cd ros2_medkit
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install && source install/setup.bash
-ros2 launch ros2_medkit_gateway gateway.launch.py
-# → http://localhost:8080/api/v1/areas
+| Service | Type | Description |
+|---------|------|-------------|
+| `~/report_fault` | `ros2_medkit_msgs/srv/ReportFault` | Report a fault occurrence |
+| `~/list_faults` | `ros2_medkit_msgs/srv/ListFaults` | Query faults with filtering |
+| `~/clear_fault` | `ros2_medkit_msgs/srv/ClearFault` | Clear/acknowledge a fault |
+| `~/get_snapshots` | `ros2_medkit_msgs/srv/GetSnapshots` | Get topic snapshots for a fault |
+
+## Features
+
+- **Multi-source aggregation**: Same `fault_code` from different sources creates a single fault
+- **Occurrence tracking**: Counts total reports and tracks all reporting sources
+- **Severity escalation**: Fault severity is updated if a higher severity is reported
+- **Persistent storage**: SQLite backend ensures faults survive node restarts
+- **Debounce filtering** (optional): AUTOSAR DEM-style counter-based fault confirmation
+- **Snapshot capture**: Captures topic data when faults are confirmed for debugging (snapshots are deleted when fault is cleared)
+- **Fault correlation** (optional): Root cause analysis with symptom muting and auto-clear
+
+## Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `storage_type` | string | `"sqlite"` | Storage backend: `"sqlite"` or `"memory"` |
+| `database_path` | string | `"/var/lib/ros2_medkit/faults.db"` | Path to SQLite database file |
+| `confirmation_threshold` | int | `-1` | Counter value at which faults are confirmed |
+| `healing_enabled` | bool | `false` | Enable automatic healing via PASSED events |
+| `healing_threshold` | int | `3` | Counter value at which faults are healed |
+| `auto_confirm_after_sec` | double | `0.0` | Auto-confirm PREFAILED faults after timeout (0 = disabled) |
+
+### Snapshot Parameters
+
+Snapshots capture topic data when faults are confirmed for post-mortem debugging.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `snapshots.enabled` | bool | `true` | Enable/disable snapshot capture |
+| `snapshots.background_capture` | bool | `false` | Use background subscriptions (caches latest message) vs on-demand capture |
+| `snapshots.timeout_sec` | double | `1.0` | Timeout waiting for topic message (on-demand mode) |
+| `snapshots.max_message_size` | int | `65536` | Maximum message size in bytes (larger messages skipped) |
+| `snapshots.default_topics` | string[] | `[]` | Topics to capture for all faults |
+| `snapshots.config_file` | string | `""` | Path to YAML config for `fault_specific` and `patterns` |
+
+**Topic Resolution Priority:**
+1. `fault_specific` - Exact match for fault code (configured via YAML config file)
+2. `patterns` - Regex pattern match (configured via YAML config file)
+3. `default_topics` - Fallback for all faults
+
+**Example YAML config file** (`snapshots.yaml`):
+```yaml
+fault_specific:
+  MOTOR_OVERHEAT:
+    - /joint_states
+    - /motor/temperature
+patterns:
+  "MOTOR_.*":
+    - /joint_states
+    - /cmd_vel
 ```
 
-For more examples, see our [Postman collection](postman/).
+### Storage Backends
 
-## ✨ Features
+**SQLite (default)**: Faults are persisted to disk and survive node restarts. Uses WAL mode for optimal performance.
 
-| Feature | Status | Description |
-|---------|--------|-------------|
-| 🔍 Discovery | **Available** | Automatically discover running nodes, topics, services, and actions |
-| 📊 Data | **Available** | Read and write topic data via REST |
-| ⚙️ Operations | **Available** | Call services and actions with execution tracking |
-| 🔧 Configurations | **Available** | Read, write, and reset node parameters |
-| 🚨 Faults | **Available** | Query, inspect, and clear faults with environment data and snapshots |
-| 📦 Bulk Data | **Available** | Upload, download, and manage files (calibration, firmware, rosbags) |
-| 📡 Subscriptions | **Available** | Stream live data and fault events via SSE |
-| 🔄 Software Updates | **Available** | Async prepare/execute lifecycle with pluggable backends |
-| 🔒 Authentication | **Available** | JWT-based RBAC (viewer, operator, configurator, admin) |
-| 📋 Logs | Planned | Log sources, entries, and configuration |
-| 🔁 Entity Lifecycle | Planned | Start, restart, shutdown control |
-| 🔐 Modes & Locking | Planned | Target mode control and resource locking |
-| 📝 Scripts | Planned | Diagnostic script upload and execution |
-| 🧹 Clear Data | Planned | Clear cached and learned diagnostic data |
-| 📞 Communication Logs | Planned | Protocol-level communication logging |
+**Memory**: Faults are stored in memory only. Useful for testing or when persistence is not required.
 
-## 📖 Overview
+## Usage
 
-ros2_medkit models a robot as a **diagnostic entity tree**:
-
-| Entity | Description | Example |
-|--------|-------------|---------|
-| **Area** | Physical or logical domain | `base`, `arm`, `safety`, `navigation` |
-| **Component** | Hardware or software component within an area | `motor_controller`, `lidar_driver` |
-| **Function** | Capability provided by one or more components | `localization`, `obstacle_detection` |
-| **App** | Deployable software unit | node, container, process |
-
-Compatible with the **SOVD (Service-Oriented Vehicle Diagnostics)** model — same concepts across robots, vehicles, and embedded systems.
-
-## 📋 Requirements
-
-- **OS:** Ubuntu 24.04 LTS (Jazzy / Rolling) or Ubuntu 22.04 LTS (Humble)
-- **ROS 2:** Jazzy Jalisco, Humble Hawksbill, or Rolling (experimental)
-- **Compiler:** GCC 11+ (C++17 support)
-- **Build System:** colcon + ament_cmake
-
-## 📚 Documentation
-
-- 📖 [Full Documentation](https://selfpatch.github.io/ros2_medkit/)
-- 🗺️ [Roadmap](https://selfpatch.github.io/ros2_medkit/roadmap.html)
-- 📋 [GitHub Milestones](https://github.com/selfpatch/ros2_medkit/milestones)
-
-## 💬 Community
-
-We'd love to have you join our community!
-
-- **💬 Discord** — [Join our server](https://discord.gg/6CXPMApAyq) for discussions, help, and announcements
-- **🐛 Issues** — [Report bugs or request features](https://github.com/selfpatch/ros2_medkit/issues)
-- **💡 Discussions** — [GitHub Discussions](https://github.com/selfpatch/ros2_medkit/discussions) for Q&A and ideas
-
----
-
-## 🛠️ Development
-
-This section is for contributors and developers who want to build and test ros2_medkit locally.
-
-### Pre-commit Hooks
-
-This project uses [pre-commit](https://pre-commit.com/) to automatically run
-`clang-format`, `flake8`, and other checks on staged files before each commit.
+### Launch
 
 ```bash
-pip install pre-commit
-pre-commit install
+# Default (SQLite storage, immediate confirmation)
+ros2 launch ros2_medkit_fault_manager fault_manager.launch.py
+
+# With custom database path
+ros2 run ros2_medkit_fault_manager fault_manager_node --ros-args \
+  -p database_path:=/custom/path/faults.db
+
+# With in-memory storage (no persistence)
+ros2 run ros2_medkit_fault_manager fault_manager_node --ros-args \
+  -p storage_type:=memory
 ```
 
-To run all hooks against every file (useful after first setup):
+## Advanced: Debounce Filtering
+
+For systems that need to filter transient faults, enable debounce filtering by setting a lower `confirmation_threshold`.
+
+### Configuration
 
 ```bash
-pre-commit run --all-files
+ros2 run ros2_medkit_fault_manager fault_manager_node --ros-args \
+  -p confirmation_threshold:=-3 \
+  -p healing_enabled:=true \
+  -p healing_threshold:=3
 ```
 
-### Installing Dependencies
+### How It Works
 
-```bash
-rosdep install --from-paths src --ignore-src -r -y
+The fault manager uses an AUTOSAR DEM-style debounce model:
+
+- **FAILED events** (fault detected): Decrement the internal counter
+- **PASSED events** (fault cleared): Increment the internal counter
+- Fault becomes **CONFIRMED** when counter reaches `confirmation_threshold`
+- Fault becomes **HEALED** when counter reaches `healing_threshold` (if enabled)
+
+### Fault Lifecycle with Debounce
+
+```
+     FAILED events          PASSED events
+          |                      |
+          v                      v
+   [counter--]             [counter++]
+          |                      |
+          v                      v
+PREFAILED -----> CONFIRMED -----> HEALED (retained)
+  (counter     (counter <=     (counter >=
+   < 0)         threshold)      healing)
+                    |
+                    v
+                CLEARED (manual via ~/clear_fault)
 ```
 
-### Building
+### Status Reference
+
+| Status | Description |
+|--------|-------------|
+| `PREFAILED` | Debounce counter < 0, not yet confirmed |
+| `CONFIRMED` | Fault is active and verified |
+| `HEALED` | Resolved via PASSED events (if healing enabled) |
+| `CLEARED` | Manually acknowledged via `~/clear_fault` |
+
+### Testing Debounce
 
 ```bash
-colcon build --symlink-install
+# Report FAILED events (need 3 to confirm with threshold=-3)
+ros2 service call /fault_manager/report_fault ros2_medkit_msgs/srv/ReportFault \
+  "{fault_code: 'SENSOR_FAIL', event_type: 0, severity: 2, description: 'Sensor timeout', source_id: '/sensor'}"
+
+# Report PASSED event (fault condition cleared)
+ros2 service call /fault_manager/report_fault ros2_medkit_msgs/srv/ReportFault \
+  "{fault_code: 'SENSOR_FAIL', event_type: 1, severity: 0, description: '', source_id: '/sensor'}"
+
+# Query all statuses including PREFAILED
+ros2 service call /fault_manager/list_faults ros2_medkit_msgs/srv/ListFaults \
+  "{statuses: ['PREFAILED', 'CONFIRMED', 'HEALED']}"
 ```
 
-### Testing
+Event types: `0` = EVENT_FAILED, `1` = EVENT_PASSED
 
-Run all tests:
+### Immediate Confirmation
+
+CRITICAL severity faults bypass debounce and are immediately CONFIRMED, regardless of threshold.
+
+## Advanced: Fault Correlation
+
+Fault correlation reduces noise by identifying relationships between faults. When enabled, symptom faults
+(effects of a root cause) can be muted and auto-cleared when the root cause is resolved.
+
+### Correlation Modes
+
+**Hierarchical**: Defines explicit root cause → symptoms relationships. When a root cause fault occurs,
+subsequent matching symptom faults within a time window are correlated and optionally muted.
+
+**Auto-Cluster**: Automatically groups related faults that match a pattern within a time window.
+Useful for detecting "storms" of related faults (e.g., communication errors).
+
+### Configuration
+
+Enable correlation by providing a YAML configuration file:
 
 ```bash
+ros2 run ros2_medkit_fault_manager fault_manager_node --ros-args \
+  -p correlation.config_file:=/path/to/correlation.yaml
+```
+
+### Correlation Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `correlation.config_file` | string | `""` | Path to correlation YAML config (empty = disabled) |
+| `correlation.cleanup_interval_sec` | double | `5.0` | Interval for cleaning up expired pending correlations (seconds) |
+
+### Configuration File Format
+
+```yaml
+correlation:
+  enabled: true
+  default_window_ms: 500  # Default time window for symptom detection
+
+  # Reusable fault patterns (supports wildcards with *)
+  patterns:
+    motor_errors:
+      codes: ["MOTOR_COMM_*", "MOTOR_TIMEOUT_*"]
+    drive_faults:
+      codes: ["DRIVE_*"]
+    comm_errors:
+      codes: ["*_COMM_*", "*_TIMEOUT"]
+
+  rules:
+    # Hierarchical rule: E-Stop causes motor and drive faults
+    - id: estop_cascade
+      name: "E-Stop Cascade"
+      mode: hierarchical
+      root_cause:
+        codes: ["ESTOP_001", "ESTOP_002"]
+      symptoms:
+        - pattern: motor_errors
+        - pattern: drive_faults
+      window_ms: 1000           # Symptoms within 1s of root cause
+      mute_symptoms: true       # Don't publish symptom events
+      auto_clear_with_root: true # Clear symptoms when root cause clears
+
+    # Auto-cluster rule: Group communication errors
+    - id: comm_storm
+      name: "Communication Storm"
+      mode: auto_cluster
+      match:
+        - pattern: comm_errors
+      min_count: 3              # Need 3 faults to form cluster
+      window_ms: 500            # Within 500ms
+      show_as_single: true      # Only show representative fault
+      representative: highest_severity  # first | most_recent | highest_severity
+```
+
+### Pattern Wildcards
+
+Patterns support `*` wildcard matching:
+- `MOTOR_*` matches `MOTOR_COMM`, `MOTOR_TIMEOUT`, `MOTOR_DRIVE_FAULT`
+- `*_COMM_*` matches `MOTOR_COMM_FL`, `SENSOR_COMM_TIMEOUT`
+- `*_TIMEOUT` matches `MOTOR_TIMEOUT`, `SENSOR_TIMEOUT`
+
+### Querying Correlation Data
+
+Use `include_muted` and `include_clusters` to retrieve correlation information:
+
+```bash
+# Get faults with muted fault details
+ros2 service call /fault_manager/list_faults ros2_medkit_msgs/srv/ListFaults \
+  "{statuses: ['CONFIRMED'], include_muted: true, include_clusters: true}"
+```
+
+Response includes:
+- `muted_count`: Number of muted symptom faults
+- `cluster_count`: Number of active fault clusters
+- `muted_faults[]`: Details of muted faults (when `include_muted=true`)
+- `clusters[]`: Details of active clusters (when `include_clusters=true`)
+
+### REST API (via Gateway)
+
+Query parameters for GET `/api/v1/faults`:
+- `include_muted=true`: Include muted fault details in response
+- `include_clusters=true`: Include cluster details in response
+
+Response fields:
+```json
+{
+  "faults": [...],
+  "count": 5,
+  "muted_count": 2,
+  "cluster_count": 1,
+  "muted_faults": [
+    {
+      "fault_code": "MOTOR_COMM_FL",
+      "root_cause_code": "ESTOP_001",
+      "rule_id": "estop_cascade",
+      "delay_ms": 50
+    }
+  ],
+  "clusters": [
+    {
+      "cluster_id": "comm_storm_1",
+      "rule_id": "comm_storm",
+      "rule_name": "Communication Storm",
+      "representative_code": "SENSOR_TIMEOUT",
+      "representative_severity": "CRITICAL",
+      "fault_codes": ["MOTOR_COMM_FL", "SENSOR_TIMEOUT", "DRIVE_COMM_ERR"],
+      "count": 3,
+      "first_at": 1705678901.123,
+      "last_at": 1705678901.456
+    }
+  ]
+}
+```
+
+When clearing a root cause fault, `auto_cleared_codes` lists symptoms that were auto-cleared:
+```json
+{
+  "status": "success",
+  "fault_code": "ESTOP_001",
+  "message": "Fault cleared",
+  "auto_cleared_codes": ["MOTOR_COMM_FL", "MOTOR_COMM_FR", "DRIVE_FAULT"]
+}
+```
+
+### Example: E-Stop Cascade
+
+1. E-Stop is triggered → `ESTOP_001` fault reported
+2. Motors lose power → `MOTOR_COMM_FL`, `MOTOR_COMM_FR` faults reported
+3. Correlation engine detects motor faults are symptoms of E-Stop
+4. Motor faults are muted (not published as events, but stored)
+5. Dashboard shows only `ESTOP_001` (root cause)
+6. When E-Stop is cleared → Motor faults are auto-cleared
+
+## Building
+
+```bash
+colcon build --packages-select ros2_medkit_fault_manager
 source install/setup.bash
-colcon test
+```
+
+## Testing
+
+```bash
+colcon test --packages-select ros2_medkit_fault_manager
 colcon test-result --verbose
 ```
 
-Run linters:
+## License
 
-```bash
-source install/setup.bash
-colcon test --ctest-args -L linters
-colcon test-result --verbose
-```
-
-Run only unit tests (everything except integration):
-
-```bash
-source install/setup.bash
-colcon test --ctest-args -E test_integration
-colcon test-result --verbose
-```
-
-Run only integration tests:
-
-```bash
-source install/setup.bash
-colcon test --ctest-args -R test_integration
-colcon test-result --verbose
-```
-
-### Code Coverage
-
-To generate code coverage reports locally:
-
-1. Build with coverage flags enabled:
-
-```bash
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
-```
-
-2. Run tests:
-
-```bash
-source install/setup.bash
-colcon test --ctest-args -LE linter
-```
-
-3. Generate coverage report:
-
-```bash
-lcov --capture --directory build --output-file coverage.raw.info --ignore-errors mismatch,negative
-lcov --extract coverage.raw.info '*/ros2_medkit/src/*/src/*' '*/ros2_medkit/src/*/include/*' --output-file coverage.info --ignore-errors unused
-lcov --list coverage.info
-```
-
-4. (Optional) Generate HTML report:
-
-```bash
-genhtml coverage.info --output-directory coverage_html
-```
-
-Then open `coverage_html/index.html` in your browser.
-
-### CI/CD
-
-All pull requests and pushes to main are automatically built and tested using GitHub Actions.
-The CI workflow runs a build matrix across **ROS 2 Jazzy** (Ubuntu 24.04), **ROS 2 Humble** (Ubuntu 22.04), and **ROS 2 Rolling** (Ubuntu 24.04, allow-failure) and consists of the following jobs:
-
-**build-and-test** (matrix: Jazzy + Humble + Rolling):
-
-- Full build and unit/integration tests on all distros
-- Rolling jobs are allowed to fail (best-effort forward-compatibility)
-- Code linting and formatting checks (clang-format, clang-tidy) — Jazzy only
-
-**coverage** (Jazzy only):
-
-- Builds with coverage instrumentation (Debug mode)
-- Runs unit tests only (for stable coverage metrics)
-- Generates lcov coverage report (available as artifact)
-- Uploads coverage to Codecov (only on push to main)
-
-After every run the workflow uploads test results and coverage reports as artifacts for debugging and review.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Whether it's bug reports, feature requests, documentation improvements, or code contributions — we appreciate your help.
-
-1. Read our [Contributing Guidelines](CONTRIBUTING.md)
-2. Check out [good first issues](https://github.com/selfpatch/ros2_medkit/labels/good%20first%20issue) for beginners
-3. Follow our [Code of Conduct](CODE_OF_CONDUCT.md)
-
-## 🔒 Security
-
-If you discover a security vulnerability, please follow the responsible disclosure process in [SECURITY.md](SECURITY.md).
-
-## 📄 License
-
-This project is licensed under the **Apache License 2.0** — see the [LICENSE](LICENSE) file for details.
-
----
-
-<p align="center">
-  Made with ❤️ by the <a href="https://github.com/selfpatch">selfpatch</a> community
-  <br>
-  <a href="https://discord.gg/6CXPMApAyq">💬 Join us on Discord</a>
-</p>
+Apache-2.0
