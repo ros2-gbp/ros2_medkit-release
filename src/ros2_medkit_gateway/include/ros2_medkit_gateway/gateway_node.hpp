@@ -1,0 +1,159 @@
+// Copyright 2025 bburda, mfaferek93
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+#include <atomic>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
+#include <rclcpp/rclcpp.hpp>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "ros2_medkit_gateway/auth/auth_config.hpp"
+#include "ros2_medkit_gateway/bulk_data_store.hpp"
+#include "ros2_medkit_gateway/config.hpp"
+#include "ros2_medkit_gateway/configuration_manager.hpp"
+#include "ros2_medkit_gateway/data_access_manager.hpp"
+#include "ros2_medkit_gateway/discovery/discovery_manager.hpp"
+#include "ros2_medkit_gateway/fault_manager.hpp"
+#include "ros2_medkit_gateway/http/rate_limiter.hpp"
+#include "ros2_medkit_gateway/http/rest_server.hpp"
+#include "ros2_medkit_gateway/models/thread_safe_entity_cache.hpp"
+#include "ros2_medkit_gateway/operation_manager.hpp"
+#include "ros2_medkit_gateway/plugins/plugin_manager.hpp"
+#include "ros2_medkit_gateway/subscription_manager.hpp"
+#include "ros2_medkit_gateway/updates/update_manager.hpp"
+
+namespace ros2_medkit_gateway {
+
+class GatewayNode : public rclcpp::Node {
+ public:
+  GatewayNode();
+  ~GatewayNode() override;
+
+  /**
+   * @brief Get the thread-safe entity cache with O(1) lookups
+   * @return Reference to ThreadSafeEntityCache
+   */
+  const ThreadSafeEntityCache & get_thread_safe_cache() const;
+
+  /**
+   * @brief Get the DataAccessManager instance
+   * @return Raw pointer to DataAccessManager (valid for lifetime of GatewayNode)
+   * @note The returned pointer is valid as long as the GatewayNode exists.
+   *       REST server is stopped before GatewayNode destruction to ensure safe access.
+   */
+  DataAccessManager * get_data_access_manager() const;
+
+  /**
+   * @brief Get the OperationManager instance
+   * @return Raw pointer to OperationManager (valid for lifetime of GatewayNode)
+   */
+  OperationManager * get_operation_manager() const;
+
+  /**
+   * @brief Get the DiscoveryManager instance
+   * @return Raw pointer to DiscoveryManager (valid for lifetime of GatewayNode)
+   */
+  DiscoveryManager * get_discovery_manager() const;
+
+  /**
+   * @brief Get the ConfigurationManager instance
+   * @return Raw pointer to ConfigurationManager (valid for lifetime of GatewayNode)
+   */
+  ConfigurationManager * get_configuration_manager() const;
+
+  /**
+   * @brief Get the FaultManager instance
+   * @return Raw pointer to FaultManager (valid for lifetime of GatewayNode)
+   */
+  FaultManager * get_fault_manager() const;
+
+  /**
+   * @brief Get the BulkDataStore instance
+   * @return Raw pointer to BulkDataStore (valid for lifetime of GatewayNode)
+   */
+  BulkDataStore * get_bulk_data_store() const;
+
+  /**
+   * @brief Get the SubscriptionManager instance
+   * @return Raw pointer to SubscriptionManager (valid for lifetime of GatewayNode)
+   */
+  SubscriptionManager * get_subscription_manager() const;
+
+  /**
+   * @brief Get the UpdateManager instance
+   * @return Raw pointer to UpdateManager (valid for lifetime of GatewayNode), or nullptr if disabled
+   */
+  UpdateManager * get_update_manager() const;
+
+  /**
+   * @brief Get the PluginManager instance
+   * @return Raw pointer to PluginManager (valid for lifetime of GatewayNode)
+   */
+  PluginManager * get_plugin_manager() const;
+
+ private:
+  void refresh_cache();
+  void start_rest_server();
+  void stop_rest_server();
+
+  // Configuration parameters
+  std::string server_host_;
+  int server_port_;
+  int refresh_interval_ms_;
+  CorsConfig cors_config_;
+  AuthConfig auth_config_;
+  RateLimitConfig rate_limit_config_;
+  TlsConfig tls_config_;
+
+  // Managers
+  std::unique_ptr<DiscoveryManager> discovery_mgr_;
+  std::unique_ptr<DataAccessManager> data_access_mgr_;
+  std::unique_ptr<OperationManager> operation_mgr_;
+  std::unique_ptr<ConfigurationManager> config_mgr_;
+  std::unique_ptr<FaultManager> fault_mgr_;
+  std::unique_ptr<BulkDataStore> bulk_data_store_;
+  std::unique_ptr<SubscriptionManager> subscription_mgr_;
+  // IMPORTANT: plugin_mgr_ BEFORE update_mgr_ - C++ destroys in reverse order,
+  // so update_mgr_ waits for async tasks before plugin_mgr_ destroys the plugin.
+  // plugin_ctx_ is owned here (outlives plugins); plugin_mgr_ holds a non-owning ref.
+  std::unique_ptr<PluginContext> plugin_ctx_;
+  std::unique_ptr<PluginManager> plugin_mgr_;
+  std::unique_ptr<UpdateManager> update_mgr_;
+  std::unique_ptr<RESTServer> rest_server_;
+
+  // Cache with thread safety
+  ThreadSafeEntityCache thread_safe_cache_;
+
+  // Timer for periodic refresh
+  rclcpp::TimerBase::SharedPtr refresh_timer_;
+
+  // Timer for periodic cleanup of old action goals
+  rclcpp::TimerBase::SharedPtr cleanup_timer_;
+
+  // Timer for periodic cleanup of expired cyclic subscriptions
+  rclcpp::TimerBase::SharedPtr subscription_cleanup_timer_;
+
+  // REST server thread management
+  std::unique_ptr<std::thread> server_thread_;
+  std::atomic<bool> server_running_{false};
+  std::mutex server_mutex_;
+  std::condition_variable server_cv_;
+};
+
+}  // namespace ros2_medkit_gateway
