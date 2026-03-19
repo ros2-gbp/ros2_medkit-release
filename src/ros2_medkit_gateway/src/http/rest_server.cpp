@@ -1,0 +1,1094 @@
+// Copyright 2025 mfaferek93
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "ros2_medkit_gateway/http/rest_server.hpp"
+
+#include <exception>
+#include <rclcpp/rclcpp.hpp>
+#include <stdexcept>
+#include <type_traits>
+
+#include "ros2_medkit_gateway/auth/auth_middleware.hpp"
+#include "ros2_medkit_gateway/gateway_node.hpp"
+#include "ros2_medkit_gateway/http/error_codes.hpp"
+#include "ros2_medkit_gateway/http/http_utils.hpp"
+
+namespace ros2_medkit_gateway {
+
+namespace {
+
+void set_internal_server_error(httplib::Response & res, const std::string & details) {
+  nlohmann::json error;
+  error["error_code"] = ERR_INTERNAL_ERROR;
+  error["message"] = "Internal server error";
+  error["parameters"] = nlohmann::json::object();
+  error["parameters"]["details"] = details;
+
+  res.status = 500;
+  res.set_content(error.dump(2), "application/json");
+}
+
+struct HttplibExceptionHandlerAdapter {
+  // Newer cpp-httplib versions pass std::exception_ptr.
+  void operator()(const httplib::Request & /*req*/, httplib::Response & res, const std::exception_ptr & ep) const {
+    try {
+      if (ep) {
+        std::rethrow_exception(ep);
+      }
+      RCLCPP_ERROR(rclcpp::get_logger("rest_server"), "Unhandled empty exception_ptr");
+      set_internal_server_error(res, "Unknown exception");
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(rclcpp::get_logger("rest_server"), "Unhandled exception: %s", e.what());
+      set_internal_server_error(res, e.what());
+    } catch (...) {
+      RCLCPP_ERROR(rclcpp::get_logger("rest_server"), "Unknown exception caught");
+      set_internal_server_error(res, "Unknown exception");
+    }
+  }
+
+  // Older cpp-httplib versions pass std::exception directly.
+  void operator()(const httplib::Request & /*req*/, httplib::Response & res, const std::exception & e) const {
+    RCLCPP_ERROR(rclcpp::get_logger("rest_server"), "Unhandled exception: %s", e.what());
+    set_internal_server_error(res, e.what());
+  }
+};
+
+static_assert(std::is_constructible_v<httplib::Server::ExceptionHandler, HttplibExceptionHandlerAdapter>,
+              "cpp-httplib exception handler signature changed; update HttplibExceptionHandlerAdapter");
+
+}  // namespace
+
+RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, const CorsConfig & cors_config,
+                       const AuthConfig & auth_config, const RateLimitConfig & rate_limit_config,
+                       const TlsConfig & tls_config)
+  : node_(node)
+  , host_(host)
+  , port_(port)
+  , cors_config_(cors_config)
+  , auth_config_(auth_config)
+  , tls_config_(tls_config) {
+  // Create HTTP/HTTPS server manager
+  http_server_ = std::make_unique<HttpServerManager>(tls_config_);
+
+  // Set maximum payload size for uploads (cpp-httplib default is 8MB)
+  auto * srv = http_server_->get_server();
+  if (srv) {
+    size_t max_payload = node_->get_bulk_data_store() ? node_->get_bulk_data_store()->max_upload_bytes() : 0;
+    if (max_payload > 0) {
+      srv->set_payload_max_length(max_payload);
+      RCLCPP_INFO(rclcpp::get_logger("rest_server"), "Max payload length set to %zu bytes", max_payload);
+    }
+  }
+
+  // Initialize auth manager and middleware if auth is enabled
+  if (auth_config_.enabled) {
+    auth_manager_ = std::make_unique<AuthManager>(auth_config_);
+    auth_middleware_ = std::make_unique<AuthMiddleware>(auth_config_, auth_manager_.get());
+    RCLCPP_INFO(rclcpp::get_logger("rest_server"), "Authentication enabled - algorithm: %s, require_auth_for: %s",
+                algorithm_to_string(auth_config_.jwt_algorithm).c_str(),
+                auth_config_.require_auth_for == AuthRequirement::NONE    ? "none"
+                : auth_config_.require_auth_for == AuthRequirement::WRITE ? "write"
+                                                                          : "all");
+  }
+
+  // Initialize rate limiter if enabled
+  if (rate_limit_config.enabled) {
+    rate_limiter_ = std::make_unique<RateLimiter>(rate_limit_config);
+    RCLCPP_INFO(rclcpp::get_logger("rest_server"), "Rate limiting enabled - global: %d rpm, per-client: %d rpm",
+                rate_limit_config.global_requests_per_minute, rate_limit_config.client_requests_per_minute);
+  }
+
+  // Create handler context and domain-specific handlers
+  handler_ctx_ = std::make_unique<handlers::HandlerContext>(node_, cors_config_, auth_config_, tls_config_,
+                                                            auth_manager_.get(), node_->get_bulk_data_store());
+
+  health_handlers_ = std::make_unique<handlers::HealthHandlers>(*handler_ctx_);
+  discovery_handlers_ = std::make_unique<handlers::DiscoveryHandlers>(*handler_ctx_);
+  data_handlers_ = std::make_unique<handlers::DataHandlers>(*handler_ctx_);
+  operation_handlers_ = std::make_unique<handlers::OperationHandlers>(*handler_ctx_);
+  config_handlers_ = std::make_unique<handlers::ConfigHandlers>(*handler_ctx_);
+  fault_handlers_ = std::make_unique<handlers::FaultHandlers>(*handler_ctx_);
+  auth_handlers_ = std::make_unique<handlers::AuthHandlers>(*handler_ctx_);
+  auto max_sse_clients = static_cast<size_t>(node_->get_parameter("sse.max_clients").as_int());
+  sse_client_tracker_ = std::make_shared<SSEClientTracker>(max_sse_clients);
+  sse_fault_handler_ = std::make_unique<handlers::SSEFaultHandler>(*handler_ctx_, sse_client_tracker_);
+  bulkdata_handlers_ = std::make_unique<handlers::BulkDataHandlers>(*handler_ctx_);
+  cyclic_sub_handlers_ = std::make_unique<handlers::CyclicSubscriptionHandlers>(
+      *handler_ctx_, *node_->get_subscription_manager(), sse_client_tracker_);
+
+  if (node_->get_update_manager()) {
+    update_handlers_ = std::make_unique<handlers::UpdateHandlers>(*handler_ctx_, node_->get_update_manager());
+  }
+
+  // Set up global error handlers for SOVD GenericError compliance
+  setup_global_error_handlers();
+  // Set up pre-routing handler for CORS and Authentication
+  setup_pre_routing_handler();
+  setup_routes();
+
+  // Register plugin custom routes
+  if (node_->get_plugin_manager()) {
+    auto * plugin_srv = http_server_->get_server();
+    if (plugin_srv) {
+      node_->get_plugin_manager()->register_routes(*plugin_srv, API_BASE_PATH);
+    }
+  }
+}
+
+void RESTServer::setup_pre_routing_handler() {
+  httplib::Server * srv = http_server_->get_server();
+  if (!srv) {
+    return;
+  }
+
+  // Set up pre-routing handler for CORS and Authentication
+  // This handler runs before any route handler
+  srv->set_pre_routing_handler([this](const httplib::Request & req, httplib::Response & res) {
+    // 1. Handle CORS (existing logic)
+    if (cors_config_.enabled) {
+      std::string origin = req.get_header_value("Origin");
+      bool origin_allowed = !origin.empty() && is_origin_allowed(origin);
+
+      if (origin_allowed) {
+        set_cors_headers(res, origin);
+        // Add Authorization header to allowed headers for CORS
+        if (auth_config_.enabled) {
+          std::string current_headers = res.get_header_value("Access-Control-Allow-Headers");
+          if (!current_headers.empty() && current_headers.find("Authorization") == std::string::npos) {
+            res.set_header("Access-Control-Allow-Headers", current_headers + ", Authorization");
+          }
+        }
+      }
+
+      // 2. Handle preflight OPTIONS requests
+      if (req.method == "OPTIONS") {
+        if (origin_allowed) {
+          res.set_header("Access-Control-Max-Age", std::to_string(cors_config_.max_age_seconds));
+          res.status = 204;
+        } else {
+          res.status = 403;
+        }
+        return httplib::Server::HandlerResponse::Handled;
+      }
+    }
+
+    // 3. Rate limiting check. If rejected, return Handled (CORS headers already set)
+    if (rate_limiter_ && rate_limiter_->is_enabled() && req.method != "OPTIONS") {
+      auto rl_result = rate_limiter_->check(req.remote_addr, req.path);
+      RateLimiter::apply_headers(rl_result, res);
+      if (!rl_result.allowed) {
+        RateLimiter::apply_rejection(rl_result, res);
+        return httplib::Server::HandlerResponse::Handled;
+      }
+    }
+
+    // 1. Handle CORS (existing logic)
+
+    // Handle Authentication if enabled
+    if (auth_middleware_ && auth_middleware_->is_enabled()) {
+      // Use AuthMiddleware to process the request
+      auto auth_request = AuthMiddleware::from_httplib_request(req);
+      auto result = auth_middleware_->process(auth_request);
+
+      if (!result.allowed) {
+        AuthMiddleware::apply_to_response(result, res);
+        return httplib::Server::HandlerResponse::Handled;
+      }
+    }
+
+    return httplib::Server::HandlerResponse::Unhandled;
+  });
+}
+
+void RESTServer::setup_global_error_handlers() {
+  httplib::Server * srv = http_server_->get_server();
+  if (!srv) {
+    return;
+  }
+
+  // Global error handler - catches HTTP errors like 404 Not Found
+  // Only set error content if no content has been set by a handler
+  srv->set_error_handler([](const httplib::Request & /*req*/, httplib::Response & res) {
+    // If the response already has content (from a handler's send_error), don't overwrite it
+    if (!res.body.empty()) {
+      return;
+    }
+
+    nlohmann::json error;
+    error["error_code"] = ERR_RESOURCE_NOT_FOUND;
+    error["message"] = "Resource not found";
+    error["parameters"] = nlohmann::json::object();
+    error["parameters"]["status"] = res.status;
+
+    res.set_content(error.dump(2), "application/json");
+  });
+
+  // Global exception handler - catches unhandled exceptions in route handlers
+  srv->set_exception_handler(HttplibExceptionHandlerAdapter{});
+}
+
+RESTServer::~RESTServer() {
+  stop();
+}
+
+void RESTServer::setup_routes() {
+  httplib::Server * srv = http_server_->get_server();
+  if (!srv) {
+    throw std::runtime_error("No server instance available for route setup");
+  }
+
+  // Health check
+  srv->Get(api_path("/health"), [this](const httplib::Request & req, httplib::Response & res) {
+    health_handlers_->handle_health(req, res);
+  });
+
+  // Root - server capabilities and entry points (REQ_INTEROP_010)
+  srv->Get(api_path("/"), [this](const httplib::Request & req, httplib::Response & res) {
+    health_handlers_->handle_root(req, res);
+  });
+
+  // Version info (REQ_INTEROP_001)
+  srv->Get(api_path("/version-info"), [this](const httplib::Request & req, httplib::Response & res) {
+    health_handlers_->handle_version_info(req, res);
+  });
+
+  // Areas
+  srv->Get(api_path("/areas"), [this](const httplib::Request & req, httplib::Response & res) {
+    discovery_handlers_->handle_list_areas(req, res);
+  });
+
+  // Apps - must register before /apps/{id} to avoid regex conflict
+  srv->Get(api_path("/apps"), [this](const httplib::Request & req, httplib::Response & res) {
+    discovery_handlers_->handle_list_apps(req, res);
+  });
+
+  // App data item (specific topic) - register before /apps/{id}/data
+  srv->Get((api_path("/apps") + R"(/([^/]+)/data/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_get_data_item(req, res);
+           });
+
+  // App data write (PUT) - publish data to topic
+  srv->Put((api_path("/apps") + R"(/([^/]+)/data/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_put_data_item(req, res);
+           });
+
+  // App data-categories (not implemented for ROS 2)
+  srv->Get((api_path("/apps") + R"(/([^/]+)/data-categories$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_data_categories(req, res);
+           });
+
+  // App data-groups (not implemented for ROS 2)
+  srv->Get((api_path("/apps") + R"(/([^/]+)/data-groups$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_data_groups(req, res);
+           });
+
+  // App data (all topics)
+  srv->Get((api_path("/apps") + R"(/([^/]+)/data$)"), [this](const httplib::Request & req, httplib::Response & res) {
+    data_handlers_->handle_list_data(req, res);
+  });
+
+  // App operations
+  srv->Get((api_path("/apps") + R"(/([^/]+)/operations$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_list_operations(req, res);
+           });
+
+  // App operation details (GET) - get single operation info
+  srv->Get((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_get_operation(req, res);
+           });
+
+  // Execution endpoints for apps
+  // POST /{entity}/operations/{op-id}/executions - start execution
+  srv->Post((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
+            [this](const httplib::Request & req, httplib::Response & res) {
+              operation_handlers_->handle_create_execution(req, res);
+            });
+
+  // GET /{entity}/operations/{op-id}/executions - list executions
+  srv->Get((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_list_executions(req, res);
+           });
+
+  // GET /{entity}/operations/{op-id}/executions/{exec-id} - get execution status
+  srv->Get((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_get_execution(req, res);
+           });
+
+  // PUT /{entity}/operations/{op-id}/executions/{exec-id} - update execution
+  srv->Put((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_update_execution(req, res);
+           });
+
+  // DELETE /{entity}/operations/{op-id}/executions/{exec-id} - cancel execution
+  srv->Delete((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                operation_handlers_->handle_cancel_execution(req, res);
+              });
+
+  // App configurations - list all
+  srv->Get((api_path("/apps") + R"(/([^/]+)/configurations$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_list_configurations(req, res);
+           });
+
+  // App configurations - get specific
+  // Use (.+) for config_id to accept slashes from percent-encoded URLs (%2F -> /)
+  // ROS2 parameters like qos_overrides./parameter_events.publisher.depth contain slashes
+  srv->Get((api_path("/apps") + R"(/([^/]+)/configurations/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_get_configuration(req, res);
+           });
+
+  // App configurations - set
+  srv->Put((api_path("/apps") + R"(/([^/]+)/configurations/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_set_configuration(req, res);
+           });
+
+  // App configurations - delete single
+  srv->Delete((api_path("/apps") + R"(/([^/]+)/configurations/(.+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                config_handlers_->handle_delete_configuration(req, res);
+              });
+
+  // App configurations - delete all
+  srv->Delete((api_path("/apps") + R"(/([^/]+)/configurations$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                config_handlers_->handle_delete_all_configurations(req, res);
+              });
+
+  // App depends-on (relationship endpoint)
+  srv->Get((api_path("/apps") + R"(/([^/]+)/depends-on$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             discovery_handlers_->handle_app_depends_on(req, res);
+           });
+
+  // Single app (capabilities) - must be after more specific routes
+  srv->Get((api_path("/apps") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
+    discovery_handlers_->handle_get_app(req, res);
+  });
+
+  // Functions - list all functions
+  srv->Get(api_path("/functions"), [this](const httplib::Request & req, httplib::Response & res) {
+    discovery_handlers_->handle_list_functions(req, res);
+  });
+
+  // Function hosts
+  srv->Get((api_path("/functions") + R"(/([^/]+)/hosts$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             discovery_handlers_->handle_function_hosts(req, res);
+           });
+
+  // Function data item (specific topic) - register before /functions/{id}/data
+  srv->Get((api_path("/functions") + R"(/([^/]+)/data/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_get_data_item(req, res);
+           });
+
+  // Function data write (PUT) - publish data to topic
+  srv->Put((api_path("/functions") + R"(/([^/]+)/data/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_put_data_item(req, res);
+           });
+
+  // Function data (aggregated from host apps)
+  srv->Get((api_path("/functions") + R"(/([^/]+)/data$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_list_data(req, res);
+           });
+
+  // Function operations (aggregated from host apps)
+  srv->Get((api_path("/functions") + R"(/([^/]+)/operations$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_list_operations(req, res);
+           });
+
+  // Function operation details (GET) - get single operation info
+  srv->Get((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_get_operation(req, res);
+           });
+
+  // Execution endpoints for functions
+  srv->Post((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
+            [this](const httplib::Request & req, httplib::Response & res) {
+              operation_handlers_->handle_create_execution(req, res);
+            });
+
+  srv->Get((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_list_executions(req, res);
+           });
+
+  srv->Get((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_get_execution(req, res);
+           });
+
+  srv->Put((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_update_execution(req, res);
+           });
+
+  srv->Delete((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                operation_handlers_->handle_cancel_execution(req, res);
+              });
+
+  // Function configurations
+  srv->Get((api_path("/functions") + R"(/([^/]+)/configurations$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_list_configurations(req, res);
+           });
+
+  srv->Get((api_path("/functions") + R"(/([^/]+)/configurations/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_get_configuration(req, res);
+           });
+
+  srv->Put((api_path("/functions") + R"(/([^/]+)/configurations/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_set_configuration(req, res);
+           });
+
+  srv->Delete((api_path("/functions") + R"(/([^/]+)/configurations/(.+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                config_handlers_->handle_delete_configuration(req, res);
+              });
+
+  srv->Delete((api_path("/functions") + R"(/([^/]+)/configurations$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                config_handlers_->handle_delete_all_configurations(req, res);
+              });
+
+  // Function faults
+  srv->Get((api_path("/functions") + R"(/([^/]+)/faults$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             fault_handlers_->handle_list_faults(req, res);
+           });
+
+  srv->Get((api_path("/functions") + R"(/([^/]+)/faults/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             fault_handlers_->handle_get_fault(req, res);
+           });
+
+  srv->Delete((api_path("/functions") + R"(/([^/]+)/faults/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                fault_handlers_->handle_clear_fault(req, res);
+              });
+
+  srv->Delete((api_path("/functions") + R"(/([^/]+)/faults$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                fault_handlers_->handle_clear_all_faults(req, res);
+              });
+
+  // Single function (capabilities) - must be after more specific routes
+  srv->Get((api_path("/functions") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
+    discovery_handlers_->handle_get_function(req, res);
+  });
+
+  // Components
+  srv->Get(api_path("/components"), [this](const httplib::Request & req, httplib::Response & res) {
+    discovery_handlers_->handle_list_components(req, res);
+  });
+
+  // Area components
+  srv->Get((api_path("/areas") + R"(/([^/]+)/components)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             discovery_handlers_->handle_area_components(req, res);
+           });
+
+  // Area subareas (relationship endpoint)
+  srv->Get((api_path("/areas") + R"(/([^/]+)/subareas$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             discovery_handlers_->handle_get_subareas(req, res);
+           });
+
+  // Area contains
+  srv->Get((api_path("/areas") + R"(/([^/]+)/contains$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             discovery_handlers_->handle_get_contains(req, res);
+           });
+
+  // Area data item (specific topic) - register before /areas/{id}/data
+  srv->Get((api_path("/areas") + R"(/([^/]+)/data/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_get_data_item(req, res);
+           });
+
+  // Area data write (PUT) - publish data to topic
+  srv->Put((api_path("/areas") + R"(/([^/]+)/data/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_put_data_item(req, res);
+           });
+
+  // Area data (aggregated from contained components)
+  srv->Get((api_path("/areas") + R"(/([^/]+)/data$)"), [this](const httplib::Request & req, httplib::Response & res) {
+    data_handlers_->handle_list_data(req, res);
+  });
+
+  // Area operations
+  srv->Get((api_path("/areas") + R"(/([^/]+)/operations$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_list_operations(req, res);
+           });
+
+  // Area operation details (GET) - get single operation info
+  srv->Get((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_get_operation(req, res);
+           });
+
+  // Execution endpoints for areas
+  srv->Post((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
+            [this](const httplib::Request & req, httplib::Response & res) {
+              operation_handlers_->handle_create_execution(req, res);
+            });
+
+  srv->Get((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_list_executions(req, res);
+           });
+
+  srv->Get((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_get_execution(req, res);
+           });
+
+  srv->Put((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_update_execution(req, res);
+           });
+
+  srv->Delete((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                operation_handlers_->handle_cancel_execution(req, res);
+              });
+
+  // Area configurations
+  srv->Get((api_path("/areas") + R"(/([^/]+)/configurations$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_list_configurations(req, res);
+           });
+
+  srv->Get((api_path("/areas") + R"(/([^/]+)/configurations/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_get_configuration(req, res);
+           });
+
+  srv->Put((api_path("/areas") + R"(/([^/]+)/configurations/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_set_configuration(req, res);
+           });
+
+  srv->Delete((api_path("/areas") + R"(/([^/]+)/configurations/(.+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                config_handlers_->handle_delete_configuration(req, res);
+              });
+
+  srv->Delete((api_path("/areas") + R"(/([^/]+)/configurations$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                config_handlers_->handle_delete_all_configurations(req, res);
+              });
+
+  // Area faults
+  srv->Get((api_path("/areas") + R"(/([^/]+)/faults$)"), [this](const httplib::Request & req, httplib::Response & res) {
+    fault_handlers_->handle_list_faults(req, res);
+  });
+
+  srv->Get((api_path("/areas") + R"(/([^/]+)/faults/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             fault_handlers_->handle_get_fault(req, res);
+           });
+
+  srv->Delete((api_path("/areas") + R"(/([^/]+)/faults/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                fault_handlers_->handle_clear_fault(req, res);
+              });
+
+  srv->Delete((api_path("/areas") + R"(/([^/]+)/faults$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                fault_handlers_->handle_clear_all_faults(req, res);
+              });
+
+  // Single area (capabilities) - must be after more specific routes
+  srv->Get((api_path("/areas") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
+    discovery_handlers_->handle_get_area(req, res);
+  });
+
+  // Component topic data (specific topic) - register before general route
+  // Use (.+) for topic_name to accept slashes from percent-encoded URLs (%2F -> /)
+  srv->Get((api_path("/components") + R"(/([^/]+)/data/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_get_data_item(req, res);
+           });
+
+  // Component data (all topics)
+  srv->Get((api_path("/components") + R"(/([^/]+)/data$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_list_data(req, res);
+           });
+
+  // Component subcomponents (relationship endpoint)
+  srv->Get((api_path("/components") + R"(/([^/]+)/subcomponents$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             discovery_handlers_->handle_get_subcomponents(req, res);
+           });
+
+  // Component hosts
+  srv->Get((api_path("/components") + R"(/([^/]+)/hosts$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             discovery_handlers_->handle_get_hosts(req, res);
+           });
+
+  // Component depends-on (relationship endpoint)
+  srv->Get((api_path("/components") + R"(/([^/]+)/depends-on$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             discovery_handlers_->handle_component_depends_on(req, res);
+           });
+
+  // Single component (capabilities) - must be after more specific routes
+  srv->Get((api_path("/components") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
+    discovery_handlers_->handle_get_component(req, res);
+  });
+
+  // Component topic publish (PUT)
+  // Use (.+) for topic_name to accept slashes from percent-encoded URLs (%2F -> /)
+  srv->Put((api_path("/components") + R"(/([^/]+)/data/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             data_handlers_->handle_put_data_item(req, res);
+           });
+
+  // List component operations (GET) - list all services and actions for a component
+  srv->Get((api_path("/components") + R"(/([^/]+)/operations$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_list_operations(req, res);
+           });
+
+  // Component operation details (GET) - get single operation info
+  srv->Get((api_path("/components") + R"(/([^/]+)/operations/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_get_operation(req, res);
+           });
+
+  // Execution endpoints for components
+  // POST /{entity}/operations/{op-id}/executions - start execution
+  srv->Post((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
+            [this](const httplib::Request & req, httplib::Response & res) {
+              operation_handlers_->handle_create_execution(req, res);
+            });
+
+  // GET /{entity}/operations/{op-id}/executions - list executions
+  srv->Get((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_list_executions(req, res);
+           });
+
+  // GET /{entity}/operations/{op-id}/executions/{exec-id} - get execution status
+  srv->Get((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_get_execution(req, res);
+           });
+
+  // PUT /{entity}/operations/{op-id}/executions/{exec-id} - update execution
+  srv->Put((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             operation_handlers_->handle_update_execution(req, res);
+           });
+
+  // DELETE /{entity}/operations/{op-id}/executions/{exec-id} - cancel execution
+  srv->Delete((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                operation_handlers_->handle_cancel_execution(req, res);
+              });
+
+  // Configurations endpoints - SOVD Configurations API mapped to ROS2 parameters
+  // List all configurations (parameters) for a component
+  srv->Get((api_path("/components") + R"(/([^/]+)/configurations$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_list_configurations(req, res);
+           });
+
+  // Get specific configuration (parameter) - register before general route
+  srv->Get((api_path("/components") + R"(/([^/]+)/configurations/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_get_configuration(req, res);
+           });
+
+  // Set configuration (parameter)
+  srv->Put((api_path("/components") + R"(/([^/]+)/configurations/(.+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             config_handlers_->handle_set_configuration(req, res);
+           });
+
+  // Delete (reset) single configuration to default value
+  srv->Delete((api_path("/components") + R"(/([^/]+)/configurations/(.+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                config_handlers_->handle_delete_configuration(req, res);
+              });
+
+  // Delete (reset) all configurations to default values
+  srv->Delete((api_path("/components") + R"(/([^/]+)/configurations$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                config_handlers_->handle_delete_all_configurations(req, res);
+              });
+
+  // Fault endpoints
+  // SSE stream for real-time fault events - must be registered before /faults to avoid regex conflict
+  srv->Get(api_path("/faults/stream"), [this](const httplib::Request & req, httplib::Response & res) {
+    sse_fault_handler_->handle_stream(req, res);
+  });
+
+  // GET /faults - convenience API to retrieve all faults across the system
+  // Useful for dashboards and monitoring tools that need a complete system health view
+  srv->Get(api_path("/faults"), [this](const httplib::Request & req, httplib::Response & res) {
+    fault_handlers_->handle_list_all_faults(req, res);
+  });
+
+  // DELETE /faults - extension: clear all faults globally (not SOVD)
+  srv->Delete(api_path("/faults"), [this](const httplib::Request & req, httplib::Response & res) {
+    fault_handlers_->handle_clear_all_faults_global(req, res);
+  });
+
+  // List all faults for a component (REQ_INTEROP_012)
+  srv->Get((api_path("/components") + R"(/([^/]+)/faults$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             fault_handlers_->handle_list_faults(req, res);
+           });
+
+  // List all faults for an app (same handler, entity-agnostic)
+  srv->Get((api_path("/apps") + R"(/([^/]+)/faults$)"), [this](const httplib::Request & req, httplib::Response & res) {
+    fault_handlers_->handle_list_faults(req, res);
+  });
+
+  // Get specific fault by code (REQ_INTEROP_013)
+  srv->Get((api_path("/components") + R"(/([^/]+)/faults/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             fault_handlers_->handle_get_fault(req, res);
+           });
+
+  // Get specific fault by code for an app
+  srv->Get((api_path("/apps") + R"(/([^/]+)/faults/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             fault_handlers_->handle_get_fault(req, res);
+           });
+
+  // Clear a fault (REQ_INTEROP_015)
+  srv->Delete((api_path("/components") + R"(/([^/]+)/faults/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                fault_handlers_->handle_clear_fault(req, res);
+              });
+
+  // Clear a fault for an app
+  srv->Delete((api_path("/apps") + R"(/([^/]+)/faults/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                fault_handlers_->handle_clear_fault(req, res);
+              });
+
+  // Clear all faults for a component
+  srv->Delete((api_path("/components") + R"(/([^/]+)/faults$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                fault_handlers_->handle_clear_all_faults(req, res);
+              });
+
+  // Clear all faults for an app
+  srv->Delete((api_path("/apps") + R"(/([^/]+)/faults$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                fault_handlers_->handle_clear_all_faults(req, res);
+              });
+
+  // === Bulk Data Routes (REQ_INTEROP_071-073) ===
+  // List bulk-data categories
+  srv->Get((api_path("/apps") + R"(/([^/]+)/bulk-data$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_categories(req, res);
+           });
+  srv->Get((api_path("/components") + R"(/([^/]+)/bulk-data$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_categories(req, res);
+           });
+  srv->Get((api_path("/areas") + R"(/([^/]+)/bulk-data$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_categories(req, res);
+           });
+  srv->Get((api_path("/functions") + R"(/([^/]+)/bulk-data$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_categories(req, res);
+           });
+
+  // List bulk-data descriptors (by category)
+  srv->Get((api_path("/apps") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_descriptors(req, res);
+           });
+  srv->Get((api_path("/components") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_descriptors(req, res);
+           });
+  srv->Get((api_path("/areas") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_descriptors(req, res);
+           });
+  srv->Get((api_path("/functions") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_descriptors(req, res);
+           });
+
+  // Download bulk-data file
+  srv->Get((api_path("/apps") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_download(req, res);
+           });
+  srv->Get((api_path("/components") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_download(req, res);
+           });
+  srv->Get((api_path("/areas") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_download(req, res);
+           });
+  srv->Get((api_path("/functions") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_download(req, res);
+           });
+
+  // Upload bulk-data (POST) — apps and components only (REQ_INTEROP_074)
+  srv->Post((api_path("/apps") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
+            [this](const httplib::Request & req, httplib::Response & res) {
+              bulkdata_handlers_->handle_upload(req, res);
+            });
+  srv->Post((api_path("/components") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
+            [this](const httplib::Request & req, httplib::Response & res) {
+              bulkdata_handlers_->handle_upload(req, res);
+            });
+  // Bulk data upload not supported for areas and functions (405)
+  auto bulk_upload_405 = [this](const httplib::Request & /*req*/, httplib::Response & res) {
+    handlers::HandlerContext::send_error(res, 405, ERR_INVALID_REQUEST,
+                                         "Bulk data upload is only supported for components and apps");
+  };
+  srv->Post((api_path("/areas") + R"(/([^/]+)/bulk-data/([^/]+)$)"), bulk_upload_405);
+  srv->Post((api_path("/functions") + R"(/([^/]+)/bulk-data/([^/]+)$)"), bulk_upload_405);
+
+  // Delete bulk-data (DELETE) — apps and components only (REQ_INTEROP_074)
+  srv->Delete((api_path("/apps") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                bulkdata_handlers_->handle_delete(req, res);
+              });
+  srv->Delete((api_path("/components") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                bulkdata_handlers_->handle_delete(req, res);
+              });
+  // Bulk data deletion not supported for areas and functions (405)
+  auto bulk_delete_405 = [this](const httplib::Request & /*req*/, httplib::Response & res) {
+    handlers::HandlerContext::send_error(res, 405, ERR_INVALID_REQUEST,
+                                         "Bulk data deletion is only supported for components and apps");
+  };
+  srv->Delete((api_path("/areas") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"), bulk_delete_405);
+  srv->Delete((api_path("/functions") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"), bulk_delete_405);
+
+  // Nested entities - subareas
+  srv->Get((api_path("/areas") + R"(/([^/]+)/subareas/([^/]+)/bulk-data$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_categories(req, res);
+           });
+  srv->Get((api_path("/areas") + R"(/([^/]+)/subareas/([^/]+)/bulk-data/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_descriptors(req, res);
+           });
+  srv->Get((api_path("/areas") + R"(/([^/]+)/subareas/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_download(req, res);
+           });
+
+  // Nested entities - subcomponents
+  srv->Get((api_path("/components") + R"(/([^/]+)/subcomponents/([^/]+)/bulk-data$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_categories(req, res);
+           });
+  srv->Get((api_path("/components") + R"(/([^/]+)/subcomponents/([^/]+)/bulk-data/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_list_descriptors(req, res);
+           });
+  srv->Get((api_path("/components") + R"(/([^/]+)/subcomponents/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             bulkdata_handlers_->handle_download(req, res);
+           });
+
+  // === Cyclic Subscription Routes (REQ_INTEROP_025-028, REQ_INTEROP_089-090) ===
+  // SSE events stream - must be registered before CRUD routes to avoid regex conflict
+  srv->Get((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)/events$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             cyclic_sub_handlers_->handle_events(req, res);
+           });
+  srv->Get((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)/events$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             cyclic_sub_handlers_->handle_events(req, res);
+           });
+
+  // Create cyclic subscription
+  srv->Post((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions$)"),
+            [this](const httplib::Request & req, httplib::Response & res) {
+              cyclic_sub_handlers_->handle_create(req, res);
+            });
+  srv->Post((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions$)"),
+            [this](const httplib::Request & req, httplib::Response & res) {
+              cyclic_sub_handlers_->handle_create(req, res);
+            });
+
+  // List cyclic subscriptions
+  srv->Get((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             cyclic_sub_handlers_->handle_list(req, res);
+           });
+  srv->Get((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             cyclic_sub_handlers_->handle_list(req, res);
+           });
+
+  // Get single subscription
+  srv->Get((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             cyclic_sub_handlers_->handle_get(req, res);
+           });
+  srv->Get((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             cyclic_sub_handlers_->handle_get(req, res);
+           });
+
+  // Update subscription
+  srv->Put((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             cyclic_sub_handlers_->handle_update(req, res);
+           });
+  srv->Put((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
+           [this](const httplib::Request & req, httplib::Response & res) {
+             cyclic_sub_handlers_->handle_update(req, res);
+           });
+
+  // Delete subscription
+  srv->Delete((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                cyclic_sub_handlers_->handle_delete(req, res);
+              });
+  srv->Delete((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
+              [this](const httplib::Request & req, httplib::Response & res) {
+                cyclic_sub_handlers_->handle_delete(req, res);
+              });
+
+  // === Software Updates (server-level endpoints, REQ_INTEROP_082-085, 091-094) ===
+  if (update_handlers_) {
+    srv->Get(api_path("/updates"), [this](const httplib::Request & req, httplib::Response & res) {
+      update_handlers_->handle_list_updates(req, res);
+    });
+    srv->Post(api_path("/updates"), [this](const httplib::Request & req, httplib::Response & res) {
+      update_handlers_->handle_register_update(req, res);
+    });
+    // Specific routes before generic /{id}
+    srv->Get((api_path("/updates") + R"(/([^/]+)/status$)"),
+             [this](const httplib::Request & req, httplib::Response & res) {
+               update_handlers_->handle_get_status(req, res);
+             });
+    srv->Put((api_path("/updates") + R"(/([^/]+)/prepare$)"),
+             [this](const httplib::Request & req, httplib::Response & res) {
+               update_handlers_->handle_prepare(req, res);
+             });
+    srv->Put((api_path("/updates") + R"(/([^/]+)/execute$)"),
+             [this](const httplib::Request & req, httplib::Response & res) {
+               update_handlers_->handle_execute(req, res);
+             });
+    srv->Put((api_path("/updates") + R"(/([^/]+)/automated$)"),
+             [this](const httplib::Request & req, httplib::Response & res) {
+               update_handlers_->handle_automated(req, res);
+             });
+    // Generic /{id} routes last
+    srv->Get((api_path("/updates") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
+      update_handlers_->handle_get_update(req, res);
+    });
+    srv->Delete((api_path("/updates") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
+      update_handlers_->handle_delete_update(req, res);
+    });
+  }
+
+  // Authentication endpoints (REQ_INTEROP_086, REQ_INTEROP_087)
+  // POST /auth/authorize - Authenticate and get tokens (client_credentials grant)
+  srv->Post(api_path("/auth/authorize"), [this](const httplib::Request & req, httplib::Response & res) {
+    auth_handlers_->handle_auth_authorize(req, res);
+  });
+
+  // POST /auth/token - Refresh access token
+  srv->Post(api_path("/auth/token"), [this](const httplib::Request & req, httplib::Response & res) {
+    auth_handlers_->handle_auth_token(req, res);
+  });
+
+  // POST /auth/revoke - Revoke a refresh token
+  srv->Post(api_path("/auth/revoke"), [this](const httplib::Request & req, httplib::Response & res) {
+    auth_handlers_->handle_auth_revoke(req, res);
+  });
+}
+
+void RESTServer::start() {
+  http_server_->listen(host_, port_);
+}
+
+void RESTServer::stop() {
+  if (http_server_) {
+    http_server_->stop();
+  }
+}
+
+void RESTServer::set_cors_headers(httplib::Response & res, const std::string & origin) const {
+  res.set_header("Access-Control-Allow-Origin", origin);
+
+  // Use pre-built header strings from CorsConfig
+  if (!cors_config_.methods_header.empty()) {
+    res.set_header("Access-Control-Allow-Methods", cors_config_.methods_header);
+  }
+  if (!cors_config_.headers_header.empty()) {
+    res.set_header("Access-Control-Allow-Headers", cors_config_.headers_header);
+  }
+
+  // Expose headers that JavaScript needs access to (e.g., for file downloads)
+  res.set_header("Access-Control-Expose-Headers",
+                 "Content-Disposition, Content-Length, X-RateLimit-Limit, X-RateLimit-Remaining, "
+                 "X-RateLimit-Reset, Retry-After");
+
+  // Set credentials header if enabled
+  if (cors_config_.allow_credentials) {
+    res.set_header("Access-Control-Allow-Credentials", "true");
+  }
+}
+
+bool RESTServer::is_origin_allowed(const std::string & origin) const {
+  // Check if origin matches any allowed origin
+  // Note: Wildcard "*" is allowed here but credentials+wildcard is blocked at startup
+  // (see gateway_node.cpp validation). When wildcard is used, we echo back the actual
+  // origin for security, as browsers require exact origin match with credentials.
+  for (const auto & allowed : cors_config_.allowed_origins) {
+    if (allowed == "*" || allowed == origin) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace ros2_medkit_gateway
