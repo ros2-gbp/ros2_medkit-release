@@ -1,0 +1,12 @@
+Source: ros-jazzy-ros2-medkit-fault-reporter
+Section: misc
+Priority: optional
+Maintainer: mfaferek93 <michal.faferek.coe@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), ros-jazzy-ament-cmake, ros-jazzy-ament-cmake-clang-format <!nocheck>, ros-jazzy-ament-cmake-clang-tidy <!nocheck>, ros-jazzy-ament-cmake-gtest <!nocheck>, ros-jazzy-ament-lint-auto <!nocheck>, ros-jazzy-ament-lint-common <!nocheck>, ros-jazzy-launch-testing-ament-cmake <!nocheck>, ros-jazzy-launch-testing-ros <!nocheck>, ros-jazzy-rclcpp, ros-jazzy-ros2-medkit-fault-manager <!nocheck>, ros-jazzy-ros2-medkit-msgs, ros-jazzy-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-ros2-medkit-fault-reporter
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-jazzy-rclcpp, ros-jazzy-ros2-medkit-msgs, ros-jazzy-ros-workspace
+Description: Client library for easy fault reporting with local filtering
