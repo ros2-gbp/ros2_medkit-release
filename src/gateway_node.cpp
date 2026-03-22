@@ -17,7 +17,12 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cinttypes>
+#include <set>
 #include <unordered_set>
+
+#include "ros2_medkit_gateway/http/handlers/sse_transport_provider.hpp"
+#include "ros2_medkit_gateway/sqlite_trigger_store.hpp"
 
 using namespace std::chrono_literals;
 
@@ -70,15 +75,48 @@ nlohmann::json extract_plugin_config(const std::vector<rclcpp::Parameter> & over
   return config;
 }
 
+/// Filter faults by FQN prefix match on reporting_sources.
+/// Used for FUNCTION and COMPONENT entities that aggregate faults from hosted apps.
+nlohmann::json filter_faults_by_fqns(const nlohmann::json & fault_data, const std::set<std::string> & fqns) {
+  nlohmann::json filtered = nlohmann::json::array();
+  if (!fault_data.contains("faults") || !fault_data["faults"].is_array()) {
+    return filtered;
+  }
+  for (const auto & fault : fault_data["faults"]) {
+    if (!fault.contains("reporting_sources")) {
+      continue;
+    }
+    bool matches = false;
+    for (const auto & src : fault["reporting_sources"]) {
+      const std::string src_str = src.get<std::string>();
+      for (const auto & fqn : fqns) {
+        if (src_str.rfind(fqn, 0) == 0) {
+          matches = true;
+          break;
+        }
+      }
+      if (matches) {
+        break;
+      }
+    }
+    if (matches) {
+      filtered.push_back(fault);
+    }
+  }
+  return filtered;
+}
+
 }  // namespace
 
-GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
+GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medkit_gateway", options) {
   RCLCPP_INFO(get_logger(), "Initializing ROS 2 Medkit Gateway...");
 
   // Declare parameters with defaults
   declare_parameter("server.host", "127.0.0.1");
   declare_parameter("server.port", 8080);
   declare_parameter("refresh_interval_ms", 10000);
+  declare_parameter("fault_manager.namespace", "");
+  declare_parameter("fault_manager.service_timeout_sec", 5.0);
   declare_parameter("cors.allowed_origins", std::vector<std::string>{});
   declare_parameter("cors.allowed_methods", std::vector<std::string>{"GET", "PUT", "POST", "DELETE", "OPTIONS"});
   declare_parameter("cors.allowed_headers", std::vector<std::string>{"Content-Type", "Accept"});
@@ -88,6 +126,11 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
   // SSE (Server-Sent Events) parameters
   declare_parameter("sse.max_clients", 10);         // Limit concurrent SSE connections to prevent resource exhaustion
   declare_parameter("sse.max_subscriptions", 100);  // Maximum active cyclic subscriptions across all entities
+  declare_parameter("sse.max_duration_sec", 3600);  // Maximum subscription duration in seconds (1 hour default)
+
+  // Log management parameters
+  declare_parameter("logs.buffer_size",
+                    200);  // Ring buffer capacity per node; entries exceeding this are dropped (oldest first)
 
   // TLS/HTTPS parameters
   declare_parameter("server.tls.enabled", false);
@@ -109,6 +152,9 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
   declare_parameter("auth.issuer", "ros2_medkit_gateway");
   declare_parameter("auth.clients", std::vector<std::string>{});
 
+  // OpenAPI documentation endpoints
+  declare_parameter("docs.enabled", true);
+
   // Rate limiting parameters
   declare_parameter("rate_limiting.enabled", false);
   declare_parameter("rate_limiting.global_requests_per_minute", 600);
@@ -118,15 +164,40 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
   declare_parameter("rate_limiting.client_max_idle_seconds", 600);
 
   // Discovery mode parameters
-  declare_parameter("discovery_mode", "runtime_only");  // runtime_only, manifest_only, hybrid
-  declare_parameter("manifest_path", "");
-  declare_parameter("manifest_strict_validation", true);
+  declare_parameter("discovery.mode", "runtime_only");  // runtime_only, manifest_only, hybrid
+  declare_parameter("discovery.manifest_path", "");
+  declare_parameter("discovery.manifest_strict_validation", true);
+  declare_parameter("discovery.manifest.enabled", true);
+  declare_parameter("discovery.runtime.enabled", true);
 
   // Software updates parameters
   declare_parameter("updates.enabled", false);
 
+  // Scripts parameters
+  declare_parameter("scripts.scripts_dir", "");
+  declare_parameter("scripts.max_file_size_mb", 10);
+  declare_parameter("scripts.max_concurrent_executions", 5);
+  declare_parameter("scripts.default_timeout_sec", 300);
+  declare_parameter("scripts.max_execution_history", 100);
+  declare_parameter("scripts.allow_uploads", true);
+
+  // Trigger subsystem parameters
+  declare_parameter("triggers.enabled", true);
+  declare_parameter("triggers.max_triggers", 1000);
+  declare_parameter("triggers.on_restart_behavior", "reset");
+  declare_parameter("triggers.storage.path", "");
+
   // Plugin framework parameters
   declare_parameter("plugins", std::vector<std::string>{});
+
+  // Locking parameters
+  declare_parameter("locking.enabled", true);
+  declare_parameter("locking.default_max_expiration", 3600);
+  declare_parameter("locking.cleanup_interval", 30);
+  declare_parameter("locking.defaults.components.lock_required_scopes", std::vector<std::string>{""});
+  declare_parameter("locking.defaults.components.breakable", true);
+  declare_parameter("locking.defaults.apps.lock_required_scopes", std::vector<std::string>{""});
+  declare_parameter("locking.defaults.apps.breakable", true);
 
   // Bulk data storage parameters
   declare_parameter("bulk_data.storage_dir", "/tmp/ros2_medkit_bulk_data");
@@ -140,6 +211,21 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
   declare_parameter("discovery.runtime.synthetic_component_name_pattern", "{area}");
   declare_parameter("discovery.runtime.topic_only_policy", "create_component");
   declare_parameter("discovery.runtime.min_topics_for_component", 1);
+
+  // Merge pipeline configuration (hybrid mode only)
+  declare_parameter("discovery.merge_pipeline.gap_fill.allow_heuristic_areas", true);
+  declare_parameter("discovery.merge_pipeline.gap_fill.allow_heuristic_components", true);
+  declare_parameter("discovery.merge_pipeline.gap_fill.allow_heuristic_apps", true);
+  declare_parameter("discovery.merge_pipeline.gap_fill.allow_heuristic_functions", false);
+  declare_parameter("discovery.merge_pipeline.gap_fill.namespace_whitelist", std::vector<std::string>{});
+  declare_parameter("discovery.merge_pipeline.gap_fill.namespace_blacklist", std::vector<std::string>{});
+
+  // Per-layer merge policy overrides (optional, empty string = use layer default)
+  for (const auto & layer : {"manifest", "runtime"}) {
+    for (const auto & fg : {"identity", "hierarchy", "live_data", "status", "metadata"}) {
+      declare_parameter(std::string("discovery.merge_pipeline.layers.") + layer + "." + fg, std::string(""));
+    }
+  }
 
   // Get parameter values
   server_host_ = get_parameter("server.host").as_string();
@@ -335,21 +421,64 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
 
   // Configure and initialize discovery manager
   DiscoveryConfig discovery_config;
-  discovery_config.mode = parse_discovery_mode(get_parameter("discovery_mode").as_string());
-  discovery_config.manifest_path = get_parameter("manifest_path").as_string();
-  discovery_config.manifest_strict_validation = get_parameter("manifest_strict_validation").as_bool();
+
+  auto mode_str = get_parameter("discovery.mode").as_string();
+  discovery_config.mode = parse_discovery_mode(mode_str);
+  if (mode_str != "runtime_only" && mode_str != "manifest_only" && mode_str != "hybrid") {
+    RCLCPP_WARN(get_logger(), "Unknown discovery.mode '%s', defaulting to 'runtime_only'", mode_str.c_str());
+  }
+
+  discovery_config.manifest_path = get_parameter("discovery.manifest_path").as_string();
+  discovery_config.manifest_strict_validation = get_parameter("discovery.manifest_strict_validation").as_bool();
+  discovery_config.manifest_enabled = get_parameter("discovery.manifest.enabled").as_bool();
+  discovery_config.runtime_enabled = get_parameter("discovery.runtime.enabled").as_bool();
 
   // Runtime discovery options
   discovery_config.runtime.create_synthetic_components =
       get_parameter("discovery.runtime.create_synthetic_components").as_bool();
-  discovery_config.runtime.grouping =
-      parse_grouping_strategy(get_parameter("discovery.runtime.grouping_strategy").as_string());
+
+  auto grouping_str = get_parameter("discovery.runtime.grouping_strategy").as_string();
+  discovery_config.runtime.grouping = parse_grouping_strategy(grouping_str);
+  if (grouping_str != "none" && grouping_str != "namespace") {
+    RCLCPP_WARN(get_logger(), "Unknown grouping_strategy '%s', defaulting to 'none'", grouping_str.c_str());
+  }
+
   discovery_config.runtime.synthetic_component_name_pattern =
       get_parameter("discovery.runtime.synthetic_component_name_pattern").as_string();
-  discovery_config.runtime.topic_only_policy =
-      parse_topic_only_policy(get_parameter("discovery.runtime.topic_only_policy").as_string());
+
+  auto topic_policy_str = get_parameter("discovery.runtime.topic_only_policy").as_string();
+  discovery_config.runtime.topic_only_policy = parse_topic_only_policy(topic_policy_str);
+  if (topic_policy_str != "ignore" && topic_policy_str != "create_component" &&
+      topic_policy_str != "create_area_only") {
+    RCLCPP_WARN(get_logger(), "Unknown topic_only_policy '%s', defaulting to 'create_component'",
+                topic_policy_str.c_str());
+  }
   discovery_config.runtime.min_topics_for_component =
       static_cast<int>(get_parameter("discovery.runtime.min_topics_for_component").as_int());
+
+  // Merge pipeline gap-fill configuration (hybrid mode)
+  discovery_config.merge_pipeline.gap_fill.allow_heuristic_areas =
+      get_parameter("discovery.merge_pipeline.gap_fill.allow_heuristic_areas").as_bool();
+  discovery_config.merge_pipeline.gap_fill.allow_heuristic_components =
+      get_parameter("discovery.merge_pipeline.gap_fill.allow_heuristic_components").as_bool();
+  discovery_config.merge_pipeline.gap_fill.allow_heuristic_apps =
+      get_parameter("discovery.merge_pipeline.gap_fill.allow_heuristic_apps").as_bool();
+  discovery_config.merge_pipeline.gap_fill.allow_heuristic_functions =
+      get_parameter("discovery.merge_pipeline.gap_fill.allow_heuristic_functions").as_bool();
+  discovery_config.merge_pipeline.gap_fill.namespace_whitelist =
+      get_parameter("discovery.merge_pipeline.gap_fill.namespace_whitelist").as_string_array();
+  discovery_config.merge_pipeline.gap_fill.namespace_blacklist =
+      get_parameter("discovery.merge_pipeline.gap_fill.namespace_blacklist").as_string_array();
+
+  // Read per-layer merge policy overrides
+  for (const auto & layer : {"manifest", "runtime"}) {
+    for (const auto & fg : {"identity", "hierarchy", "live_data", "status", "metadata"}) {
+      auto val = get_parameter(std::string("discovery.merge_pipeline.layers.") + layer + "." + fg).as_string();
+      if (!val.empty()) {
+        discovery_config.merge_pipeline.layer_policies[layer][fg] = val;
+      }
+    }
+  }
 
   if (!discovery_mgr_->initialize(discovery_config)) {
     RCLCPP_ERROR(get_logger(), "Failed to initialize discovery manager");
@@ -365,6 +494,12 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
   auto bd_storage_dir = get_parameter("bulk_data.storage_dir").as_string();
   auto bd_max_upload = static_cast<size_t>(get_parameter("bulk_data.max_upload_size").as_int());
   auto bd_categories = get_parameter("bulk_data.categories").as_string_array();
+  bd_categories.erase(std::remove_if(bd_categories.begin(), bd_categories.end(),
+                                     [](const auto & item) {
+                                       return item.empty();
+                                     }),
+                      bd_categories.end());
+
   bulk_data_store_ = std::make_unique<BulkDataStore>(bd_storage_dir, bd_max_upload, bd_categories);
   RCLCPP_INFO(get_logger(), "Bulk data store: dir=%s, max_upload=%zuB, categories=%zu", bd_storage_dir.c_str(),
               bd_max_upload, bd_categories.size());
@@ -374,11 +509,25 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
   subscription_mgr_ = std::make_unique<SubscriptionManager>(max_subscriptions);
   RCLCPP_INFO(get_logger(), "Subscription manager: max_subscriptions=%zu", max_subscriptions);
 
+  // Create SSE client tracker (shared between SseTransportProvider and SSEFaultHandler)
+  auto max_sse_clients = static_cast<size_t>(get_parameter("sse.max_clients").as_int());
+  sse_client_tracker_ = std::make_shared<SSEClientTracker>(max_sse_clients);
+
+  // Initialize resource sampler and transport registries
+  sampler_registry_ = std::make_unique<ResourceSamplerRegistry>();
+  transport_registry_ = std::make_unique<TransportRegistry>();
+
   // Initialize plugin manager
   plugin_mgr_ = std::make_unique<PluginManager>();
+  plugin_mgr_->set_registries(*sampler_registry_, *transport_registry_);
   auto plugin_names = get_parameter("plugins").as_string_array();
+  plugin_names.erase(std::remove_if(plugin_names.begin(), plugin_names.end(),
+                                    [](const auto & item) {
+                                      return item.empty();
+                                    }),
+                     plugin_names.end());
+  std::vector<PluginConfig> configs;
   if (!plugin_names.empty()) {
-    std::vector<PluginConfig> configs;
     // Plugin name validation: alphanumeric, underscore, hyphen only (max 256 chars)
     auto is_valid_plugin_name = [](const std::string & name) -> bool {
       if (name.empty() || name.size() > 256) {
@@ -401,7 +550,10 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
         continue;
       }
       auto path_param = "plugins." + pname + ".path";
-      declare_parameter(path_param, std::string(""));
+      rcl_interfaces::msg::ParameterDescriptor path_desc;
+      path_desc.read_only = true;
+      path_desc.description = "Absolute path to plugin .so file";
+      declare_parameter(path_param, std::string(""), path_desc);
       auto path = get_parameter(path_param).as_string();
       if (path.empty()) {
         RCLCPP_ERROR(get_logger(), "Plugin '%s' has no path configured", pname.c_str());
@@ -413,12 +565,36 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
       }
       configs.push_back({pname, path, std::move(plugin_config)});
     }
-    auto loaded = plugin_mgr_->load_plugins(configs);
-    plugin_mgr_->configure_plugins();
-    plugin_ctx_ = make_gateway_plugin_context(this, fault_mgr_.get());
-    plugin_mgr_->set_context(*plugin_ctx_);
-    RCLCPP_INFO(get_logger(), "Loaded %zu plugin(s)", loaded);
   }
+
+  auto loaded = plugin_mgr_->load_plugins(configs);
+  plugin_mgr_->configure_plugins();
+  plugin_ctx_ = make_gateway_plugin_context(this, fault_mgr_.get(), sampler_registry_.get());
+  plugin_mgr_->set_context(*plugin_ctx_);
+  RCLCPP_INFO(get_logger(), "Loaded %zu plugin(s)", loaded);
+
+  // Register IntrospectionProvider plugins as pipeline layers (hybrid mode only)
+  if (discovery_mgr_->get_mode() == DiscoveryMode::HYBRID) {
+    auto providers = plugin_mgr_->get_named_introspection_providers();
+    for (auto & [name, provider] : providers) {
+      discovery_mgr_->add_plugin_layer(name, provider);
+    }
+    if (!providers.empty()) {
+      discovery_mgr_->refresh_pipeline();
+    }
+  }
+
+  // Initialize log manager (subscribes to /rosout, delegates to plugin if available)
+  static constexpr int kMinBufferSize = 1;
+  static constexpr int kMaxBufferSize = 100000;
+  auto raw_buffer_size = get_parameter("logs.buffer_size").as_int();
+  auto clamped =
+      std::clamp(raw_buffer_size, static_cast<int64_t>(kMinBufferSize), static_cast<int64_t>(kMaxBufferSize));
+  if (clamped != raw_buffer_size) {
+    RCLCPP_WARN(get_logger(), "logs.buffer_size %" PRId64 " clamped to %" PRId64, raw_buffer_size, clamped);
+  }
+  auto log_buffer_size = static_cast<size_t>(clamped);
+  log_mgr_ = std::make_unique<LogManager>(this, plugin_mgr_.get(), log_buffer_size);
 
   // Initialize update manager
   auto updates_enabled = get_parameter("updates.enabled").as_bool();
@@ -433,6 +609,468 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
     }
   }
 
+  // Initialize lock manager
+  auto locking_enabled = get_parameter("locking.enabled").as_bool();
+  if (locking_enabled) {
+    LockConfig lock_config;
+    lock_config.enabled = true;
+    lock_config.default_max_expiration = static_cast<int>(get_parameter("locking.default_max_expiration").as_int());
+    lock_config.cleanup_interval = static_cast<int>(get_parameter("locking.cleanup_interval").as_int());
+
+    // Helper: parse lock_required_scopes, filtering out empty-string sentinel
+    auto parse_scopes = [&](const std::string & param_name) {
+      auto raw = get_parameter(param_name).as_string_array();
+      std::vector<std::string> scopes;
+      for (const auto & s : raw) {
+        if (!s.empty()) {
+          scopes.push_back(s);
+        }
+      }
+      return scopes;
+    };
+
+    EntityLockConfig comp_config;
+    comp_config.required_scopes = parse_scopes("locking.defaults.components.lock_required_scopes");
+    comp_config.breakable = get_parameter("locking.defaults.components.breakable").as_bool();
+    lock_config.type_defaults["component"] = comp_config;
+
+    EntityLockConfig app_config;
+    app_config.required_scopes = parse_scopes("locking.defaults.apps.lock_required_scopes");
+    app_config.breakable = get_parameter("locking.defaults.apps.breakable").as_bool();
+    lock_config.type_defaults["app"] = app_config;
+
+    // Apply per-entity lock overrides from manifest
+    auto * manifest_mgr = discovery_mgr_->get_manifest_manager();
+    if (manifest_mgr) {
+      auto overrides = manifest_mgr->get_lock_overrides();
+      for (auto & [entity_id, manifest_lock] : overrides) {
+        EntityLockConfig entity_config;
+        entity_config.required_scopes = manifest_lock.required_scopes;
+        entity_config.breakable = manifest_lock.breakable;
+        entity_config.max_expiration = manifest_lock.max_expiration;
+        lock_config.entity_overrides[entity_id] = entity_config;
+      }
+      if (!overrides.empty()) {
+        RCLCPP_INFO(get_logger(), "Lock manager: %zu entity overrides from manifest", overrides.size());
+      }
+    }
+
+    lock_manager_ = std::make_unique<LockManager>(get_thread_safe_cache(), lock_config);
+
+    auto cleanup_interval = lock_config.cleanup_interval;
+    lock_cleanup_timer_ = this->create_wall_timer(std::chrono::seconds(cleanup_interval), [this]() {
+      auto expired = lock_manager_->cleanup_expired();
+      for (const auto & info : expired) {
+        RCLCPP_INFO(get_logger(), "Lock %s expired on entity %s", info.lock_id.c_str(), info.entity_id.c_str());
+
+        // Clean up temporary resources within expired lock scope
+        auto scope_includes = [&](const std::string & collection) {
+          return info.scopes.empty() ||
+                 std::find(info.scopes.begin(), info.scopes.end(), collection) != info.scopes.end();
+        };
+
+        // Remove cyclic subscriptions for the entity
+        if (scope_includes("cyclic-subscriptions") && subscription_mgr_) {
+          auto subs = subscription_mgr_->list(info.entity_id);
+          for (const auto & sub : subs) {
+            if (subscription_mgr_->remove(sub.id)) {
+              RCLCPP_INFO(get_logger(), "Removed subscription %s on lock expiry", sub.id.c_str());
+            }
+          }
+        }
+      }
+    });
+
+    RCLCPP_INFO(get_logger(), "Lock manager: enabled, max_expiration=%ds, cleanup_interval=%ds",
+                lock_config.default_max_expiration, lock_config.cleanup_interval);
+  } else {
+    RCLCPP_INFO(get_logger(), "Lock manager: disabled");
+  }
+
+  // Scripts
+  script_mgr_ = std::make_unique<ScriptManager>();
+  auto * plugin_script_provider = plugin_mgr_->get_script_provider();
+  if (plugin_script_provider) {
+    script_mgr_->set_backend(plugin_script_provider);
+    RCLCPP_INFO(get_logger(), "Using plugin ScriptProvider");
+  } else {
+    auto scripts_dir = get_parameter("scripts.scripts_dir").as_string();
+    if (!scripts_dir.empty()) {
+      ScriptsConfig scripts_config;
+      scripts_config.scripts_dir = scripts_dir;
+      scripts_config.max_file_size_mb = static_cast<int>(get_parameter("scripts.max_file_size_mb").as_int());
+      scripts_config.max_concurrent_executions =
+          static_cast<int>(get_parameter("scripts.max_concurrent_executions").as_int());
+      scripts_config.default_timeout_sec = static_cast<int>(get_parameter("scripts.default_timeout_sec").as_int());
+      scripts_config.max_execution_history = static_cast<int>(get_parameter("scripts.max_execution_history").as_int());
+      scripts_config.allow_uploads = get_parameter("scripts.allow_uploads").as_bool();
+
+      // Load manifest-defined scripts
+      auto * manifest_mgr = discovery_mgr_->get_manifest_manager();
+      if (manifest_mgr) {
+        scripts_config.entries = manifest_mgr->get_scripts();
+        if (!scripts_config.entries.empty()) {
+          RCLCPP_INFO(get_logger(), "Loaded %zu manifest-defined scripts", scripts_config.entries.size());
+        }
+      }
+
+      default_script_provider_ = std::make_unique<DefaultScriptProvider>(scripts_config);
+      script_mgr_->set_backend(default_script_provider_.get());
+      RCLCPP_INFO(get_logger(), "Scripts enabled with directory: %s", scripts_dir.c_str());
+    } else {
+      auto * manifest_mgr = discovery_mgr_->get_manifest_manager();
+      if (manifest_mgr) {
+        auto manifest_scripts = manifest_mgr->get_scripts();
+        if (!manifest_scripts.empty()) {
+          RCLCPP_WARN(get_logger(),
+                      "Manifest defines %zu script(s) but scripts.scripts_dir is not configured - "
+                      "manifest scripts will not be loaded. Set 'scripts.scripts_dir' in gateway parameters to enable.",
+                      manifest_scripts.size());
+        }
+      }
+    }
+  }
+
+  // --- Trigger infrastructure ---
+  resource_change_notifier_ = std::make_unique<ResourceChangeNotifier>([this](const std::string & msg) {
+    RCLCPP_WARN(get_logger(), "ResourceChangeNotifier: %s", msg.c_str());
+  });
+
+  condition_registry_ = std::make_unique<ConditionRegistry>();
+  condition_registry_->register_condition("OnChange", std::make_shared<OnChangeEvaluator>());
+  condition_registry_->register_condition("OnChangeTo", std::make_shared<OnChangeToEvaluator>());
+  condition_registry_->register_condition("EnterRange", std::make_shared<EnterRangeEvaluator>());
+  condition_registry_->register_condition("LeaveRange", std::make_shared<LeaveRangeEvaluator>());
+
+  auto triggers_enabled = get_parameter("triggers.enabled").as_bool();
+  if (triggers_enabled) {
+    auto storage_path = get_parameter("triggers.storage.path").as_string();
+    if (storage_path.empty()) {
+      trigger_store_ = std::make_unique<SqliteTriggerStore>(":memory:");
+    } else {
+      trigger_store_ = std::make_unique<SqliteTriggerStore>(storage_path);
+    }
+
+    TriggerConfig trigger_config;
+    trigger_config.max_triggers = static_cast<int>(get_parameter("triggers.max_triggers").as_int());
+    trigger_config.on_restart_behavior = get_parameter("triggers.on_restart_behavior").as_string();
+
+    trigger_mgr_ = std::make_unique<TriggerManager>(*resource_change_notifier_, *condition_registry_, *trigger_store_,
+                                                    trigger_config);
+
+    // Set entity hierarchy resolver using thread-safe cache
+    trigger_mgr_->set_entity_children_fn(
+        [this](const std::string & entity_id, const std::string & entity_type) -> std::vector<std::string> {
+          const auto & cache = get_thread_safe_cache();
+          if (entity_type == "components") {
+            return cache.get_apps_for_component(entity_id);
+          } else if (entity_type == "areas") {
+            auto comps = cache.get_components_for_area(entity_id);
+            std::vector<std::string> all_apps;
+            for (const auto & comp_id : comps) {
+              auto apps = cache.get_apps_for_component(comp_id);
+              all_apps.insert(all_apps.end(), apps.begin(), apps.end());
+            }
+            return all_apps;
+          } else if (entity_type == "functions") {
+            return cache.get_apps_for_function(entity_id);
+          }
+          return {};
+        });
+
+    // Set entity existence checker for orphan sweep
+    trigger_mgr_->set_entity_exists_fn(
+        [this](const std::string & entity_id, const std::string & /*entity_type*/) -> bool {
+          const auto & cache = get_thread_safe_cache();
+          return cache.find_entity(entity_id).has_value();
+        });
+
+    // Load persistent triggers
+    trigger_mgr_->load_persistent_triggers();
+
+    // Wire notifier to managers so they emit events for trigger evaluation
+    if (update_mgr_) {
+      update_mgr_->set_notifier(resource_change_notifier_.get());
+    }
+    operation_mgr_->set_notifier(resource_change_notifier_.get());
+
+    // Wire LogManager <-> TriggerManager for log_settings integration
+    if (log_mgr_) {
+      trigger_mgr_->set_log_manager(log_mgr_.get());
+      log_mgr_->set_notifier(resource_change_notifier_.get());
+    }
+
+    // Subscribe to fault events and forward to notifier
+    trigger_fault_subscriber_ = std::make_unique<TriggerFaultSubscriber>(this, *resource_change_notifier_);
+
+    // Subscribe to data topics for data triggers
+    trigger_topic_subscriber_ = std::make_unique<TriggerTopicSubscriber>(this, *resource_change_notifier_);
+    trigger_mgr_->set_topic_subscriber(trigger_topic_subscriber_.get());
+
+    RCLCPP_INFO(get_logger(), "Trigger subsystem: enabled (max=%d, storage=%s)", trigger_config.max_triggers,
+                storage_path.empty() ? ":memory:" : storage_path.c_str());
+  } else {
+    RCLCPP_INFO(get_logger(), "Trigger subsystem: disabled");
+  }
+
+  // Register built-in resource samplers
+  sampler_registry_->register_sampler(
+      "data",
+      [this](const std::string & /*entity_id*/,
+             const std::string & resource_path) -> tl::expected<nlohmann::json, std::string> {
+        auto * dam = get_data_access_manager();
+        if (!dam) {
+          return tl::make_unexpected(std::string("DataAccessManager not available"));
+        }
+        auto * native_sampler = dam->get_native_sampler();
+        if (!native_sampler) {
+          return tl::make_unexpected(std::string("Native topic sampler unavailable"));
+        }
+        auto sample = native_sampler->sample_topic(resource_path, dam->get_topic_sample_timeout());
+        if (sample.has_data && sample.data.has_value()) {
+          nlohmann::json payload;
+          payload["id"] = resource_path;
+          payload["data"] = *sample.data;
+          return payload;
+        }
+        return tl::make_unexpected(std::string("Topic data not available: " + resource_path));
+      },
+      true);
+
+  sampler_registry_->register_sampler(
+      "faults",
+      [this](const std::string & entity_id,
+             const std::string & /*resource_path*/) -> tl::expected<nlohmann::json, std::string> {
+        auto * fault_mgr = get_fault_manager();
+        if (!fault_mgr) {
+          return tl::make_unexpected(std::string("FaultManager not available"));
+        }
+        // Determine fault filtering based on entity type (mirrors fault_handlers.cpp logic)
+        const auto & cache = get_thread_safe_cache();
+        auto entity_ref = cache.find_entity(entity_id);
+        if (!entity_ref) {
+          return tl::make_unexpected(std::string("Entity not found: " + entity_id));
+        }
+
+        if (entity_ref->type == SovdEntityType::FUNCTION) {
+          // FUNCTION: get all faults, filter by host app FQNs
+          auto result = fault_mgr->list_faults("");
+          if (!result.success) {
+            return tl::make_unexpected(result.error_message);
+          }
+          auto func = cache.get_function(entity_id);
+          if (!func || func->hosts.empty()) {
+            nlohmann::json empty_result = {{"faults", nlohmann::json::array()}, {"count", 0}};
+            return empty_result;
+          }
+          std::set<std::string> host_fqns;
+          for (const auto & app_id : func->hosts) {
+            auto app = cache.get_app(app_id);
+            if (app) {
+              auto fqn = app->effective_fqn();
+              if (!fqn.empty()) {
+                host_fqns.insert(std::move(fqn));
+              }
+            }
+          }
+          auto filtered = filter_faults_by_fqns(result.data, host_fqns);
+          result.data["faults"] = filtered;
+          result.data["count"] = filtered.size();
+          return result.data;
+        }
+
+        if (entity_ref->type == SovdEntityType::COMPONENT) {
+          // COMPONENT: get all faults, filter by hosted app FQNs
+          auto result = fault_mgr->list_faults("");
+          if (!result.success) {
+            return tl::make_unexpected(result.error_message);
+          }
+          auto app_ids = cache.get_apps_for_component(entity_id);
+          std::set<std::string> app_fqns;
+          for (const auto & app_id : app_ids) {
+            auto app = cache.get_app(app_id);
+            if (app) {
+              auto fqn = app->effective_fqn();
+              if (!fqn.empty()) {
+                app_fqns.insert(std::move(fqn));
+              }
+            }
+          }
+          auto filtered = filter_faults_by_fqns(result.data, app_fqns);
+          result.data["faults"] = filtered;
+          result.data["count"] = filtered.size();
+          return result.data;
+        }
+
+        // APP: use effective_fqn with prefix matching via list_faults
+        // AREA: use namespace_path with prefix matching via list_faults
+        std::string source_id;
+        if (entity_ref->type == SovdEntityType::APP) {
+          auto app = cache.get_app(entity_id);
+          if (app) {
+            source_id = app->effective_fqn();
+          }
+        } else if (entity_ref->type == SovdEntityType::AREA) {
+          auto area = cache.get_area(entity_id);
+          if (area) {
+            source_id = area->namespace_path;
+          }
+        }
+        if (source_id.empty()) {
+          return tl::make_unexpected(std::string("Entity no longer available: " + entity_id));
+        }
+        auto result = fault_mgr->list_faults(source_id);
+        if (!result.success) {
+          return tl::make_unexpected(result.error_message);
+        }
+        return result.data;
+      },
+      true);
+
+  sampler_registry_->register_sampler(
+      "configurations",
+      [this](const std::string & entity_id,
+             const std::string & /*resource_path*/) -> tl::expected<nlohmann::json, std::string> {
+        auto * config_mgr = get_configuration_manager();
+        if (!config_mgr) {
+          return tl::make_unexpected(std::string("ConfigurationManager not available"));
+        }
+        const auto & cache = get_thread_safe_cache();
+        auto entity_configs = cache.get_entity_configurations(entity_id);
+        nlohmann::json items = nlohmann::json::array();
+        for (const auto & node : entity_configs.nodes) {
+          auto result = config_mgr->list_parameters(node.node_fqn);
+          if (result.success && result.data.is_array()) {
+            for (auto & param : result.data) {
+              items.push_back(std::move(param));
+            }
+          }
+        }
+        nlohmann::json payload;
+        payload["items"] = std::move(items);
+        return payload;
+      },
+      true);
+
+  sampler_registry_->register_sampler(
+      "logs",
+      [this](const std::string & entity_id,
+             const std::string & /*resource_path*/) -> tl::expected<nlohmann::json, std::string> {
+        auto * log_mgr = get_log_manager();
+        if (!log_mgr) {
+          return tl::make_unexpected(std::string("LogManager not available"));
+        }
+        // Match log_handlers.cpp scoping logic:
+        // AREA/COMPONENT: entity fqn (namespace_path) with prefix_match=true
+        // FUNCTION: host app FQNs with prefix_match=false (exact)
+        // APP: entity fqn (effective_fqn) with prefix_match=false (exact)
+        const auto & cache = get_thread_safe_cache();
+        auto entity_ref = cache.find_entity(entity_id);
+        if (!entity_ref) {
+          return tl::make_unexpected(std::string("Entity not found: " + entity_id));
+        }
+
+        if (entity_ref->type == SovdEntityType::FUNCTION) {
+          // Aggregate logs from all hosted apps (exact match)
+          auto func = cache.get_function(entity_id);
+          if (!func || func->hosts.empty()) {
+            nlohmann::json payload;
+            payload["items"] = nlohmann::json::array();
+            return payload;
+          }
+          std::vector<std::string> host_fqns;
+          for (const auto & app_id : func->hosts) {
+            auto app = cache.get_app(app_id);
+            if (app) {
+              auto fqn = app->effective_fqn();
+              if (!fqn.empty()) {
+                host_fqns.push_back(std::move(fqn));
+              }
+            }
+          }
+          if (host_fqns.empty()) {
+            nlohmann::json payload;
+            payload["items"] = nlohmann::json::array();
+            return payload;
+          }
+          auto result = log_mgr->get_logs(host_fqns, false, "", "", entity_id);
+          if (!result.has_value()) {
+            return tl::make_unexpected(result.error());
+          }
+          nlohmann::json payload;
+          payload["items"] = std::move(*result);
+          return payload;
+        }
+
+        // AREA and COMPONENT: use namespace_path/fqn with prefix matching
+        // APP: use effective_fqn with exact matching
+        std::string fqn;
+        bool prefix_match = false;
+        if (entity_ref->type == SovdEntityType::AREA) {
+          auto area = cache.get_area(entity_id);
+          if (area) {
+            fqn = area->namespace_path;
+          }
+          prefix_match = true;
+        } else if (entity_ref->type == SovdEntityType::COMPONENT) {
+          auto comp = cache.get_component(entity_id);
+          if (comp) {
+            fqn = comp->fqn;
+          }
+          prefix_match = true;
+        } else if (entity_ref->type == SovdEntityType::APP) {
+          auto app = cache.get_app(entity_id);
+          if (app) {
+            fqn = app->effective_fqn();
+          }
+        }
+
+        if (fqn.empty()) {
+          return tl::make_unexpected(std::string("Entity no longer available: " + entity_id));
+        }
+        auto result = log_mgr->get_logs({fqn}, prefix_match, "", "", entity_id);
+        if (!result.has_value()) {
+          return tl::make_unexpected(result.error());
+        }
+        nlohmann::json payload;
+        payload["items"] = std::move(*result);
+        return payload;
+      },
+      true);
+
+  // Register update status sampler (server-level, uses UpdateManager)
+  if (update_mgr_) {
+    sampler_registry_->register_sampler(
+        "updates",
+        [this](const std::string & /*entity_id*/,
+               const std::string & resource_path) -> tl::expected<nlohmann::json, std::string> {
+          auto * mgr = get_update_manager();
+          if (!mgr || !mgr->has_backend()) {
+            return tl::make_unexpected(std::string("Update backend not available"));
+          }
+          auto result = mgr->get_status(resource_path);
+          if (!result) {
+            return tl::make_unexpected(result.error().message);
+          }
+          return update_status_to_json(*result);
+        },
+        true);
+  }
+
+  RCLCPP_INFO(get_logger(), "Registered built-in resource samplers: data, faults, configurations, logs%s",
+              update_mgr_ ? ", updates" : "");
+
+  // Register built-in SSE transport
+  transport_registry_->register_transport(
+      std::make_unique<SseTransportProvider>(*subscription_mgr_, sse_client_tracker_));
+
+  // Wire subscription lifecycle -> transport cleanup
+  subscription_mgr_->set_on_removed([this](const CyclicSubscriptionInfo & info) {
+    if (auto * transport = transport_registry_->get_transport(info.protocol)) {
+      transport->stop(info.id);
+    }
+  });
+
   // Connect topic sampler to discovery manager for component-topic mapping
   discovery_mgr_->set_topic_sampler(data_access_mgr_->get_native_sampler());
 
@@ -445,6 +1083,11 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
   // Setup periodic refresh with configurable interval
   refresh_timer_ = create_wall_timer(std::chrono::milliseconds(refresh_interval_ms_), [this]() {
     refresh_cache();
+
+    // Sweep triggers whose entities disappeared from discovery
+    if (trigger_mgr_) {
+      trigger_mgr_->sweep_orphaned_triggers();
+    }
   });
 
   // Setup periodic cleanup of old action goals (every 60 seconds, remove goals older than 5 minutes)
@@ -463,6 +1106,12 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
   // Start REST server with configured host, port, CORS, auth, and TLS
   rest_server_ = std::make_unique<RESTServer>(this, server_host_, server_port_, cors_config_, auth_config_,
                                               rate_limit_config_, tls_config_);
+
+  // Wire trigger handlers into REST server
+  if (trigger_mgr_) {
+    rest_server_->set_trigger_handlers(*trigger_mgr_);
+  }
+
   start_rest_server();
 
   std::string protocol = tls_config_.enabled ? "HTTPS" : "HTTP";
@@ -472,10 +1121,30 @@ GatewayNode::GatewayNode() : Node("ros2_medkit_gateway") {
 
 GatewayNode::~GatewayNode() {
   RCLCPP_INFO(get_logger(), "Shutting down ROS 2 Medkit Gateway...");
+  // 1. Stop REST server (kills HTTP connections, SSE streams exit)
   stop_rest_server();
+  // 2. Shutdown subscriptions via transport registry (calls sub_mgr.shutdown(),
+  //    which triggers on_removed -> transport->stop() for each active subscription)
+  if (transport_registry_) {
+    transport_registry_->shutdown_all(*subscription_mgr_);
+  }
+  // 3. Shutdown trigger topic subscriber (stops producing data notifications)
+  if (trigger_topic_subscriber_) {
+    trigger_topic_subscriber_->shutdown();
+  }
+  // 4. Shutdown trigger subsystem (wakes SSE trigger streams)
+  if (trigger_mgr_) {
+    trigger_mgr_->shutdown();
+  }
+  // 5. Shutdown resource change notifier (stops worker thread)
+  if (resource_change_notifier_) {
+    resource_change_notifier_->shutdown();
+  }
+  // 6. Shutdown plugins
   if (plugin_mgr_) {
     plugin_mgr_->shutdown_all();
   }
+  // 7. Normal member destruction (managers safe - all transports stopped)
 }
 
 const ThreadSafeEntityCache & GatewayNode::get_thread_safe_cache() const {
@@ -502,6 +1171,10 @@ FaultManager * GatewayNode::get_fault_manager() const {
   return fault_mgr_.get();
 }
 
+LogManager * GatewayNode::get_log_manager() const {
+  return log_mgr_.get();
+}
+
 BulkDataStore * GatewayNode::get_bulk_data_store() const {
   return bulk_data_store_.get();
 }
@@ -514,53 +1187,76 @@ UpdateManager * GatewayNode::get_update_manager() const {
   return update_mgr_.get();
 }
 
+LockManager * GatewayNode::get_lock_manager() const {
+  return lock_manager_.get();
+}
+
+ScriptManager * GatewayNode::get_script_manager() const {
+  return script_mgr_.get();
+}
+
 PluginManager * GatewayNode::get_plugin_manager() const {
   return plugin_mgr_.get();
+}
+
+ResourceSamplerRegistry * GatewayNode::get_sampler_registry() const {
+  return sampler_registry_.get();
+}
+
+TransportRegistry * GatewayNode::get_transport_registry() const {
+  return transport_registry_.get();
+}
+
+std::shared_ptr<SSEClientTracker> GatewayNode::get_sse_client_tracker() const {
+  return sse_client_tracker_;
+}
+
+ResourceChangeNotifier * GatewayNode::get_resource_change_notifier() const {
+  return resource_change_notifier_.get();
+}
+
+TriggerManager * GatewayNode::get_trigger_manager() const {
+  return trigger_mgr_.get();
+}
+
+ConditionRegistry * GatewayNode::get_condition_registry() const {
+  return condition_registry_.get();
 }
 
 void GatewayNode::refresh_cache() {
   RCLCPP_DEBUG(get_logger(), "Refreshing entity cache...");
 
   try {
-    // Refresh topic map first (rebuilds the cached map)
+    // Refresh topic map first (rebuilds the cached map, triggers pipeline in hybrid mode)
     discovery_mgr_->refresh_topic_map();
 
-    // Discover data outside the lock to minimize lock time
+    // Discover entities - in HYBRID mode the pipeline merges all sources,
+    // in RUNTIME_ONLY mode we manually merge node + topic components
     auto areas = discovery_mgr_->discover_areas();
-
-    // Discover node-based components (standard ROS 2 nodes)
-    auto node_components = discovery_mgr_->discover_components();
-
-    // Discover topic-based components (for systems like Isaac Sim that
-    // publish topics without creating proper ROS 2 nodes)
-    auto topic_components = discovery_mgr_->discover_topic_components();
-
-    // Discover apps (nodes as Apps when heuristic discovery is enabled)
     auto apps = discovery_mgr_->discover_apps();
-
-    // Discover functions (from manifest in manifest_only/hybrid mode)
     auto functions = discovery_mgr_->discover_functions();
 
-    // Merge both component lists
     std::vector<Component> all_components;
-    all_components.reserve(node_components.size() + topic_components.size());
-    all_components.insert(all_components.end(), node_components.begin(), node_components.end());
-    all_components.insert(all_components.end(), topic_components.begin(), topic_components.end());
+    if (discovery_mgr_->get_mode() == DiscoveryMode::RUNTIME_ONLY) {
+      // RUNTIME_ONLY: merge node + topic components (no pipeline)
+      auto node_components = discovery_mgr_->discover_components();
+      auto topic_components = discovery_mgr_->discover_topic_components();
+      all_components.reserve(node_components.size() + topic_components.size());
+      all_components.insert(all_components.end(), node_components.begin(), node_components.end());
+      all_components.insert(all_components.end(), topic_components.begin(), topic_components.end());
+    } else {
+      // HYBRID: pipeline merges all sources; MANIFEST_ONLY: manifest components only
+      all_components = discovery_mgr_->discover_components();
+    }
 
-    // Capture sizes before move for logging
+    // Capture sizes for logging
     const size_t area_count = areas.size();
-    const size_t node_component_count = node_components.size();
-    const size_t topic_component_count = topic_components.size();
+    const size_t component_count = all_components.size();
     const size_t app_count = apps.size();
     const size_t function_count = functions.size();
 
-    // Update ThreadSafeEntityCache (primary) with copies
-    // This provides O(1) lookups and proper thread safety
-    thread_safe_cache_.update_all(areas,           // copy
-                                  all_components,  // copy
-                                  apps,            // copy
-                                  functions        // copy
-    );
+    // Update ThreadSafeEntityCache with copies
+    thread_safe_cache_.update_all(areas, all_components, apps, functions);
 
     // Update topic type cache (avoids expensive ROS graph queries on /data requests)
     if (data_access_mgr_) {
@@ -576,11 +1272,8 @@ void GatewayNode::refresh_cache() {
       thread_safe_cache_.update_topic_types(std::move(topic_types));
     }
 
-    RCLCPP_DEBUG(
-        get_logger(),
-        "Cache refreshed: %zu areas, %zu components (%zu node-based, %zu topic-based), %zu apps, %zu functions",
-        area_count, node_component_count + topic_component_count, node_component_count, topic_component_count,
-        app_count, function_count);
+    RCLCPP_DEBUG(get_logger(), "Cache refreshed: %zu areas, %zu components, %zu apps, %zu functions", area_count,
+                 component_count, app_count, function_count);
   } catch (const std::exception & e) {
     RCLCPP_ERROR(get_logger(), "Failed to refresh cache: %s", e.what());
   } catch (...) {

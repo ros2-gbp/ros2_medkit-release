@@ -16,6 +16,7 @@
 
 #include "ros2_medkit_gateway/plugins/plugin_types.hpp"
 #include "ros2_medkit_gateway/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/providers/script_provider.hpp"
 #include "ros2_medkit_gateway/providers/update_provider.hpp"
 
 #include <dlfcn.h>
@@ -30,6 +31,8 @@ namespace ros2_medkit_gateway {
 GatewayPluginLoadResult::~GatewayPluginLoadResult() {
   update_provider = nullptr;
   introspection_provider = nullptr;
+  log_provider = nullptr;
+  script_provider = nullptr;
   plugin.reset();
   if (handle_) {
     dlclose(handle_);
@@ -40,9 +43,13 @@ GatewayPluginLoadResult::GatewayPluginLoadResult(GatewayPluginLoadResult && othe
   : plugin(std::move(other.plugin))
   , update_provider(other.update_provider)
   , introspection_provider(other.introspection_provider)
+  , log_provider(other.log_provider)
+  , script_provider(other.script_provider)
   , handle_(other.handle_) {
   other.update_provider = nullptr;
   other.introspection_provider = nullptr;
+  other.log_provider = nullptr;
+  other.script_provider = nullptr;
   other.handle_ = nullptr;
 }
 
@@ -51,6 +58,8 @@ GatewayPluginLoadResult & GatewayPluginLoadResult::operator=(GatewayPluginLoadRe
     // Destroy current state in correct order
     update_provider = nullptr;
     introspection_provider = nullptr;
+    log_provider = nullptr;
+    script_provider = nullptr;
     plugin.reset();
     if (handle_) {
       dlclose(handle_);
@@ -60,10 +69,14 @@ GatewayPluginLoadResult & GatewayPluginLoadResult::operator=(GatewayPluginLoadRe
     plugin = std::move(other.plugin);
     update_provider = other.update_provider;
     introspection_provider = other.introspection_provider;
+    log_provider = other.log_provider;
+    script_provider = other.script_provider;
     handle_ = other.handle_;
 
     other.update_provider = nullptr;
     other.introspection_provider = nullptr;
+    other.log_provider = nullptr;
+    other.script_provider = nullptr;
     other.handle_ = nullptr;
   }
   return *this;
@@ -182,6 +195,34 @@ tl::expected<GatewayPluginLoadResult, std::string> PluginLoader::load(const std:
                   plugin_path.c_str(), e.what());
     } catch (...) {
       RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_introspection_provider threw unknown exception in %s",
+                  plugin_path.c_str());
+    }
+  }
+
+  using LogProviderFn = LogProvider * (*)(GatewayPlugin *);
+  auto log_fn = reinterpret_cast<LogProviderFn>(dlsym(handle, "get_log_provider"));
+  if (log_fn) {
+    try {
+      result.log_provider = log_fn(raw_plugin);
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_log_provider threw in %s: %s", plugin_path.c_str(),
+                  e.what());
+    } catch (...) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_log_provider threw unknown exception in %s",
+                  plugin_path.c_str());
+    }
+  }
+
+  using ScriptProviderFn = ScriptProvider * (*)(GatewayPlugin *);
+  auto script_fn = reinterpret_cast<ScriptProviderFn>(dlsym(handle, "get_script_provider"));
+  if (script_fn) {
+    try {
+      result.script_provider = script_fn(raw_plugin);
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_script_provider threw in %s: %s", plugin_path.c_str(),
+                  e.what());
+    } catch (...) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_script_provider threw unknown exception in %s",
                   plugin_path.c_str());
     }
   }

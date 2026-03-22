@@ -14,6 +14,8 @@
 
 #include "ros2_medkit_gateway/plugins/plugin_manager.hpp"
 
+#include <dlfcn.h>
+
 #include <rclcpp/rclcpp.hpp>
 
 namespace ros2_medkit_gateway {
@@ -55,6 +57,8 @@ void PluginManager::add_plugin(std::unique_ptr<GatewayPlugin> plugin) {
   // For in-process plugins, use dynamic_cast (safe within same binary)
   lp.update_provider = dynamic_cast<UpdateProvider *>(plugin.get());
   lp.introspection_provider = dynamic_cast<IntrospectionProvider *>(plugin.get());
+  lp.log_provider = dynamic_cast<LogProvider *>(plugin.get());
+  lp.script_provider = dynamic_cast<ScriptProvider *>(plugin.get());
 
   // Cache first UpdateProvider, warn on duplicates
   if (lp.update_provider) {
@@ -62,6 +66,24 @@ void PluginManager::add_plugin(std::unique_ptr<GatewayPlugin> plugin) {
       first_update_provider_ = lp.update_provider;
     } else {
       RCLCPP_WARN(logger(), "Multiple UpdateProvider plugins loaded - ignoring '%s'", plugin->name().c_str());
+    }
+  }
+
+  // Cache first LogProvider; additional LogProvider plugins are observers only
+  if (lp.log_provider) {
+    if (!first_log_provider_) {
+      first_log_provider_ = lp.log_provider;
+    } else {
+      RCLCPP_DEBUG(logger(), "LogProvider plugin '%s' registered as observer only", plugin->name().c_str());
+    }
+  }
+
+  // Cache first ScriptProvider, warn on duplicates
+  if (lp.script_provider) {
+    if (!first_script_provider_) {
+      first_script_provider_ = lp.script_provider;
+    } else {
+      RCLCPP_WARN(logger(), "Multiple ScriptProvider plugins loaded - ignoring '%s'", plugin->name().c_str());
     }
   }
 
@@ -83,6 +105,10 @@ size_t PluginManager::load_plugins(const std::vector<PluginConfig> & configs) {
       // Provider pointers from extern "C" query functions (safe across dlopen boundary)
       lp.update_provider = result->update_provider;
       lp.introspection_provider = result->introspection_provider;
+      // LogProvider: discovered via extern "C" query function (mirrors UpdateProvider /
+      // IntrospectionProvider mechanism - safe across the dlopen boundary).
+      lp.log_provider = result->log_provider;
+      lp.script_provider = result->script_provider;
 
       // Cache first UpdateProvider, warn on duplicates
       if (lp.update_provider) {
@@ -90,6 +116,25 @@ size_t PluginManager::load_plugins(const std::vector<PluginConfig> & configs) {
           first_update_provider_ = lp.update_provider;
         } else {
           RCLCPP_WARN(logger(), "Multiple UpdateProvider plugins loaded - ignoring '%s'",
+                      result->plugin->name().c_str());
+        }
+      }
+
+      // Cache first LogProvider; additional LogProvider plugins are observers only
+      if (lp.log_provider) {
+        if (!first_log_provider_) {
+          first_log_provider_ = lp.log_provider;
+        } else {
+          RCLCPP_DEBUG(logger(), "LogProvider plugin '%s' registered as observer only", result->plugin->name().c_str());
+        }
+      }
+
+      // Cache first ScriptProvider, warn on duplicates
+      if (lp.script_provider) {
+        if (!first_script_provider_) {
+          first_script_provider_ = lp.script_provider;
+        } else {
+          RCLCPP_WARN(logger(), "Multiple ScriptProvider plugins loaded - ignoring '%s'",
                       result->plugin->name().c_str());
         }
       }
@@ -126,14 +171,37 @@ void PluginManager::disable_plugin(LoadedPlugin & lp) {
       }
     }
   }
+  if (first_log_provider_ && lp.log_provider == first_log_provider_) {
+    first_log_provider_ = nullptr;
+    for (const auto & other : plugins_) {
+      if (&other != &lp && other.load_result.plugin && other.log_provider) {
+        first_log_provider_ = other.log_provider;
+        break;
+      }
+    }
+  }
+  if (first_script_provider_ && lp.script_provider == first_script_provider_) {
+    first_script_provider_ = nullptr;
+    for (const auto & other : plugins_) {
+      if (&other != &lp && other.load_result.plugin && other.script_provider) {
+        first_script_provider_ = other.script_provider;
+        break;
+      }
+    }
+  }
   lp.update_provider = nullptr;
   lp.introspection_provider = nullptr;
+  lp.log_provider = nullptr;
+  lp.script_provider = nullptr;
   lp.load_result.update_provider = nullptr;
   lp.load_result.introspection_provider = nullptr;
+  lp.load_result.log_provider = nullptr;
+  lp.load_result.script_provider = nullptr;
   lp.load_result.plugin.reset();
 }
 
 void PluginManager::configure_plugins() {
+  std::unique_lock<std::shared_mutex> lock(plugins_mutex_);
   for (auto & lp : plugins_) {
     if (!lp.load_result.plugin) {
       continue;
@@ -154,6 +222,7 @@ void PluginManager::configure_plugins() {
 
 void PluginManager::set_context(PluginContext & context) {
   context_ = &context;
+  std::unique_lock<std::shared_mutex> lock(plugins_mutex_);
   for (auto & lp : plugins_) {
     if (!lp.load_result.plugin) {
       continue;
@@ -172,7 +241,27 @@ void PluginManager::set_context(PluginContext & context) {
   }
 }
 
+void PluginManager::set_registries(ResourceSamplerRegistry & samplers, TransportRegistry & transports) {
+  sampler_registry_ = &samplers;
+  transport_registry_ = &transports;
+}
+
+void PluginManager::register_resource_sampler(const std::string & collection, ResourceSamplerFn fn) {
+  if (!sampler_registry_) {
+    throw std::runtime_error("Sampler registry not initialized");
+  }
+  sampler_registry_->register_sampler(collection, std::move(fn));
+}
+
+void PluginManager::register_transport(std::unique_ptr<SubscriptionTransportProvider> provider) {
+  if (!transport_registry_) {
+    throw std::runtime_error("Transport registry not initialized");
+  }
+  transport_registry_->register_transport(std::move(provider));
+}
+
 void PluginManager::register_routes(httplib::Server & server, const std::string & api_prefix) {
+  std::unique_lock<std::shared_mutex> lock(plugins_mutex_);
   for (auto & lp : plugins_) {
     if (!lp.load_result.plugin) {
       continue;
@@ -196,6 +285,7 @@ void PluginManager::shutdown_all() {
     return;
   }
   shutdown_called_ = true;
+  std::unique_lock<std::shared_mutex> lock(plugins_mutex_);
   for (auto & lp : plugins_) {
     if (!lp.load_result.plugin) {
       continue;
@@ -212,10 +302,12 @@ void PluginManager::shutdown_all() {
 }
 
 UpdateProvider * PluginManager::get_update_provider() const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
   return first_update_provider_;
 }
 
 std::vector<IntrospectionProvider *> PluginManager::get_introspection_providers() const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
   std::vector<IntrospectionProvider *> result;
   for (const auto & lp : plugins_) {
     if (!lp.load_result.plugin) {
@@ -228,7 +320,61 @@ std::vector<IntrospectionProvider *> PluginManager::get_introspection_providers(
   return result;
 }
 
+LogProvider * PluginManager::get_log_provider() const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+  return first_log_provider_;
+}
+
+ScriptProvider * PluginManager::get_script_provider() const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+  return first_script_provider_;
+}
+
+std::vector<LogProvider *> PluginManager::get_log_observers() const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+  std::vector<LogProvider *> result;
+  for (const auto & lp : plugins_) {
+    if (lp.log_provider) {
+      result.push_back(lp.log_provider);
+    }
+  }
+  return result;
+}
+
+std::vector<std::pair<std::string, IntrospectionProvider *>> PluginManager::get_named_introspection_providers() const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+  std::vector<std::pair<std::string, IntrospectionProvider *>> result;
+  for (const auto & lp : plugins_) {
+    if (!lp.load_result.plugin) {
+      continue;
+    }
+    if (lp.introspection_provider) {
+      result.emplace_back(lp.load_result.plugin->name(), lp.introspection_provider);
+    }
+  }
+  return result;
+}
+
+std::vector<GatewayPlugin::RouteDescription> PluginManager::get_all_route_descriptions() const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+  std::vector<GatewayPlugin::RouteDescription> all;
+  for (const auto & lp : plugins_) {
+    if (!lp.load_result.plugin) {
+      continue;
+    }
+    try {
+      auto routes = lp.load_result.plugin->get_route_descriptions();
+      all.insert(all.end(), routes.begin(), routes.end());
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(rclcpp::get_logger("plugin_manager"), "Plugin '%s' threw in get_route_descriptions(): %s",
+                   lp.load_result.plugin->name().c_str(), e.what());
+    }
+  }
+  return all;
+}
+
 bool PluginManager::has_plugins() const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
   for (const auto & lp : plugins_) {
     if (lp.load_result.plugin) {
       return true;
@@ -238,6 +384,7 @@ bool PluginManager::has_plugins() const {
 }
 
 std::vector<std::string> PluginManager::plugin_names() const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
   std::vector<std::string> names;
   for (const auto & lp : plugins_) {
     if (lp.load_result.plugin) {
@@ -245,6 +392,41 @@ std::vector<std::string> PluginManager::plugin_names() const {
     }
   }
   return names;
+}
+
+std::vector<openapi::RouteDescriptions> PluginManager::collect_route_descriptions() const {
+  std::vector<openapi::RouteDescriptions> all_descriptions;
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+
+  for (const auto & lp : plugins_) {
+    if (!lp.load_result.plugin) {
+      continue;
+    }
+
+    void * handle = lp.load_result.dl_handle();
+    if (!handle) {
+      continue;
+    }
+
+    // Check for optional describe_plugin_routes symbol
+    using DescribeFn = openapi::RouteDescriptions (*)();
+    auto fn = reinterpret_cast<DescribeFn>(dlsym(handle, "describe_plugin_routes"));
+    if (!fn) {
+      continue;  // Plugin doesn't export route descriptions - skip silently
+    }
+
+    try {
+      all_descriptions.push_back(fn());
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(logger(), "Plugin '%s' threw in describe_plugin_routes(): %s", lp.load_result.plugin->name().c_str(),
+                  e.what());
+    } catch (...) {
+      RCLCPP_WARN(logger(), "Plugin '%s' threw unknown exception in describe_plugin_routes()",
+                  lp.load_result.plugin->name().c_str());
+    }
+  }
+
+  return all_descriptions;
 }
 
 }  // namespace ros2_medkit_gateway
