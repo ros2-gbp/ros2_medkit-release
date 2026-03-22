@@ -5,9 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Multi-distro compatibility (Humble / Jazzy / Rolling)
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+# Shared cmake modules (multi-distro compat, ccache, linting)
+find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
+include(ROS2MedkitCcache)
+include(ROS2MedkitLinting)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
@@ -48,6 +50,10 @@ add_library(${PROJECT_NAME}
   src/vendored/dynmsg/vector_utils.cpp
   src/vendored/dynmsg/yaml_utils.cpp
 )
+
+# Enable PIC so this static library can be linked into shared objects
+# (e.g. test_gateway_plugin.so via gateway_lib.a)
+set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -105,7 +111,6 @@ install(DIRECTORY include/
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
-  find_package(ament_cmake_clang_tidy REQUIRED)
   find_package(std_msgs REQUIRED)
   find_package(std_srvs REQUIRED)
   find_package(geometry_msgs REQUIRED)
@@ -140,11 +145,7 @@ if(BUILD_TESTING)
     "test/test_type_cache.cpp"
   )
 
-  # Configure clang-tidy manually for non-vendored files only
-  set(_clang_tidy_config "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-tidy")
-  ament_clang_tidy(
-    "${CMAKE_CURRENT_BINARY_DIR}"
-    CONFIG_FILE "${_clang_tidy_config}"
+  ros2_medkit_clang_tidy(
     HEADER_FILTER "^${CMAKE_CURRENT_SOURCE_DIR}/include/ros2_medkit_serialization/[^v].*"
     TIMEOUT 300
   )
