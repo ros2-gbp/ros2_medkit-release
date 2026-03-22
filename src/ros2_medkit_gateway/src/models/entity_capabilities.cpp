@@ -23,18 +23,10 @@ EntityCapabilities EntityCapabilities::for_type(SovdEntityType type) {
     case SovdEntityType::SERVER:
       // SERVER supports all collections
       caps.collections_ = {
-          ResourceCollection::CONFIGURATIONS,
-          ResourceCollection::DATA,
-          ResourceCollection::FAULTS,
-          ResourceCollection::OPERATIONS,
-          ResourceCollection::BULK_DATA,
-          ResourceCollection::DATA_LISTS,
-          ResourceCollection::LOCKS,
-          ResourceCollection::MODES,
-          ResourceCollection::CYCLIC_SUBSCRIPTIONS,
-          ResourceCollection::COMMUNICATION_LOGS,
-          ResourceCollection::TRIGGERS,
-          ResourceCollection::SCRIPTS,
+          ResourceCollection::CONFIGURATIONS, ResourceCollection::DATA,      ResourceCollection::FAULTS,
+          ResourceCollection::OPERATIONS,     ResourceCollection::BULK_DATA, ResourceCollection::DATA_LISTS,
+          ResourceCollection::LOCKS,          ResourceCollection::MODES,     ResourceCollection::CYCLIC_SUBSCRIPTIONS,
+          ResourceCollection::LOGS,           ResourceCollection::TRIGGERS,  ResourceCollection::SCRIPTS,
           ResourceCollection::UPDATES,
       };
       // SERVER resources
@@ -42,27 +34,26 @@ EntityCapabilities EntityCapabilities::for_type(SovdEntityType type) {
       break;
 
     case SovdEntityType::AREA:
-      // AREA does NOT support resource collections per SOVD spec
-      // Only navigation/relationship resources
-      caps.collections_ = {};
+      // ros2_medkit extension: areas support resource collections via aggregation
+      // (SOVD spec defines collections only for apps/components)
+      caps.collections_ = {
+          ResourceCollection::DATA,   ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS,
+          ResourceCollection::FAULTS, ResourceCollection::LOGS,       ResourceCollection::BULK_DATA,
+      };
+      caps.aggregated_collections_ = {
+          ResourceCollection::DATA,   ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS,
+          ResourceCollection::FAULTS, ResourceCollection::LOGS,
+      };
       caps.resources_ = {"docs", "contains", "subareas", "related-components"};
       break;
 
     case SovdEntityType::COMPONENT:
       // COMPONENT supports most collections
       caps.collections_ = {
-          ResourceCollection::CONFIGURATIONS,
-          ResourceCollection::DATA,
-          ResourceCollection::FAULTS,
-          ResourceCollection::OPERATIONS,
-          ResourceCollection::BULK_DATA,
-          ResourceCollection::DATA_LISTS,
-          ResourceCollection::LOCKS,
-          ResourceCollection::MODES,
-          ResourceCollection::CYCLIC_SUBSCRIPTIONS,
-          ResourceCollection::COMMUNICATION_LOGS,
-          ResourceCollection::TRIGGERS,
-          ResourceCollection::SCRIPTS,
+          ResourceCollection::CONFIGURATIONS, ResourceCollection::DATA,      ResourceCollection::FAULTS,
+          ResourceCollection::OPERATIONS,     ResourceCollection::BULK_DATA, ResourceCollection::DATA_LISTS,
+          ResourceCollection::LOCKS,          ResourceCollection::MODES,     ResourceCollection::CYCLIC_SUBSCRIPTIONS,
+          ResourceCollection::LOGS,           ResourceCollection::TRIGGERS,  ResourceCollection::SCRIPTS,
           ResourceCollection::UPDATES,
       };
       caps.resources_ = {"docs",       "logs",          "hosts",           "belongs-to",
@@ -72,33 +63,30 @@ EntityCapabilities EntityCapabilities::for_type(SovdEntityType type) {
     case SovdEntityType::APP:
       // APP supports most collections
       caps.collections_ = {
-          ResourceCollection::CONFIGURATIONS,
-          ResourceCollection::DATA,
-          ResourceCollection::FAULTS,
-          ResourceCollection::OPERATIONS,
-          ResourceCollection::BULK_DATA,
-          ResourceCollection::DATA_LISTS,
-          ResourceCollection::LOCKS,
-          ResourceCollection::MODES,
-          ResourceCollection::CYCLIC_SUBSCRIPTIONS,
-          ResourceCollection::COMMUNICATION_LOGS,
-          ResourceCollection::TRIGGERS,
-          ResourceCollection::SCRIPTS,
+          ResourceCollection::CONFIGURATIONS, ResourceCollection::DATA,      ResourceCollection::FAULTS,
+          ResourceCollection::OPERATIONS,     ResourceCollection::BULK_DATA, ResourceCollection::DATA_LISTS,
+          ResourceCollection::LOCKS,          ResourceCollection::MODES,     ResourceCollection::CYCLIC_SUBSCRIPTIONS,
+          ResourceCollection::LOGS,           ResourceCollection::TRIGGERS,  ResourceCollection::SCRIPTS,
           ResourceCollection::UPDATES,
       };
       caps.resources_ = {"docs", "logs", "is-located-on", "belongs-to", "depends-on", "data-categories", "data-groups"};
       break;
 
     case SovdEntityType::FUNCTION:
-      // FUNCTION only supports data and operations (aggregated from Apps)
+      // ros2_medkit extension: functions support additional collections via aggregation
+      // (SOVD spec only defines data/operations for functions)
       caps.collections_ = {
           ResourceCollection::DATA,
           ResourceCollection::OPERATIONS,
+          ResourceCollection::CONFIGURATIONS,
+          ResourceCollection::FAULTS,
+          ResourceCollection::LOGS,
+          ResourceCollection::BULK_DATA,
+          ResourceCollection::CYCLIC_SUBSCRIPTIONS,
       };
-      // Mark these as aggregated
       caps.aggregated_collections_ = {
-          ResourceCollection::DATA,
-          ResourceCollection::OPERATIONS,
+          ResourceCollection::DATA,   ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS,
+          ResourceCollection::FAULTS, ResourceCollection::LOGS,
       };
       caps.resources_ = {"docs", "hosts", "depends-on"};
       break;

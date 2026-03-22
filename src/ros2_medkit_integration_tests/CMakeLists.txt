@@ -10,8 +10,8 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 
-# Multi-distro compatibility (Humble / Jazzy / Rolling)
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+# Shared cmake modules (multi-distro compat, ccache, linting)
+find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 
 find_package(ament_cmake_python REQUIRED)
@@ -23,6 +23,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(example_interfaces REQUIRED)
 find_package(ros2_medkit_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 
 # === Demo node executables ===
 
@@ -53,6 +54,12 @@ medkit_target_dependencies(demo_long_calibration_action rclcpp rclcpp_action exa
 add_executable(demo_lidar_sensor demo_nodes/lidar_sensor.cpp)
 medkit_target_dependencies(demo_lidar_sensor rclcpp rcl_interfaces sensor_msgs std_srvs ros2_medkit_msgs)
 
+add_executable(demo_beacon_publisher demo_nodes/beacon_publisher.cpp)
+medkit_target_dependencies(demo_beacon_publisher rclcpp ros2_medkit_msgs diagnostic_msgs)
+
+add_executable(demo_param_beacon_node demo_nodes/param_beacon_node.cpp)
+medkit_target_dependencies(demo_param_beacon_node rclcpp)
+
 install(TARGETS
   demo_engine_temp_sensor
   demo_rpm_sensor
@@ -63,6 +70,8 @@ install(TARGETS
   demo_calibration_service
   demo_long_calibration_action
   demo_lidar_sensor
+  demo_beacon_publisher
+  demo_param_beacon_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -79,6 +88,15 @@ install(DIRECTORY launch/ DESTINATION share/${PROJECT_NAME}/launch)
 if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)
 
+  # Each integration test gets a unique HTTP port via GATEWAY_TEST_PORT env var,
+  # allowing parallel CTest execution without port conflicts.
+  # Stride of 10 per test so multi-gateway tests can use get_test_port(offset).
+  # Each test also gets a unique ROS_DOMAIN_ID to prevent DDS cross-contamination
+  # between tests (e.g., stale DDS participants from previous tests leaking into
+  # subsequent test's graph discovery).
+  set(_INTEG_PORT 9100)
+  set(_INTEG_DOMAIN_ID 100)
+
   # Feature tests (atomic, independent, 120s timeout)
   file(GLOB FEATURE_TESTS test/features/*.test.py)
   foreach(test_file ${FEATURE_TESTS})
@@ -87,7 +105,12 @@ if(BUILD_TESTING)
       TARGET ${test_name}
       TIMEOUT 120
     )
-    set_tests_properties(${test_name} PROPERTIES LABELS "integration;feature")
+    set_tests_properties(${test_name} PROPERTIES
+      LABELS "integration;feature"
+      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT};ROS_DOMAIN_ID=${_INTEG_DOMAIN_ID}"
+    )
+    math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
+    math(EXPR _INTEG_DOMAIN_ID "${_INTEG_DOMAIN_ID} + 1")
   endforeach()
 
   # Scenario tests (E2E stories, 300s timeout)
@@ -98,7 +121,12 @@ if(BUILD_TESTING)
       TARGET ${test_name}
       TIMEOUT 300
     )
-    set_tests_properties(${test_name} PROPERTIES LABELS "integration;scenario")
+    set_tests_properties(${test_name} PROPERTIES
+      LABELS "integration;scenario"
+      ENVIRONMENT "GATEWAY_TEST_PORT=${_INTEG_PORT};ROS_DOMAIN_ID=${_INTEG_DOMAIN_ID}"
+    )
+    math(EXPR _INTEG_PORT "${_INTEG_PORT} + 10")
+    math(EXPR _INTEG_DOMAIN_ID "${_INTEG_DOMAIN_ID} + 1")
   endforeach()
 endif()
 

@@ -119,9 +119,9 @@ Option 1: Using Launch File
                package='ros2_medkit_gateway',
                executable='gateway_node',
                parameters=[{
-                   'manifest.enabled': True,
-                   'manifest.file_path': '/path/to/system_manifest.yaml',
-                   'manifest.mode': 'hybrid',
+                   'discovery.mode': 'hybrid',
+                   'discovery.manifest_path': '/path/to/system_manifest.yaml',
+                   'discovery.manifest_strict_validation': True,
                }]
            )
        ])
@@ -137,18 +137,15 @@ Add to your ``gateway_params.yaml``:
      ros__parameters:
        # ... existing parameters ...
 
-       manifest:
-         # Enable manifest-based discovery
-         enabled: true
-
-         # Path to manifest YAML file
-         file_path: "/path/to/system_manifest.yaml"
-
+       discovery:
          # Discovery mode: "runtime_only", "hybrid", or "manifest_only"
          mode: "hybrid"
 
+         # Path to manifest YAML file (required for hybrid and manifest_only)
+         manifest_path: "/path/to/system_manifest.yaml"
+
          # Strict validation: fail on any validation error
-         strict_validation: true
+         manifest_strict_validation: true
 
 Then launch with:
 
@@ -163,9 +160,8 @@ Option 3: Command Line Parameters
 .. code-block:: bash
 
    ros2 run ros2_medkit_gateway gateway_node --ros-args \
-       -p manifest.enabled:=true \
-       -p manifest.file_path:=/path/to/system_manifest.yaml \
-       -p manifest.mode:=hybrid
+       -p discovery.mode:=hybrid \
+       -p discovery.manifest_path:=/path/to/system_manifest.yaml
 
 Verifying the Configuration
 ---------------------------
@@ -207,16 +203,74 @@ List functions:
 
    curl http://localhost:8080/api/v1/functions
 
-Understanding Runtime Linking
------------------------------
+Understanding Hybrid Mode
+-------------------------
 
-In hybrid mode, manifest apps are automatically linked to running ROS 2 nodes.
-The linking process:
+In hybrid mode, discovery uses a **merge pipeline** that combines entities from
+multiple discovery layers:
 
-1. **Discovery**: Gateway discovers running ROS 2 nodes
-2. **Matching**: For each manifest app, checks ``ros_binding`` configuration
-3. **Linking**: If match found, copies runtime resources (topics, services, actions)
-4. **Status**: Apps with matched nodes are marked ``is_online: true``
+1. **ManifestLayer** (highest priority) - entities from the YAML manifest
+2. **RuntimeLayer** - entities discovered via ROS 2 graph introspection
+3. **PluginLayers** (optional) - entities from gateway plugins
+
+The pipeline merges entities by ID. When the same entity appears in multiple layers,
+per-field-group merge policies determine which values win. See
+:doc:`/config/discovery-options` for details on merge policies and gap-fill configuration.
+
+After merging, the **RuntimeLinker** binds manifest apps to running ROS 2 nodes:
+
+1. **Discovery**: All layers produce entities
+2. **Merging**: Pipeline merges entities by ID, applying field-group policies
+3. **Linking**: For each manifest app, checks ``ros_binding`` configuration
+4. **Binding**: If match found, copies runtime resources (topics, services, actions)
+5. **Status**: Apps with matched nodes are marked ``is_online: true``
+
+Merge Report
+~~~~~~~~~~~~
+
+After each pipeline execution, the gateway produces a ``MergeReport`` available
+via the health endpoint (``GET /health``). The report includes:
+
+- Layer names and ordering
+- Total entity count, enrichment count
+- Conflict details (which layers disagreed on which field groups)
+- Cross-type ID collision warnings
+- Gap-fill filtering statistics
+
+In hybrid mode, the ``GET /health`` response includes full discovery diagnostics:
+
+.. code-block:: json
+
+   {
+     "discovery": {
+       "mode": "hybrid",
+       "strategy": "hybrid",
+       "pipeline": {
+         "layers": ["manifest", "runtime"],
+         "total_entities": 12,
+         "enriched_count": 8,
+         "conflict_count": 0,
+         "id_collisions": 0
+       },
+       "linking": {
+         "linked_count": 5,
+         "orphan_count": 1,
+         "binding_conflicts": 0,
+         "warnings": ["Orphan node: /unmanifested_node"]
+       }
+     }
+   }
+
+
+Runtime Linking
+~~~~~~~~~~~~~~~
+
+.. note::
+
+   In hybrid mode, the gateway uses a layered merge pipeline: manifest entities,
+   runtime-discovered entities, and plugin-contributed entities are merged per
+   field-group before linking. See :doc:`/config/discovery-options` for merge
+   pipeline configuration.
 
 ROS Binding Configuration
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -237,7 +291,8 @@ The ``ros_binding`` section specifies how to match an app to a ROS 2 node:
 
 **Match Types:**
 
-- **Exact match** (default): Node name and namespace must match exactly
+- **Name and namespace match** (default): Node name must match exactly. Namespace uses
+  path-segment-boundary matching (``/nav`` matches ``/nav`` and ``/nav/sub`` but NOT ``/navigation``)
 - **Wildcard namespace**: Use ``namespace: "*"`` to match any namespace
 - **Topic namespace**: Match nodes by their topic prefix
 
@@ -265,7 +320,7 @@ Check which apps are online:
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/apps | jq '.[] | {id, name, is_online}'
+   curl http://localhost:8080/api/v1/apps | jq '.items[] | {id, name, is_online}'
 
 Example response:
 
@@ -341,24 +396,31 @@ The manifest defines a hierarchical structure:
          - controller-node
          - localization-node
 
-Handling Unmanifested Nodes
----------------------------
+Controlling Gap-Fill in Hybrid Mode
+------------------------------------
 
-In hybrid mode, the gateway may discover ROS 2 nodes that aren't declared
-in the manifest. The ``config.unmanifested_nodes`` setting controls this:
+In hybrid mode, the runtime layer can create heuristic entities for namespaces
+not covered by the manifest. The ``merge_pipeline.gap_fill`` parameters control
+this behavior:
 
 .. code-block:: yaml
 
-   config:
-     # Options: ignore, warn, error, include_as_orphan
-     unmanifested_nodes: warn
+   discovery:
+     merge_pipeline:
+       gap_fill:
+         allow_heuristic_areas: true        # Create areas from namespaces
+         allow_heuristic_components: true    # Create synthetic components
+         allow_heuristic_apps: true          # Create apps from unbound nodes
+         allow_heuristic_functions: false    # Don't create heuristic functions
+         # namespace_blacklist: ["/rosout"]  # Exclude specific namespaces
+         # namespace_whitelist: []           # If set, only allow these namespaces
 
-**Policies:**
+When all ``allow_heuristic_*`` options are ``false``, only manifest-declared
+entities appear. Runtime nodes are still discovered for linking, but no
+heuristic entities (areas, components, apps, functions) are created from
+unmatched namespaces or nodes.
 
-- ``ignore``: Don't expose unmanifested nodes at all
-- ``warn`` (default): Log warning, include nodes as orphans
-- ``error``: Fail startup if orphan nodes detected
-- ``include_as_orphan``: Include with ``source: "orphan"``
+See :doc:`/config/discovery-options` for the full merge pipeline reference.
 
 Hot Reloading
 -------------

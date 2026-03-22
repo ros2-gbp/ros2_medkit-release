@@ -30,6 +30,7 @@ A manifest file has the following top-level structure:
    components: []         # Optional - component definitions
    apps: []               # Optional - app definitions
    functions: []          # Optional - function definitions
+   scripts: []             # Optional - pre-defined script entries
 
 manifest_version (Required)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -229,6 +230,11 @@ Schema
        depends_on: [string]    # Optional - component IDs this depends on
        subcomponents: []       # Optional - nested definitions
 
+       lock:                   # Optional - per-entity lock configuration
+         required_scopes: [string]  # Collections requiring a lock before mutation
+         breakable: boolean         # Whether locks can be broken (default: true)
+         max_expiration: integer    # Max lock TTL in seconds (0 = global default)
+
 Fields
 ~~~~~~
 
@@ -365,6 +371,11 @@ Schema
          namespace: string     # Optional - namespace (default: /)
          topic_namespace: string  # Optional - match by topic prefix
 
+       lock:                   # Optional - per-entity lock configuration
+         required_scopes: [string]  # Collections requiring a lock before mutation
+         breakable: boolean         # Whether locks can be broken (default: true)
+         max_expiration: integer    # Max lock TTL in seconds (0 = global default)
+
 Fields
 ~~~~~~
 
@@ -441,7 +452,9 @@ ros_binding Fields
 
 **Matching behavior:**
 
-1. **Exact match** (default): ``node_name`` and ``namespace`` must match exactly
+1. **Name and namespace match** (default): ``node_name`` must match exactly.
+   ``namespace`` uses path-segment-boundary matching: ``/nav`` matches ``/nav``
+   and ``/nav/sub`` but NOT ``/navigation``.
 2. **Wildcard namespace**: Set ``namespace: "*"`` to match node in any namespace
 3. **Topic namespace**: Match nodes by their published topic prefix
 
@@ -598,6 +611,122 @@ Example
          - camera-driver
          - point-cloud-processor
 
+Scripts
+-------
+
+Scripts define pre-deployed diagnostic scripts that are available on entities.
+Scripts defined in the manifest are ``managed`` - they cannot be deleted via the REST API.
+
+.. note::
+
+   Manifest scripts are only loaded when ``scripts.scripts_dir`` is configured in the
+   gateway parameters. Without it, the ``scripts:`` block is parsed but scripts are
+   not exposed via the REST API.
+
+Schema
+~~~~~~
+
+.. code-block:: yaml
+
+   scripts:
+     - id: string              # Required - unique identifier
+       name: string            # Optional - human-readable name (defaults to id)
+       description: string     # Optional - detailed description
+       path: string            # Required - filesystem path to script file
+       format: string          # Required - execution format (bash, python, sh)
+       timeout_sec: integer    # Optional - execution timeout (default: 300)
+       entity_filter: [string] # Optional - glob patterns for entity matching
+       env:                    # Optional - environment variables
+         KEY: "value"
+       args:                   # Optional - argument definitions
+         - name: string
+           type: string
+           flag: string
+       parameters_schema:      # Optional - JSON Schema for parameters
+
+Fields
+~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 15 10 53
+
+   * - Field
+     - Type
+     - Required
+     - Description
+   * - ``id``
+     - string
+     - Yes
+     - Unique script identifier
+   * - ``name``
+     - string
+     - No
+     - Human-readable name (defaults to id)
+   * - ``description``
+     - string
+     - No
+     - Detailed description
+   * - ``path``
+     - string
+     - Yes
+     - Filesystem path to the script file
+   * - ``format``
+     - string
+     - Yes
+     - Execution format: ``bash``, ``python``, ``sh``
+   * - ``timeout_sec``
+     - integer
+     - No
+     - Max execution time in seconds (default: 300)
+   * - ``entity_filter``
+     - [string]
+     - No
+     - Glob patterns for entity matching (e.g., ``components/*``, ``apps/*``). Empty means all entities.
+   * - ``env``
+     - map
+     - No
+     - Environment variables passed to the script
+   * - ``args``
+     - [object]
+     - No
+     - Argument definitions with ``name``, ``type``, ``flag`` fields
+   * - ``parameters_schema``
+     - object
+     - No
+     - JSON Schema for execution parameters validation. Nested objects and arrays are fully supported.
+
+Example
+~~~~~~~
+
+.. code-block:: yaml
+
+   scripts:
+     - id: run-diagnostics
+       name: "Run Diagnostics"
+       description: "Check health of all sensors"
+       path: "/opt/scripts/run-diagnostics.sh"
+       format: "bash"
+       timeout_sec: 30
+       entity_filter:
+         - "components/*"
+       env:
+         GATEWAY_URL: "http://localhost:8080"
+
+     - id: calibrate-sensor
+       name: "Calibrate Sensor"
+       path: "/opt/scripts/calibrate.py"
+       format: "python"
+       timeout_sec: 60
+       args:
+         - name: threshold
+           type: float
+           flag: "--threshold"
+
+.. seealso::
+
+   See the Scripts section in :doc:`/api/rest` for API endpoints.
+
 Complete Example
 ----------------
 
@@ -671,6 +800,15 @@ Here's a complete manifest for a TurtleBot3 robot:
          - amcl-node
          - planner-server
 
+   scripts:
+     - id: run-diagnostics
+       name: "Run Diagnostics"
+       path: "/opt/scripts/diagnostics.sh"
+       format: "bash"
+       timeout_sec: 30
+       entity_filter:
+         - "components/*"
+
 Validation
 ----------
 
@@ -682,6 +820,8 @@ Manifests are validated during loading. The validator checks:
 - All entities must have ``id`` and ``name``
 - Apps with ``ros_binding`` must have ``node_name`` or ``topic_namespace``
 - Functions must have at least one entry in ``hosted_by``
+- Scripts must have ``id``, ``path``, and ``format``
+- ``format`` must be one of: ``bash``, ``python``, ``sh``
 
 **References:**
 
@@ -693,7 +833,7 @@ Manifests are validated during loading. The validator checks:
 **Uniqueness:**
 
 - All entity IDs must be unique within their type
-- IDs should be unique across all types (warning)
+- IDs must be unique across all entity types (areas, components, apps, functions, scripts)
 
 **Format:**
 
