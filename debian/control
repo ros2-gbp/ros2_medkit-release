@@ -1,0 +1,12 @@
+Source: ros-jazzy-ros2-medkit-beacon-common
+Section: misc
+Priority: optional
+Maintainer: bburda <bartoszburda93@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), nlohmann-json3-dev, ros-jazzy-ament-cmake, ros-jazzy-ament-cmake-clang-format <!nocheck>, ros-jazzy-ament-cmake-gtest <!nocheck>, ros-jazzy-ament-lint-auto <!nocheck>, ros-jazzy-ament-lint-common <!nocheck>, ros-jazzy-rclcpp, ros-jazzy-ros2-medkit-cmake, ros-jazzy-ros2-medkit-gateway, ros-jazzy-ros2-medkit-msgs, ros-jazzy-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-ros2-medkit-beacon-common
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, nlohmann-json3-dev, ros-jazzy-rclcpp, ros-jazzy-ros2-medkit-gateway, ros-jazzy-ros2-medkit-msgs, ros-jazzy-ros-workspace
+Description: Shared library for ros2_medkit beacon discovery plugins
