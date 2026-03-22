@@ -14,14 +14,19 @@
 
 #include "ros2_medkit_gateway/plugins/plugin_context.hpp"
 
+#include <mutex>
+#include <rclcpp/rclcpp.hpp>
+#include <vector>
+
+#include "ros2_medkit_gateway/condition_evaluator.hpp"
 #include "ros2_medkit_gateway/fault_manager.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/error_codes.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
 #include "ros2_medkit_gateway/http/http_utils.hpp"
-
-#include <mutex>
-#include <rclcpp/rclcpp.hpp>
+#include "ros2_medkit_gateway/lock_manager.hpp"
+#include "ros2_medkit_gateway/resource_change_notifier.hpp"
+#include "ros2_medkit_gateway/resource_sampler.hpp"
 
 namespace ros2_medkit_gateway {
 
@@ -40,7 +45,8 @@ void PluginContext::send_json(httplib::Response & res, const nlohmann::json & da
 
 class GatewayPluginContext : public PluginContext {
  public:
-  GatewayPluginContext(GatewayNode * node, FaultManager * fault_manager) : node_(node), fault_manager_(fault_manager) {
+  GatewayPluginContext(GatewayNode * node, FaultManager * fault_manager, ResourceSamplerRegistry * sampler_registry)
+    : node_(node), fault_manager_(fault_manager), sampler_registry_(sampler_registry) {
   }
 
   rclcpp::Node * node() const override {
@@ -54,7 +60,7 @@ class GatewayPluginContext : public PluginContext {
       return PluginEntityInfo{SovdEntityType::COMPONENT, id, comp->namespace_path, comp->fqn};
     }
     if (auto app = cache.get_app(id)) {
-      return PluginEntityInfo{SovdEntityType::APP, id, {}, app->bound_fqn.value_or("")};
+      return PluginEntityInfo{SovdEntityType::APP, id, {}, app->effective_fqn()};
     }
     if (auto area = cache.get_area(id)) {
       return PluginEntityInfo{SovdEntityType::AREA, id, area->namespace_path, {}};
@@ -63,6 +69,20 @@ class GatewayPluginContext : public PluginContext {
       return PluginEntityInfo{SovdEntityType::FUNCTION, id, {}, {}};
     }
     return std::nullopt;
+  }
+
+  std::vector<PluginEntityInfo> get_child_apps(const std::string & component_id) const override {
+    std::vector<PluginEntityInfo> result;
+    const auto & cache = node_->get_thread_safe_cache();
+    auto app_ids = cache.get_apps_for_component(component_id);
+    for (const auto & app_id : app_ids) {
+      if (auto app = cache.get_app(app_id)) {
+        result.push_back(PluginEntityInfo{SovdEntityType::APP, app_id,
+                                          "",  // namespace_path not needed for Apps
+                                          app->effective_fqn()});
+      }
+    }
+    return result;
   }
 
   nlohmann::json list_entity_faults(const std::string & entity_id) const override {
@@ -158,17 +178,86 @@ class GatewayPluginContext : public PluginContext {
     return {};
   }
 
+  LockAccessResult check_lock(const std::string & entity_id, const std::string & client_id,
+                              const std::string & collection) const override {
+    auto * lock_mgr = node_->get_lock_manager();
+    if (!lock_mgr) {
+      return LockAccessResult{true, "", "", ""};
+    }
+    return lock_mgr->check_access(entity_id, client_id, collection);
+  }
+
+  tl::expected<LockInfo, LockError> acquire_lock(const std::string & entity_id, const std::string & client_id,
+                                                 const std::vector<std::string> & scopes,
+                                                 int expiration_seconds) override {
+    auto * lock_mgr = node_->get_lock_manager();
+    if (!lock_mgr) {
+      return tl::make_unexpected(LockError{"lock-disabled", "Locking is not enabled", 503, std::nullopt});
+    }
+    return lock_mgr->acquire(entity_id, client_id, scopes, expiration_seconds);
+  }
+
+  tl::expected<void, LockError> release_lock(const std::string & entity_id, const std::string & client_id) override {
+    auto * lock_mgr = node_->get_lock_manager();
+    if (!lock_mgr) {
+      return tl::make_unexpected(LockError{"lock-disabled", "Locking is not enabled", 503, std::nullopt});
+    }
+    return lock_mgr->release(entity_id, client_id);
+  }
+
+  IntrospectionInput get_entity_snapshot() const override {
+    IntrospectionInput input;
+    const auto & cache = node_->get_thread_safe_cache();
+    input.areas = cache.get_areas();
+    input.components = cache.get_components();
+    input.apps = cache.get_apps();
+    input.functions = cache.get_functions();
+    return input;
+  }
+
+  nlohmann::json list_all_faults() const override {
+    if (!fault_manager_ || !fault_manager_->is_available()) {
+      return nlohmann::json::object();
+    }
+    auto result = fault_manager_->list_faults("");
+    if (result.success) {
+      return result.data;
+    }
+    return nlohmann::json::object();
+  }
+
+  void register_sampler(
+      const std::string & collection,
+      const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> & fn)
+      override {
+    if (sampler_registry_) {
+      sampler_registry_->register_sampler(collection, fn);
+    }
+  }
+
+  // ---- Trigger infrastructure ----
+
+  ResourceChangeNotifier * get_resource_change_notifier() override {
+    return node_->get_resource_change_notifier();
+  }
+
+  ConditionRegistry * get_condition_registry() override {
+    return node_->get_condition_registry();
+  }
+
  private:
   GatewayNode * node_;
   FaultManager * fault_manager_;
+  ResourceSamplerRegistry * sampler_registry_;
 
   mutable std::mutex capabilities_mutex_;
   std::unordered_map<SovdEntityType, std::vector<std::string>> type_capabilities_;
   std::unordered_map<std::string, std::vector<std::string>> entity_capabilities_;
 };
 
-std::unique_ptr<PluginContext> make_gateway_plugin_context(GatewayNode * node, FaultManager * fault_manager) {
-  return std::make_unique<GatewayPluginContext>(node, fault_manager);
+std::unique_ptr<PluginContext> make_gateway_plugin_context(GatewayNode * node, FaultManager * fault_manager,
+                                                           ResourceSamplerRegistry * sampler_registry) {
+  return std::make_unique<GatewayPluginContext>(node, fault_manager, sampler_registry);
 }
 
 }  // namespace ros2_medkit_gateway
