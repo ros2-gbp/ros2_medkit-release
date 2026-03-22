@@ -34,6 +34,9 @@ The following diagram shows the relationships between the main components of the
            + get_operation_manager(): OperationManager*
            + get_discovery_manager(): DiscoveryManager*
            + get_configuration_manager(): ConfigurationManager*
+           + get_lock_manager(): LockManager*
+           + get_script_manager(): ScriptManager*
+           + get_trigger_manager(): TriggerManager*
        }
 
        class DiscoveryManager {
@@ -55,7 +58,6 @@ The following diagram shows the relationships between the main components of the
        }
 
        class RuntimeDiscoveryStrategy {
-           + discover_node_components(): vector<Component>
            + discover_synthetic_components(): vector<Component>
            + discover_topic_components(): vector<Component>
            - config_: RuntimeConfig
@@ -67,8 +69,41 @@ The following diagram shows the relationships between the main components of the
        }
 
        class HybridDiscoveryStrategy {
-           - primary_: ManifestDiscoveryStrategy
-           - runtime_: RuntimeDiscoveryStrategy
+           - pipeline_: MergePipeline
+           + refresh(): void
+           + add_layer(): void
+           + get_merge_report(): MergeReport
+       }
+
+       class MergePipeline {
+           + add_layer(): void
+           + execute(): MergeResult
+           + set_linker(): void
+           + get_last_report(): MergeReport
+           - merge_entities<T>(): vector<T>
+       }
+
+       interface DiscoveryLayer <<interface>> {
+           + name(): string
+           + discover(): LayerOutput
+           + policy_for(FieldGroup): MergePolicy
+       }
+
+       class ManifestLayer {
+           - manifest_mgr_: ManifestManager*
+       }
+
+       class RuntimeLayer {
+           - strategy_: RuntimeDiscoveryStrategy*
+           - gap_fill_config_: GapFillConfig
+       }
+
+       class PluginLayer {
+           - provider_: IntrospectionProvider*
+       }
+
+       class RuntimeLinker {
+           + link(): LinkingResult
        }
 
        class OperationManager {
@@ -102,6 +137,28 @@ The following diagram shows the relationships between the main components of the
            + list_parameters(): ParameterResult
            + get_parameter(): ParameterResult
            + set_parameter(): ParameterResult
+       }
+
+       class LockManager {
+           + acquire(): expected<LockInfo, LockError>
+           + release(): expected<void, LockError>
+           + extend(): expected<LockInfo, LockError>
+           + check_access(): LockAccessResult
+           + cleanup_expired(): vector<ExpiredLockInfo>
+           + get_lock(): optional<LockInfo>
+       }
+
+       class ScriptManager {
+           + set_backend(): void
+           + has_backend(): bool
+           + list_scripts(): expected<vector<ScriptInfo>, Error>
+           + get_script(): expected<ScriptInfo, Error>
+           + upload_script(): expected<ScriptUploadResult, Error>
+           + delete_script(): expected<void, Error>
+           + start_execution(): expected<ExecutionInfo, Error>
+           + get_execution(): expected<ExecutionInfo, Error>
+           + control_execution(): expected<ExecutionInfo, Error>
+           + delete_execution(): expected<void, Error>
        }
 
        class NativeTopicSampler {
@@ -159,6 +216,52 @@ The following diagram shows the relationships between the main components of the
            + type: string
        }
 
+       class TriggerManager {
+           + create(): expected<TriggerInfo, string>
+           + get(): optional<TriggerInfo>
+           + list(): vector<TriggerInfo>
+           + update(): expected<TriggerInfo, string>
+           + remove(): bool
+           + wait_for_event(): bool
+           + consume_pending_event(): optional<json>
+           + load_persistent_triggers(): void
+           + shutdown(): void
+       }
+
+       class ResourceChangeNotifier {
+           + subscribe(): NotifierSubscriptionId
+           + unsubscribe(): void
+           + notify(): void
+           + shutdown(): void
+       }
+
+       class ConditionRegistry {
+           + register_condition(): void
+           + get(): shared_ptr<ConditionEvaluator>
+           + has(): bool
+       }
+
+       interface ConditionEvaluator <<interface>> {
+           + evaluate(): bool
+           + validate_params(): expected<void, string>
+       }
+
+       interface TriggerStore <<interface>> {
+           + save(): expected<void, string>
+           + update(): expected<void, string>
+           + remove(): expected<void, string>
+           + load_all(): expected<vector<TriggerInfo>, string>
+       }
+
+       class SqliteTriggerStore {
+           - db_path_: string
+       }
+
+       class TriggerTopicSubscriber {
+           + subscribe_topic(): void
+           + unsubscribe_topic(): void
+       }
+
        class EntityCache {
            + areas: vector<Area>
            + components: vector<Component>
@@ -183,6 +286,8 @@ The following diagram shows the relationships between the main components of the
    GatewayNode *-down-> DataAccessManager : owns
    GatewayNode *-down-> OperationManager : owns
    GatewayNode *-down-> ConfigurationManager : owns
+   GatewayNode *-down-> LockManager : owns
+   GatewayNode *-down-> ScriptManager : owns
    GatewayNode *-down-> EntityCache : owns
 
    ' Discovery Manager uses Node interface
@@ -193,6 +298,7 @@ The following diagram shows the relationships between the main components of the
    RESTServer --> DataAccessManager : uses
    RESTServer --> OperationManager : uses
    RESTServer --> ConfigurationManager : uses
+   RESTServer --> ScriptManager : uses
 
    ' OperationManager uses DiscoveryManager and native serialization
    OperationManager --> DiscoveryManager : uses
@@ -229,8 +335,15 @@ The following diagram shows the relationships between the main components of the
    RuntimeDiscoveryStrategy .up.|> DiscoveryStrategy : implements
    ManifestDiscoveryStrategy .up.|> DiscoveryStrategy : implements
    HybridDiscoveryStrategy .up.|> DiscoveryStrategy : implements
-   HybridDiscoveryStrategy --> ManifestDiscoveryStrategy : delegates
-   HybridDiscoveryStrategy --> RuntimeDiscoveryStrategy : delegates
+   HybridDiscoveryStrategy *--> MergePipeline : owns
+
+   ' MergePipeline layer architecture
+   MergePipeline o--> DiscoveryLayer : ordered layers
+   MergePipeline --> RuntimeLinker : post-merge linking
+   ManifestLayer .up.|> DiscoveryLayer : implements
+   RuntimeLayer .up.|> DiscoveryLayer : implements
+   PluginLayer .up.|> DiscoveryLayer : implements
+   RuntimeLayer --> RuntimeDiscoveryStrategy : delegates
 
    ' REST Server uses HTTP library
    RESTServer *--> HTTPLibServer : owns
@@ -239,6 +352,20 @@ The following diagram shows the relationships between the main components of the
    Area ..> JSON : serializes to
    Component ..> JSON : serializes to
    App ..> JSON : serializes to
+
+   ' Trigger subsystem
+   GatewayNode *-down-> TriggerManager : owns
+   GatewayNode *-down-> ResourceChangeNotifier : owns
+   GatewayNode *-down-> ConditionRegistry : owns
+   GatewayNode *-down-> TriggerTopicSubscriber : owns
+   TriggerManager --> ResourceChangeNotifier : subscribes to
+   TriggerManager --> ConditionRegistry : evaluates with
+   TriggerManager --> TriggerStore : persists via
+   TriggerManager --> TriggerTopicSubscriber : manages data subscriptions
+   SqliteTriggerStore .up.|> TriggerStore : implements
+   ConditionRegistry o--> ConditionEvaluator : contains many
+   RESTServer --> TriggerManager : uses
+   TriggerTopicSubscriber --> "rclcpp::Node" : uses
 
    @enduml
 
@@ -270,9 +397,31 @@ Main Components
    - **ManifestDiscoveryStrategy** - Static discovery from YAML manifest
      - Provides stable, semantic entity IDs
      - Supports offline detection of failed components
-   - **HybridDiscoveryStrategy** - Combines manifest + runtime
-     - Manifest defines structure, runtime links to live nodes
-     - Best for production systems requiring stability + live status
+   - **HybridDiscoveryStrategy** - Combines manifest + runtime via MergePipeline
+     - Delegates to ``MergePipeline`` which orchestrates ordered discovery layers
+     - Supports dynamic plugin layers added at runtime
+     - Thread-safe: mutex protects cached results, returns by value
+
+   **Merge Pipeline:**
+
+   The ``MergePipeline`` is the core engine for hybrid discovery. It:
+
+   - Maintains an ordered list of ``DiscoveryLayer`` instances (first = highest priority)
+   - Executes all layers, collects entities by ID, and merges them per-field-group
+   - Each layer declares a ``MergePolicy`` per ``FieldGroup``: AUTHORITATIVE (wins), ENRICHMENT (fills empty), FALLBACK (last resort)
+   - Runs ``RuntimeLinker`` post-merge to bind manifest apps to live ROS 2 nodes
+   - Produces a ``MergeReport`` with conflict diagnostics, enrichment counts, and ID collision detection
+
+   **Built-in Layers:**
+
+   - ``ManifestLayer`` - Wraps ManifestManager; IDENTITY/HIERARCHY/METADATA are AUTHORITATIVE,
+     LIVE_DATA is ENRICHMENT (runtime wins for topics/services), STATUS is FALLBACK
+   - ``RuntimeLayer`` - Wraps RuntimeDiscoveryStrategy; LIVE_DATA/STATUS are AUTHORITATIVE,
+     METADATA is ENRICHMENT, IDENTITY/HIERARCHY are FALLBACK.
+     Supports ``GapFillConfig`` to control which heuristic entities are allowed when manifest is present
+   - ``PluginLayer`` - Wraps IntrospectionProvider; all fields ENRICHMENT (plugins enrich, they don't override).
+     Before each layer's ``discover()`` call, the pipeline populates ``IntrospectionInput`` with entities
+     from all previous layers, so plugins see the current manifest + runtime entity set
 
 3. **OperationManager** - Executes ROS 2 operations (services and actions) using native APIs
    - Calls ROS 2 services via ``rclcpp::GenericClient`` with native serialization
@@ -289,10 +438,12 @@ Main Components
    - Data endpoints: ``/components/{id}/data``, ``/components/{id}/data/{topic}``
    - Operations endpoints: ``/apps/{id}/operations``, ``/apps/{id}/operations/{op}/executions``
    - Configurations endpoints: ``/apps/{id}/configurations``, ``/apps/{id}/configurations/{param}``
+   - Scripts endpoints: ``/{entity_type}/{id}/scripts``, ``/{entity_type}/{id}/scripts/{script_id}/executions``
    - Retrieves cached entities from the GatewayNode
    - Uses DataAccessManager for runtime topic data access
    - Uses OperationManager for service/action execution
    - Uses ConfigurationManager for parameter CRUD operations
+   - Uses ScriptManager for script upload and execution
    - Runs on configurable host and port with CORS support
 
 5. **ConfigurationManager** - Manages ROS 2 node parameters
@@ -325,10 +476,71 @@ Main Components
    - Provides static ``yaml_to_json()`` utility for YAML to JSON conversion
    - Thread-safe and stateless design
 
-9. **Data Models** - Entity representations
+9. **LockManager** - SOVD resource locking (ISO 17978-3, Section 7.17)
+    - Transport-agnostic lock store with ``shared_mutex`` for thread safety
+    - Acquire, release, extend locks on components and apps
+    - Scoped locks restrict protection to specific resource collections
+    - Lazy parent propagation (lock on component protects child apps)
+    - Lock-required enforcement via per-entity ``required_scopes`` config
+    - Automatic expiry with cyclic subscription cleanup
+    - Plugin access via ``PluginContext::check_lock/acquire_lock/release_lock``
+
+10. **Data Models** - Entity representations
     - ``Area`` - Physical or logical domain (namespace grouping)
     - ``Component`` - Logical grouping of Apps; can be ``synthetic`` (auto-created from namespace), ``topic`` (from topic-only namespace), or ``manifest`` (explicitly defined)
     - ``App`` - Software application (ROS 2 node); individual running process linked to parent Component
     - ``ServiceInfo`` - Service metadata (path, name, type)
     - ``ActionInfo`` - Action metadata (path, name, type)
     - ``EntityCache`` - Thread-safe cache of discovered entities (areas, components, apps)
+
+10. **ScriptManager** - Manages diagnostic script upload, storage, and execution (SOVD 7.15)
+    - Delegates to a pluggable ``ScriptProvider`` backend (set via ``set_backend()``)
+    - Lists, uploads, and deletes scripts per entity
+    - Starts script executions as POSIX subprocesses with timeout support
+    - Tracks execution status (``prepared``, ``running``, ``completed``, ``failed``, ``terminated``)
+    - Supports termination via ``stop`` (SIGTERM) and ``forced_termination`` (SIGKILL)
+    - Built-in ``DefaultScriptProvider`` handles filesystem storage and manifest-defined scripts
+    - Supports concurrent execution limits and per-script timeout configuration
+
+Triggers
+--------
+
+The trigger subsystem implements SOVD condition-based resource change notifications.
+It consists of five main components:
+
+1. **TriggerManager** - Central coordinator for trigger lifecycle (CRUD), condition
+   evaluation, and event dispatch.
+
+   - Subscribes to ``ResourceChangeNotifier`` for resource change events
+   - Evaluates conditions using registered ``ConditionEvaluator`` instances via the ``ConditionRegistry``
+   - Uses O(1) dispatch indexing by ``{collection, entity_id}`` for efficient notification matching
+   - Supports entity hierarchy matching (area-level triggers catch descendant changes)
+   - Manages pending events for SSE stream pickup with per-trigger mutexes
+   - Persists triggers via the ``TriggerStore`` interface
+
+2. **ResourceChangeNotifier** - Async notification hub for resource changes.
+
+   - Producers (FaultManager, DataAccessManager, UpdateManager, OperationManager, LogManager) call ``notify()``
+   - Observers (TriggerManager) register callbacks with filters
+   - ``notify()`` is non-blocking - pushes to an internal queue processed by a dedicated worker thread
+   - Filters support collection, entity_id, and resource_path matching
+
+3. **ConditionRegistry** - Thread-safe registry for condition evaluators.
+
+   - Built-in SOVD types: ``OnChange``, ``OnChangeTo``, ``EnterRange``, ``LeaveRange``
+   - Plugins register custom evaluators with ``x-`` prefixed names
+   - Uses ``shared_mutex`` for concurrent read access during evaluation
+
+4. **TriggerStore** / **SqliteTriggerStore** - Persistence backend for triggers.
+
+   - Abstract ``TriggerStore`` interface allows plugin-provided backends
+   - Default ``SqliteTriggerStore`` uses SQLite for persistent triggers
+   - Stores trigger metadata, condition parameters, and evaluator state (previous values)
+   - Supports partial updates for status changes and lifetime extensions
+
+5. **TriggerTopicSubscriber** - Manages ROS 2 topic subscriptions for data triggers.
+
+   - Creates ``rclcpp::GenericSubscription`` instances for monitored data topics
+   - Reference-counted: multiple triggers on the same topic share one subscription
+   - Publishes data changes to ``ResourceChangeNotifier`` for condition evaluation
+   - Automatically unsubscribes when the last trigger for a topic is removed

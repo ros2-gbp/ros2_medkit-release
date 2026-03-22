@@ -15,6 +15,10 @@
 #include <gtest/gtest.h>
 #include <httplib.h>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #include "ros2_medkit_gateway/plugins/plugin_context.hpp"
 #include "ros2_medkit_gateway/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/providers/introspection_provider.hpp"
@@ -158,7 +162,6 @@ class MockThrowOnShutdown : public GatewayPlugin {
   }
 };
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, EmptyManagerHasNoPlugins) {
   PluginManager mgr;
   EXPECT_FALSE(mgr.has_plugins());
@@ -167,7 +170,6 @@ TEST(PluginManagerTest, EmptyManagerHasNoPlugins) {
   EXPECT_TRUE(mgr.get_introspection_providers().empty());
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, AddPluginAndDispatch) {
   PluginManager mgr;
   auto plugin = std::make_unique<MockPlugin>();
@@ -182,7 +184,6 @@ TEST(PluginManagerTest, AddPluginAndDispatch) {
   EXPECT_EQ(mgr.get_introspection_providers().size(), 1u);
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, ConfigurePassesConfig) {
   PluginManager mgr;
   auto plugin = std::make_unique<MockPlugin>();
@@ -196,7 +197,6 @@ TEST(PluginManagerTest, ConfigurePassesConfig) {
   EXPECT_TRUE(raw->config_.empty());
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, LoadPluginsForwardsConfig) {
   // load_plugins() should forward the PluginConfig.config to configure()
   PluginManager mgr;
@@ -208,7 +208,6 @@ TEST(PluginManagerTest, LoadPluginsForwardsConfig) {
   EXPECT_EQ(configs[0].config["timeout_ms"], 5000);
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, ShutdownCallsAllPlugins) {
   PluginManager mgr;
   auto plugin = std::make_unique<MockPlugin>();
@@ -219,7 +218,6 @@ TEST(PluginManagerTest, ShutdownCallsAllPlugins) {
   EXPECT_TRUE(raw->shutdown_called_);
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, MultiCapabilityPluginDispatchedToBoth) {
   PluginManager mgr;
   mgr.add_plugin(std::make_unique<MockPlugin>());
@@ -228,7 +226,6 @@ TEST(PluginManagerTest, MultiCapabilityPluginDispatchedToBoth) {
   EXPECT_EQ(mgr.get_introspection_providers().size(), 1u);
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, IntrospectionOnlyPluginNotUpdateProvider) {
   PluginManager mgr;
   mgr.add_plugin(std::make_unique<MockIntrospectionOnly>());
@@ -237,7 +234,6 @@ TEST(PluginManagerTest, IntrospectionOnlyPluginNotUpdateProvider) {
   EXPECT_EQ(mgr.get_introspection_providers().size(), 1u);
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, MultipleIntrospectionProviders) {
   PluginManager mgr;
   mgr.add_plugin(std::make_unique<MockPlugin>());
@@ -246,7 +242,6 @@ TEST(PluginManagerTest, MultipleIntrospectionProviders) {
   EXPECT_EQ(mgr.get_introspection_providers().size(), 2u);
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, DuplicateUpdateProviderFirstWins) {
   PluginManager mgr;
   auto first = std::make_unique<MockPlugin>();
@@ -258,7 +253,6 @@ TEST(PluginManagerTest, DuplicateUpdateProviderFirstWins) {
   EXPECT_EQ(mgr.get_update_provider(), static_cast<UpdateProvider *>(first_raw));
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, ThrowingPluginDisabledDuringConfigure) {
   PluginManager mgr;
   mgr.add_plugin(std::make_unique<MockThrowingPlugin>());
@@ -274,7 +268,6 @@ TEST(PluginManagerTest, ThrowingPluginDisabledDuringConfigure) {
   EXPECT_NE(mgr.get_update_provider(), nullptr);
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, LoadNonexistentPluginReturnsZero) {
   PluginManager mgr;
   std::vector<PluginConfig> configs = {{"nonexistent", "/nonexistent/path.so", json::object()}};
@@ -283,7 +276,6 @@ TEST(PluginManagerTest, LoadNonexistentPluginReturnsZero) {
   EXPECT_FALSE(mgr.has_plugins());
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, ThrowOnSetContextDisablesPlugin) {
   PluginManager mgr;
   mgr.add_plugin(std::make_unique<MockThrowOnSetContext>());
@@ -304,7 +296,6 @@ TEST(PluginManagerTest, ThrowOnSetContextDisablesPlugin) {
   EXPECT_EQ(mgr.plugin_names()[0], "mock");
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, ThrowOnRegisterRoutesDisablesPlugin) {
   PluginManager mgr;
   mgr.add_plugin(std::make_unique<MockThrowOnRegisterRoutes>());
@@ -321,7 +312,6 @@ TEST(PluginManagerTest, ThrowOnRegisterRoutesDisablesPlugin) {
   EXPECT_EQ(mgr.plugin_names()[0], "introspection_only");
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, ShutdownAllIdempotent) {
   PluginManager mgr;
   auto plugin = std::make_unique<MockPlugin>();
@@ -337,7 +327,6 @@ TEST(PluginManagerTest, ShutdownAllIdempotent) {
   EXPECT_FALSE(raw->shutdown_called_);
 }
 
-// @verifies REQ_INTEROP_012
 TEST(PluginManagerTest, ShutdownSwallowsExceptions) {
   PluginManager mgr;
   mgr.add_plugin(std::make_unique<MockThrowOnShutdown>());
@@ -348,4 +337,123 @@ TEST(PluginManagerTest, ShutdownSwallowsExceptions) {
   // Should not throw, even though first plugin throws during shutdown
   EXPECT_NO_THROW(mgr.shutdown_all());
   EXPECT_TRUE(good_raw->shutdown_called_);
+}
+
+using namespace std::chrono_literals;
+
+// Test 1: Concurrent readers don't block each other
+TEST(PluginManagerConcurrencyTest, ConcurrentReadsDoNotBlock) {
+  PluginManager mgr;
+  mgr.add_plugin(std::make_unique<MockPlugin>());
+  mgr.add_plugin(std::make_unique<MockIntrospectionOnly>());
+
+  std::atomic<int> completed{0};
+  std::vector<std::thread> readers;
+
+  for (int i = 0; i < 8; ++i) {
+    readers.emplace_back([&mgr, &completed] {
+      for (int j = 0; j < 200; ++j) {
+        auto up = mgr.get_update_provider();
+        auto ips = mgr.get_introspection_providers();
+        auto lp = mgr.get_log_provider();
+        auto obs = mgr.get_log_observers();
+        auto has = mgr.has_plugins();
+        auto names = mgr.plugin_names();
+        (void)up;
+        (void)ips;
+        (void)lp;
+        (void)obs;
+        (void)has;
+        (void)names;
+      }
+      completed++;
+    });
+  }
+
+  auto start = std::chrono::high_resolution_clock::now();
+  for (auto & t : readers) {
+    t.join();
+  }
+  auto duration = std::chrono::high_resolution_clock::now() - start;
+
+  EXPECT_EQ(completed.load(), 8);
+  EXPECT_LT(duration, 2s) << "Concurrent reads took too long - possible blocking";
+}
+
+// Test 2: Concurrent reads and writes (lifecycle/disable) don't deadlock
+TEST(PluginManagerConcurrencyTest, ConcurrentReadsAndLifecycleDoNotDeadlock) {
+  PluginManager mgr;
+  mgr.add_plugin(std::make_unique<MockPlugin>());
+  mgr.add_plugin(std::make_unique<MockIntrospectionOnly>());
+
+  std::atomic<bool> keep_running{true};
+  std::atomic<int> read_count{0};
+  std::atomic<int> write_count{0};
+
+  // Multiple reader threads (simulating ROS 2 executor calling get_log_observers)
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 4; ++i) {
+    readers.emplace_back([&mgr, &keep_running, &read_count] {
+      while (keep_running) {
+        auto obs = mgr.get_log_observers();
+        auto ips = mgr.get_introspection_providers();
+        auto up = mgr.get_update_provider();
+        (void)obs;
+        (void)ips;
+        (void)up;
+        read_count++;
+      }
+    });
+  }
+
+  // Writer thread (simulating lifecycle operations that take unique_lock)
+  std::thread writer([&mgr, &keep_running, &write_count] {
+    while (keep_running) {
+      mgr.configure_plugins();
+      write_count++;
+    }
+  });
+
+  std::this_thread::sleep_for(50ms);
+  keep_running = false;
+
+  for (auto & t : readers) {
+    t.join();
+  }
+  writer.join();
+
+  EXPECT_GT(read_count.load(), 0) << "Readers made no progress - possible deadlock";
+  EXPECT_GT(write_count.load(), 0) << "Writer made no progress - possible deadlock";
+}
+
+// Test 3: Shutdown while readers are active doesn't deadlock
+TEST(PluginManagerConcurrencyTest, ShutdownWhileReadersActiveDoesNotDeadlock) {
+  auto mgr = std::make_unique<PluginManager>();
+  mgr->add_plugin(std::make_unique<MockPlugin>());
+
+  std::atomic<bool> keep_running{true};
+  std::atomic<int> read_count{0};
+
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 4; ++i) {
+    readers.emplace_back([&mgr, &keep_running, &read_count] {
+      while (keep_running) {
+        if (mgr) {
+          auto obs = mgr->get_log_observers();
+          (void)obs;
+        }
+        read_count++;
+      }
+    });
+  }
+
+  std::this_thread::sleep_for(10ms);
+  mgr->shutdown_all();
+
+  keep_running = false;
+  for (auto & t : readers) {
+    t.join();
+  }
+
+  EXPECT_GT(read_count.load(), 0) << "Readers made no progress before shutdown";
 }

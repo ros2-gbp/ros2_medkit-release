@@ -25,8 +25,151 @@ using namespace ros2_medkit_gateway;
 using namespace ros2_medkit_gateway::handlers;
 using json = nlohmann::json;
 
+// --- parse_resource_uri tests ---
+
+// @verifies REQ_INTEROP_089
+TEST(ParseResourceUriTest, DataCollectionWithTopic) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1/data/temperature");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->entity_type, "apps");
+  EXPECT_EQ(result->entity_id, "node1");
+  EXPECT_EQ(result->collection, "data");
+  EXPECT_EQ(result->resource_path, "/temperature");
+}
+
+TEST(ParseResourceUriTest, FaultsCollectionNoPath) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/components/ecu1/faults");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->entity_type, "components");
+  EXPECT_EQ(result->entity_id, "ecu1");
+  EXPECT_EQ(result->collection, "faults");
+  EXPECT_EQ(result->resource_path, "");
+}
+
+TEST(ParseResourceUriTest, FaultsCollectionWithId) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1/faults/fault_001");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->collection, "faults");
+  EXPECT_EQ(result->resource_path, "/fault_001");
+}
+
+TEST(ParseResourceUriTest, ConfigurationsCollection) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/components/ecu1/configurations/param1");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->collection, "configurations");
+  EXPECT_EQ(result->resource_path, "/param1");
+}
+
+TEST(ParseResourceUriTest, VendorExtensionCollection) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1/x-medkit-metrics/cpu_usage");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->collection, "x-medkit-metrics");
+  EXPECT_EQ(result->resource_path, "/cpu_usage");
+}
+
+TEST(ParseResourceUriTest, FunctionVendorExtensionCollection) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/functions/func1/x-medkit-graph");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->entity_type, "functions");
+  EXPECT_EQ(result->entity_id, "func1");
+  EXPECT_EQ(result->collection, "x-medkit-graph");
+  EXPECT_EQ(result->resource_path, "");
+}
+
+TEST(ParseResourceUriTest, MultiSegmentResourcePath) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1/data/parent/child/value");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->resource_path, "/parent/child/value");
+}
+
+TEST(ParseResourceUriTest, InvalidMissingCollection) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1");
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(ParseResourceUriTest, InvalidMalformedUri) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/not/a/valid/uri");
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(ParseResourceUriTest, FunctionEntityTypeSupported) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/functions/func1/data/topic");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->entity_type, "functions");
+  EXPECT_EQ(result->entity_id, "func1");
+  EXPECT_EQ(result->collection, "data");
+  EXPECT_EQ(result->resource_path, "/topic");
+}
+
+TEST(ParseResourceUriTest, PathTraversalRejected) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1/data/../../../etc/passwd");
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(ParseResourceUriTest, PathTraversalInMiddleRejected) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1/data/a/../b");
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(ParseResourceUriTest, BenignDoubleDotInSegmentAllowed) {
+  // "/..foo" is not a traversal - '..' is part of a larger segment name
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1/data/..foo");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->resource_path, "/..foo");
+}
+
+TEST(ParseResourceUriTest, PathTraversalAtEndRejected) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1/data/a/..");
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(ParseResourceUriTest, DataCollectionEmptyResourcePath) {
+  // data collection without a topic path - still parses, but handler rejects it
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/apps/node1/data");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->collection, "data");
+  EXPECT_EQ(result->resource_path, "");
+}
+
+// --- parse_resource_uri: server-level update status ---
+
+// @verifies REQ_INTEROP_089
+TEST(ParseResourceUriTest, UpdateStatusUri) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/updates/my-package/status");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->entity_type, "");
+  EXPECT_EQ(result->entity_id, "");
+  EXPECT_EQ(result->collection, "updates");
+  EXPECT_EQ(result->resource_path, "my-package");
+}
+
+TEST(ParseResourceUriTest, UpdateStatusUriWithHyphenatedId) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/updates/ADAS-v2-03-2154/status");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->collection, "updates");
+  EXPECT_EQ(result->resource_path, "ADAS-v2-03-2154");
+}
+
+TEST(ParseResourceUriTest, UpdateStatusUriMissingStatus) {
+  // /api/v1/updates/{id} without /status is not a subscribable resource
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/updates/my-package");
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(ParseResourceUriTest, UpdateStatusUriMissingId) {
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/updates//status");
+  EXPECT_FALSE(result.has_value());
+}
+
+TEST(ParseResourceUriTest, UpdatesListNotSubscribable) {
+  // /api/v1/updates (list endpoint) is not subscribable
+  auto result = CyclicSubscriptionHandlers::parse_resource_uri("/api/v1/updates");
+  EXPECT_FALSE(result.has_value());
+}
+
 // --- subscription_to_json ---
 
+// @verifies REQ_INTEROP_089
 TEST(CyclicSubscriptionJsonTest, ContainsAllRequiredFields) {
   CyclicSubscriptionInfo info;
   info.id = "sub_001";
@@ -58,6 +201,28 @@ TEST(CyclicSubscriptionJsonTest, AllIntervalValuesSerialize) {
     auto j = CyclicSubscriptionHandlers::subscription_to_json(info, "/events");
     EXPECT_EQ(j["interval"], expected);
   }
+}
+
+// @verifies REQ_INTEROP_089
+TEST(CyclicSubscriptionJsonTest, ServerLevelUpdateResource) {
+  CyclicSubscriptionInfo info;
+  info.id = "sub_updates_001";
+  info.entity_id = "temp_sensor";
+  info.entity_type = "apps";
+  info.resource_uri = "/api/v1/updates/ADAS-v2/status";
+  info.collection = "updates";
+  info.resource_path = "ADAS-v2";
+  info.protocol = "sse";
+  info.interval = CyclicInterval::SLOW;
+
+  std::string event_source = "/api/v1/apps/temp_sensor/cyclic-subscriptions/sub_updates_001/events";
+  auto j = CyclicSubscriptionHandlers::subscription_to_json(info, event_source);
+
+  EXPECT_EQ(j["id"], "sub_updates_001");
+  EXPECT_EQ(j["observed_resource"], "/api/v1/updates/ADAS-v2/status");
+  EXPECT_EQ(j["event_source"], event_source);
+  EXPECT_EQ(j["protocol"], "sse");
+  EXPECT_EQ(j["interval"], "slow");
 }
 
 // --- Error response format (via HandlerContext static helpers) ---

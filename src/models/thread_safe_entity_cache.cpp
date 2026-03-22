@@ -35,6 +35,7 @@ void ThreadSafeEntityCache::update_all(std::vector<Area> areas, std::vector<Comp
   last_update_ = std::chrono::system_clock::now();
 
   rebuild_all_indexes();
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 void ThreadSafeEntityCache::update_areas(std::vector<Area> areas) {
@@ -43,6 +44,7 @@ void ThreadSafeEntityCache::update_areas(std::vector<Area> areas) {
   last_update_ = std::chrono::system_clock::now();
   rebuild_area_index();
   rebuild_relationship_indexes();
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 void ThreadSafeEntityCache::update_components(std::vector<Component> components) {
@@ -52,6 +54,7 @@ void ThreadSafeEntityCache::update_components(std::vector<Component> components)
   rebuild_component_index();
   rebuild_relationship_indexes();
   rebuild_operation_index();
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 void ThreadSafeEntityCache::update_apps(std::vector<App> apps) {
@@ -61,6 +64,7 @@ void ThreadSafeEntityCache::update_apps(std::vector<App> apps) {
   rebuild_app_index();
   rebuild_relationship_indexes();
   rebuild_operation_index();
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 void ThreadSafeEntityCache::update_functions(std::vector<Function> functions) {
@@ -69,11 +73,13 @@ void ThreadSafeEntityCache::update_functions(std::vector<Function> functions) {
   last_update_ = std::chrono::system_clock::now();
   rebuild_function_index();
   rebuild_relationship_indexes();
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 void ThreadSafeEntityCache::update_topic_types(std::unordered_map<std::string, std::string> topic_types) {
   std::unique_lock lock(mutex_);
   topic_type_cache_ = std::move(topic_types);
+  generation_.fetch_add(1, std::memory_order_release);
 }
 
 // ============================================================================
@@ -418,10 +424,11 @@ AggregatedConfigurations ThreadSafeEntityCache::get_app_configurations(const std
 
   const auto & app = apps_[it->second];
 
-  // App must have a bound FQN to have parameters
-  if (app.bound_fqn.has_value() && !app.bound_fqn->empty()) {
+  // App must have a resolvable FQN to have parameters
+  auto eff_fqn = app.effective_fqn();
+  if (!eff_fqn.empty()) {
     NodeConfigInfo info;
-    info.node_fqn = *app.bound_fqn;
+    info.node_fqn = std::move(eff_fqn);
     info.app_id = app_id;
     info.entity_id = app_id;
     result.nodes.push_back(info);
@@ -451,9 +458,10 @@ AggregatedConfigurations ThreadSafeEntityCache::get_component_configurations(con
         continue;
       }
       const auto & app = apps_[app_idx];
-      if (app.bound_fqn.has_value() && !app.bound_fqn->empty()) {
+      auto eff_fqn = app.effective_fqn();
+      if (!eff_fqn.empty()) {
         NodeConfigInfo info;
-        info.node_fqn = *app.bound_fqn;
+        info.node_fqn = std::move(eff_fqn);
         info.app_id = app.id;
         info.entity_id = component_id;
         result.nodes.push_back(info);
@@ -499,9 +507,10 @@ AggregatedConfigurations ThreadSafeEntityCache::get_area_configurations(const st
             continue;
           }
           const auto & app = apps_[app_idx];
-          if (app.bound_fqn.has_value() && !app.bound_fqn->empty()) {
+          auto eff_fqn = app.effective_fqn();
+          if (!eff_fqn.empty()) {
             NodeConfigInfo info;
-            info.node_fqn = *app.bound_fqn;
+            info.node_fqn = std::move(eff_fqn);
             info.app_id = app.id;
             info.entity_id = area_id;
             result.nodes.push_back(info);
@@ -538,9 +547,10 @@ AggregatedConfigurations ThreadSafeEntityCache::get_function_configurations(cons
         continue;
       }
       const auto & app = apps_[app_idx];
-      if (app.bound_fqn.has_value() && !app.bound_fqn->empty()) {
+      auto eff_fqn = app.effective_fqn();
+      if (!eff_fqn.empty()) {
         NodeConfigInfo info;
-        info.node_fqn = *app.bound_fqn;
+        info.node_fqn = std::move(eff_fqn);
         info.app_id = app.id;
         info.entity_id = function_id;
         result.nodes.push_back(info);
@@ -653,6 +663,10 @@ std::string ThreadSafeEntityCache::validate() const {
 std::chrono::system_clock::time_point ThreadSafeEntityCache::get_last_update() const {
   std::shared_lock lock(mutex_);
   return last_update_;
+}
+
+uint64_t ThreadSafeEntityCache::generation() const {
+  return generation_.load(std::memory_order_acquire);
 }
 
 // ============================================================================
