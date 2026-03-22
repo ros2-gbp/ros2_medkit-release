@@ -18,6 +18,7 @@
 #include "ros2_medkit_gateway/discovery/discovery_strategy.hpp"
 #include "ros2_medkit_gateway/discovery/hybrid_discovery.hpp"
 #include "ros2_medkit_gateway/discovery/manifest/manifest_manager.hpp"
+#include "ros2_medkit_gateway/discovery/merge_types.hpp"
 #include "ros2_medkit_gateway/discovery/models/app.hpp"
 #include "ros2_medkit_gateway/discovery/models/area.hpp"
 #include "ros2_medkit_gateway/discovery/models/common.hpp"
@@ -25,6 +26,7 @@
 #include "ros2_medkit_gateway/discovery/models/function.hpp"
 #include "ros2_medkit_gateway/discovery/runtime_discovery.hpp"
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <rclcpp/rclcpp.hpp>
@@ -36,6 +38,7 @@ namespace ros2_medkit_gateway {
 // Forward declarations
 class NativeTopicSampler;
 class TypeIntrospection;
+class IntrospectionProvider;
 
 /**
  * @brief Configuration for discovery
@@ -44,6 +47,8 @@ struct DiscoveryConfig {
   DiscoveryMode mode{DiscoveryMode::RUNTIME_ONLY};
   std::string manifest_path;
   bool manifest_strict_validation{true};
+  bool manifest_enabled{true};  // enable/disable manifest layer in hybrid mode
+  bool runtime_enabled{true};   // enable/disable runtime layer in hybrid mode
 
   /**
    * @brief Runtime (heuristic) discovery options
@@ -97,6 +102,16 @@ struct DiscoveryConfig {
      */
     int min_topics_for_component{1};
   } runtime;
+
+  /**
+   * @brief Merge pipeline configuration (hybrid mode only)
+   */
+  struct MergePipelineConfig {
+    discovery::GapFillConfig gap_fill;
+    /// Per-layer merge policy overrides: layer_name -> (field_group_name -> policy_name)
+    /// e.g. {"manifest": {"live_data": "authoritative"}, "runtime": {"identity": "authoritative"}}
+    std::map<std::string, std::map<std::string, std::string>> layer_policies;
+  } merge_pipeline;
 };
 
 /**
@@ -303,19 +318,28 @@ class DiscoveryManager {
   // =========================================================================
 
   /**
+   * @brief Add a plugin layer to the merge pipeline
+   *
+   * Wraps an IntrospectionProvider as a PluginLayer and adds it to
+   * the pipeline. Only works in HYBRID mode.
+   *
+   * @param plugin_name Name of the plugin
+   * @param provider Non-owning pointer to IntrospectionProvider
+   */
+  void add_plugin_layer(const std::string & plugin_name, IntrospectionProvider * provider);
+
+  /**
+   * @brief Re-execute the merge pipeline (hybrid mode only)
+   *
+   * Call after adding plugin layers to trigger a single pipeline refresh.
+   */
+  void refresh_pipeline();
+
+  /**
    * @brief Get the manifest manager
    * @return Pointer to manifest manager (nullptr if not using manifest)
    */
   discovery::ManifestManager * get_manifest_manager();
-
-  /**
-   * @brief Reload manifest from file
-   *
-   * Only works if a manifest was loaded during initialize().
-   *
-   * @return true if reload succeeded
-   */
-  bool reload_manifest();
 
   // =========================================================================
   // Status
@@ -335,11 +359,29 @@ class DiscoveryManager {
    */
   std::string get_strategy_name() const;
 
+  /**
+   * @brief Get the last merge pipeline report (hybrid mode only)
+   * @return MergeReport if in hybrid mode, nullopt otherwise
+   */
+  std::optional<discovery::MergeReport> get_merge_report() const;
+
+  /**
+   * @brief Get the last linking result (hybrid mode only)
+   * @return LinkingResult if in hybrid mode, nullopt otherwise
+   */
+  std::optional<discovery::LinkingResult> get_linking_result() const;
+
  private:
   /**
    * @brief Create and activate the appropriate strategy
    */
   void create_strategy();
+
+  /**
+   * @brief Apply user-configured merge policy overrides to a layer
+   */
+  template <typename LayerT>
+  void apply_layer_policy_overrides(const std::string & layer_name, LayerT & layer);
 
   rclcpp::Node * node_;
   DiscoveryConfig config_;

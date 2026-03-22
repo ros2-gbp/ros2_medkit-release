@@ -19,8 +19,8 @@
 # Centralizes all dependency resolution workarounds for supporting multiple
 # ROS 2 distributions (Humble, Jazzy, Rolling) in a single place.
 #
-# Usage (in each package's CMakeLists.txt, after find_package(ament_cmake)):
-#   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+# Usage (in each package's CMakeLists.txt):
+#   find_package(ros2_medkit_cmake REQUIRED)
 #   include(ROS2MedkitCompat)
 #
 # Macros provided:
@@ -213,11 +213,30 @@ macro(medkit_target_dependencies target)
             list(APPEND _mtd_dep_targets ${${_mtd_targets_var}})
           elseif(TARGET ${_mtd_arg}::${_mtd_arg})
             list(APPEND _mtd_dep_targets ${_mtd_arg}::${_mtd_arg})
+          elseif(DEFINED ${_mtd_arg}_INCLUDE_DIRS OR DEFINED ${_mtd_arg}_LIBRARIES)
+            # Header-only or legacy ament package (e.g. ros2_medkit_gateway exports
+            # only include dirs via ament_export_include_directories, no CMake targets).
+            # Create an IMPORTED INTERFACE target on the fly.
+            set(_mtd_iface_target "${_mtd_arg}::${_mtd_arg}")
+            if(NOT TARGET ${_mtd_iface_target})
+              add_library(${_mtd_iface_target} IMPORTED INTERFACE)
+              if(DEFINED ${_mtd_arg}_INCLUDE_DIRS)
+                set_target_properties(${_mtd_iface_target} PROPERTIES
+                  INTERFACE_INCLUDE_DIRECTORIES "${${_mtd_arg}_INCLUDE_DIRS}")
+              endif()
+              if(DEFINED ${_mtd_arg}_LIBRARIES AND NOT "${${_mtd_arg}_LIBRARIES}" STREQUAL "")
+                set_target_properties(${_mtd_iface_target} PROPERTIES
+                  INTERFACE_LINK_LIBRARIES "${${_mtd_arg}_LIBRARIES}")
+              endif()
+              message(STATUS "[MedkitCompat] ${_mtd_arg}: created interface target from _INCLUDE_DIRS/_LIBRARIES")
+            endif()
+            list(APPEND _mtd_dep_targets ${_mtd_iface_target})
+            unset(_mtd_iface_target)
           else()
             message(FATAL_ERROR
               "[MedkitCompat] medkit_target_dependencies: could not resolve dependency '${_mtd_arg}' "
               "for target '${target}'. Expected variable ${_mtd_arg}_TARGETS or imported target "
-              "${_mtd_arg}::${_mtd_arg}")
+              "${_mtd_arg}::${_mtd_arg} or ${_mtd_arg}_INCLUDE_DIRS")
           endif()
           unset(_mtd_targets_var)
         endif()

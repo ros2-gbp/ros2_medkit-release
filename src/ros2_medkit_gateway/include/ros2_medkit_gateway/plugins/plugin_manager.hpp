@@ -14,16 +14,22 @@
 
 #pragma once
 
+#include "ros2_medkit_gateway/openapi/route_descriptions.hpp"
 #include "ros2_medkit_gateway/plugins/gateway_plugin.hpp"
 #include "ros2_medkit_gateway/plugins/plugin_context.hpp"
 #include "ros2_medkit_gateway/plugins/plugin_loader.hpp"
 #include "ros2_medkit_gateway/plugins/plugin_types.hpp"
 #include "ros2_medkit_gateway/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/providers/log_provider.hpp"
+#include "ros2_medkit_gateway/providers/script_provider.hpp"
 #include "ros2_medkit_gateway/providers/update_provider.hpp"
+#include "ros2_medkit_gateway/resource_sampler.hpp"
+#include "ros2_medkit_gateway/subscription_transport.hpp"
 
 #include <httplib.h>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -96,6 +102,15 @@ class PluginManager {
    */
   void register_routes(httplib::Server & server, const std::string & api_prefix);
 
+  /// Register a resource sampler for a vendor collection (must start with "x-")
+  void register_resource_sampler(const std::string & collection, ResourceSamplerFn fn);
+
+  /// Register a custom transport provider
+  void register_transport(std::unique_ptr<SubscriptionTransportProvider> provider);
+
+  /// Set registries (called during gateway init)
+  void set_registries(ResourceSamplerRegistry & samplers, TransportRegistry & transports);
+
   /**
    * @brief Shutdown all plugins
    */
@@ -115,12 +130,45 @@ class PluginManager {
    */
   std::vector<IntrospectionProvider *> get_introspection_providers() const;
 
+  /**
+   * @brief Get the first plugin implementing LogProvider, or nullptr if none loaded
+   */
+  LogProvider * get_log_provider() const;
+
+  /**
+   * @brief Get the first plugin implementing ScriptProvider, or nullptr if none loaded
+   */
+  ScriptProvider * get_script_provider() const;
+
+  /**
+   * @brief Get all plugins implementing LogProvider (for observer notifications)
+   */
+  std::vector<LogProvider *> get_log_observers() const;
+
+  /**
+   * @brief Get all introspection providers with their plugin names
+   * @return (plugin_name, provider) pairs for all IntrospectionProvider plugins
+   */
+  std::vector<std::pair<std::string, IntrospectionProvider *>> get_named_introspection_providers() const;
+
+  /// Collect OpenAPI route descriptions from all loaded plugins.
+  /// Uses dlsym to check for optional "describe_plugin_routes" export.
+  std::vector<openapi::RouteDescriptions> collect_route_descriptions() const;
+
   // ---- Capability queries (used by discovery handlers) ----
 
   /// Get plugin context (for capability queries from discovery handlers)
   PluginContext * get_context() const {
     return context_;
   }
+
+  // ---- Route descriptions (for handle_root auto-registration) ----
+
+  /**
+   * @brief Collect route descriptions from all active plugins
+   * @return Combined route descriptions from all plugins
+   */
+  std::vector<GatewayPlugin::RouteDescription> get_all_route_descriptions() const;
 
   // ---- Info ----
   bool has_plugins() const;
@@ -134,6 +182,8 @@ class PluginManager {
     nlohmann::json config;
     UpdateProvider * update_provider = nullptr;
     IntrospectionProvider * introspection_provider = nullptr;
+    LogProvider * log_provider = nullptr;
+    ScriptProvider * script_provider = nullptr;
   };
 
   /// Disable a plugin after a lifecycle error (nulls providers, resets plugin).
@@ -143,7 +193,12 @@ class PluginManager {
   std::vector<LoadedPlugin> plugins_;
   PluginContext * context_ = nullptr;
   UpdateProvider * first_update_provider_ = nullptr;
+  LogProvider * first_log_provider_ = nullptr;
+  ScriptProvider * first_script_provider_ = nullptr;
+  ResourceSamplerRegistry * sampler_registry_ = nullptr;
+  TransportRegistry * transport_registry_ = nullptr;
   bool shutdown_called_ = false;
+  mutable std::shared_mutex plugins_mutex_;
 };
 
 }  // namespace ros2_medkit_gateway

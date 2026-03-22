@@ -24,17 +24,54 @@ Server Capabilities
    .. code-block:: json
 
       {
-        "api_version": "1.0.0",
-        "gateway_version": "0.1.0",
+        "name": "ROS 2 Medkit Gateway",
+        "version": "0.4.0",
+        "api_base": "/api/v1",
         "endpoints": [
-          {"path": "/areas", "supported_methods": ["GET"]},
-          {"path": "/components", "supported_methods": ["GET"]},
-          {"path": "/apps", "supported_methods": ["GET"]}
-        ]
+          "GET /api/v1/health",
+          "GET /api/v1/areas",
+          "GET /api/v1/components",
+          "GET /api/v1/apps",
+          "GET /api/v1/functions",
+          "GET /api/v1/faults",
+          "..."
+        ],
+        "capabilities": {
+          "discovery": true,
+          "data_access": true,
+          "operations": true,
+          "async_actions": true,
+          "configurations": true,
+          "faults": true,
+          "logs": true,
+          "bulk_data": true,
+          "cyclic_subscriptions": true,
+          "triggers": true,
+          "updates": false,
+          "authentication": false,
+          "tls": false
+        }
       }
 
 ``GET /api/v1/version-info``
    Get gateway version and status information.
+
+   **Example Response:**
+
+   .. code-block:: json
+
+      {
+        "items": [
+          {
+            "version": "1.0.0",
+            "base_uri": "/api/v1",
+            "vendor_info": {
+              "version": "0.4.0",
+              "name": "ros2_medkit"
+            }
+          }
+        ]
+      }
 
 ``GET /api/v1/health``
    Health check endpoint. Returns HTTP 200 if gateway is operational.
@@ -57,7 +94,7 @@ Areas
           {
             "id": "powertrain",
             "name": "Powertrain",
-            "self": "/api/v1/areas/powertrain"
+            "href": "/api/v1/areas/powertrain"
           }
         ]
       }
@@ -70,6 +107,13 @@ Areas
 
 ``GET /api/v1/areas/{area_id}/components``
    List components in a specific area.
+
+   .. note::
+
+      **ros2_medkit extension:** Areas support resource collections beyond the SOVD spec,
+      which only defines them for apps and components. Areas provide ``/data``, ``/operations``,
+      ``/configurations``, ``/faults``, ``/logs`` (namespace prefix aggregation), read-only
+      ``/bulk-data``, and ``/triggers``. See :ref:`sovd-compliance` for details.
 
 Components
 ~~~~~~~~~~
@@ -86,9 +130,7 @@ Components
           {
             "id": "temp_sensor",
             "name": "temp_sensor",
-            "self": "/api/v1/components/temp_sensor",
-            "area": "powertrain",
-            "resource_collections": ["data", "operations", "configurations", "faults"]
+            "href": "/api/v1/components/temp_sensor"
           }
         ]
       }
@@ -116,6 +158,39 @@ Apps
 ``GET /api/v1/apps/{app_id}``
    Get capabilities for a single discovered app.
 
+``GET /api/v1/apps/{app_id}/is-located-on``
+   Return the parent component that hosts this app.
+
+   The response follows the standard ``items`` wrapper and returns:
+
+   - ``0`` items when the app has no associated host component
+   - ``1`` item when the host component is resolved
+   - ``1`` item with ``x-medkit.missing=true`` when the app references a host
+     component that cannot currently be resolved
+
+   **Example Response:**
+
+   .. code-block:: json
+
+      {
+        "items": [
+          {
+            "id": "temp-sensor-hw",
+            "name": "Temperature Sensor",
+            "href": "/api/v1/components/temp-sensor-hw"
+          }
+        ],
+        "x-medkit": {
+          "total_count": 1
+        },
+        "_links": {
+          "self": "/api/v1/apps/engine-temp-sensor/is-located-on",
+          "app": "/api/v1/apps/engine-temp-sensor"
+        }
+      }
+
+   Unknown apps return ``404 App not found`` with ``parameters.app_id``.
+
 Functions
 ~~~~~~~~~
 
@@ -127,6 +202,76 @@ Functions
 
 ``GET /api/v1/functions/{function_id}/hosts``
    List apps that host this function.
+
+``GET /api/v1/functions/{function_id}/x-medkit-graph``
+   Get a function-scoped topology snapshot with per-topic metrics and pipeline status.
+
+   **Example Response:**
+
+   .. code-block:: json
+
+      {
+        "x-medkit-graph": {
+          "schema_version": "1.0.0",
+          "graph_id": "perception_graph-graph",
+          "timestamp": "2026-03-08T12:00:00.000Z",
+          "scope": {
+            "type": "function",
+            "entity_id": "perception_graph"
+          },
+          "pipeline_status": "degraded",
+          "bottleneck_edge": "edge-2",
+          "topics": [
+            {
+              "topic_id": "topic-1",
+              "name": "/camera/front/image_raw"
+            }
+          ],
+          "nodes": [
+            {
+              "entity_id": "camera_front",
+              "node_status": "reachable"
+            },
+            {
+              "entity_id": "detector",
+              "node_status": "unreachable",
+              "last_seen": "2026-03-08T11:59:42.100Z"
+            }
+          ],
+          "edges": [
+            {
+              "edge_id": "edge-2",
+              "source": "camera_front",
+              "target": "detector",
+              "topic_id": "topic-1",
+              "transport_type": "unknown",
+              "metrics": {
+                "source": "greenwave_monitor",
+                "frequency_hz": 12.5,
+                "latency_ms": 4.2,
+                "drop_rate_percent": 0.0,
+                "metrics_status": "active"
+              }
+            }
+          ]
+        }
+      }
+
+   **Field Notes:**
+
+   - ``pipeline_status``: overall graph state, one of ``healthy``, ``degraded``, ``broken``
+   - ``node_status``: per-node reachability, one of ``reachable``, ``unreachable``
+   - ``metrics_status``: per-edge telemetry state, one of ``pending``, ``active``, ``error``
+   - ``error_reason``: present when ``metrics_status`` is ``error``; one of ``node_offline``, ``topic_stale``, ``no_data_source``
+
+   .. note::
+
+      **ros2_medkit extension:** Functions support resource collections beyond the SOVD spec.
+      ``/data`` and ``/operations`` aggregate from hosted apps (per SOVD). Additionally,
+      ``/configurations``, ``/faults``, ``/logs`` aggregate from hosts, read-only
+      ``/bulk-data`` is available, ``/cyclic-subscriptions`` and ``/triggers`` are
+      supported, and the vendor resource ``/x-medkit-graph`` exposes a function-scoped
+      graph snapshot. See :ref:`sovd-compliance` for details.
 
 Data Endpoints
 --------------
@@ -349,6 +494,12 @@ Manage ROS 2 node parameters.
 ``DELETE /api/v1/components/{id}/configurations``
    Reset all parameters to default values.
 
+Resource Locking
+----------------
+
+SOVD resource locking for preventing concurrent modification of entity state.
+See :doc:`locking` for the full API reference.
+
 Faults Endpoints
 ----------------
 
@@ -477,6 +628,16 @@ Query and manage faults.
    - **204:** Fault cleared
    - **404:** Fault not found
 
+``DELETE /api/v1/components/{id}/faults``
+   Clear all faults for an entity.
+
+   Accepts the optional ``?status=`` query parameter (same values as ``GET /faults``).
+   Without it, clears pending and confirmed faults.
+
+   - **204:** Faults cleared (or none to clear)
+   - **400:** Invalid status parameter
+   - **503:** Fault manager unavailable
+
 ``DELETE /api/v1/faults``
    Clear all faults across the system *(ros2_medkit extension, not SOVD)*.
 
@@ -486,6 +647,125 @@ Query and manage faults.
    - **204:** Faults cleared (or none to clear)
    - **400:** Invalid status parameter
    - **503:** Fault manager unavailable
+
+Logs Endpoints
+--------------
+
+Query and configure the /rosout ring buffer for an entity. Supported entity types:
+**areas** (namespace prefix match), **components** (namespace prefix match), **apps** (exact FQN match),
+and **functions** (aggregated from hosted apps).
+
+.. note::
+
+   By default, log entries are sourced from the ``/rosout`` ROS 2 topic. ros2_medkit retains
+   the 200 most recent entries per node in an in-memory ring buffer (configurable via
+   ``logs.buffer_size`` in ``gateway_params.yaml``). A ``LogProvider`` plugin can replace the
+   storage backend or take full ownership of the log pipeline (see plugin development docs).
+
+``GET /api/v1/components/{id}/logs``
+   Query log entries for all nodes in the component namespace (prefix match).
+
+``GET /api/v1/apps/{id}/logs``
+   Query log entries for the specific app node (exact match).
+
+**Query parameters:**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 80
+
+   * - Parameter
+     - Description
+   * - ``severity``
+     - Minimum severity filter (``debug`` | ``info`` | ``warning`` | ``error`` | ``fatal``).
+       The stricter of this parameter and the entity's configured ``severity_filter`` is applied.
+       Without this parameter, the entity's configured ``severity_filter`` (default: ``debug``)
+       determines the minimum level. Empty or absent = use entity config only.
+   * - ``context``
+     - Substring filter applied to the log entry's logger name (``context.node`` in the response).
+       Maximum length: 256 characters. Empty or absent = no filter.
+
+**Response 200:**
+
+.. code-block:: json
+
+   {
+     "items": [
+       {
+         "id": "log_42",
+         "timestamp": "2026-01-15T10:30:00.123456789Z",
+         "severity": "warning",
+         "message": "Calibration drift detected",
+         "context": {
+           "node": "powertrain/engine/temp_sensor",
+           "function": "read_sensor",
+           "file": "temp_sensor.cpp",
+           "line": 99
+         }
+       }
+     ]
+   }
+
+The ``context.function``, ``context.file``, and ``context.line`` fields are omitted when empty/zero.
+
+**Severity values** map directly to the ROS 2 log levels:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 15 70
+
+   * - Value
+     - ROS 2 level
+     - Meaning
+   * - ``debug``
+     - DEBUG (10)
+     - Fine-grained diagnostic information
+   * - ``info``
+     - INFO (20)
+     - Normal operational messages
+   * - ``warning``
+     - WARN (30)
+     - Non-fatal anomalies
+   * - ``error``
+     - ERROR (40)
+     - Errors that may require attention
+   * - ``fatal``
+     - FATAL (50)
+     - Critical failures
+
+``GET /api/v1/components/{id}/logs/configuration`` / ``GET /api/v1/apps/{id}/logs/configuration``
+   Return the current log configuration for the entity.
+
+   **Response 200:**
+
+   .. code-block:: json
+
+      {
+        "severity_filter": "debug",
+        "max_entries": 100
+      }
+
+``PUT /api/v1/components/{id}/logs/configuration`` / ``PUT /api/v1/apps/{id}/logs/configuration``
+   Update the log configuration for the entity. All body fields are optional.
+
+   **Request body:**
+
+   .. code-block:: json
+
+      {
+        "severity_filter": "warning",
+        "max_entries": 500
+      }
+
+   ``severity_filter`` - minimum severity to return in query results (``debug`` | ``info`` | ``warning`` |
+   ``error`` | ``fatal``). Entries below this level are excluded from queries. Default: ``debug``.
+
+   ``max_entries`` - maximum number of entries returned per query. Must be between 1 and 10,000
+   (inclusive). Default: ``100``.
+
+   **Response 204:** No content.
+
+   - **400:** Invalid ``severity_filter`` or ``max_entries`` value
 
 Bulk Data Endpoints
 -------------------
@@ -815,16 +1095,31 @@ Without such a plugin, all endpoints return ``501 Not Implemented``.
 Cyclic Subscriptions
 --------------------
 
-Cyclic subscriptions provide periodic push-based data delivery via Server-Sent Events (SSE).
-A client creates a subscription specifying which data resource to observe and at what interval.
-The server then pushes the latest value of that resource at the requested frequency.
+Cyclic subscriptions provide periodic push-based delivery of any SOVD resource collection
+via Server-Sent Events (SSE). A client creates a subscription specifying the resource URI
+(data, faults, configurations, logs, or ``x-`` vendor extensions) and a delivery interval.
+The server then pushes the latest value at the requested frequency.
 
-Subscriptions are temporary — they do not survive server restart.
+Subscriptions are temporary - they do not survive server restart.
+
+**Supported collections:**
+
+- ``data`` - Topic data (requires a resource path, e.g. ``/data/temperature``)
+- ``faults`` - Fault list (resource path optional, e.g. ``/faults`` or ``/faults/fault_001``)
+- ``configurations`` - Parameter values (resource path optional)
+- ``logs`` - Application log entries from ``/rosout``
+- ``x-*`` - Vendor extensions (e.g. ``x-medkit-graph``)
+
+**Interval values:**
+
+- ``fast`` - 50ms sampling period
+- ``normal`` - 200ms sampling period (default)
+- ``slow`` - 500ms sampling period
 
 ``POST /api/v1/{entity_type}/{entity_id}/cyclic-subscriptions``
    Create a new cyclic subscription.
 
-   **Applies to:** ``/apps``, ``/components``
+   **Applies to:** ``/apps``, ``/components``, ``/functions``
 
    **Request Body:**
 
@@ -839,10 +1134,23 @@ Subscriptions are temporary — they do not survive server restart.
 
    **Fields:**
 
-   - ``resource`` (string, required): Full URI of the data resource to observe
+   - ``resource`` (string, required): Full SOVD resource URI to observe
+     (e.g. ``/api/v1/apps/{id}/data/{topic}``, ``/api/v1/apps/{id}/faults``,
+     ``/api/v1/functions/{id}/x-medkit-graph``)
    - ``protocol`` (string, optional): Transport protocol. Only ``"sse"`` supported. Default: ``"sse"``
-   - ``interval`` (string, required): One of ``fast`` (<100ms), ``normal`` (100-250ms), ``slow`` (250-500ms)
-   - ``duration`` (integer, required): Subscription lifetime in seconds (must be > 0)
+   - ``interval`` (string, required): One of ``fast``, ``normal``, ``slow``
+   - ``duration`` (integer, required): Subscription lifetime in seconds.
+     Must be > 0 and <= ``sse.max_duration_sec`` (default: 3600)
+
+   **Error responses:**
+
+   - **400** ``invalid-parameter`` - Invalid interval, duration <= 0, or duration exceeds max
+   - **400** ``x-medkit-invalid-resource-uri`` - Malformed resource URI or path traversal
+   - **400** ``x-medkit-entity-mismatch`` - Resource URI references different entity than route
+   - **400** ``x-medkit-collection-not-supported`` - Entity doesn't support the collection
+   - **400** ``x-medkit-collection-not-available`` - No data provider registered for collection
+   - **400** ``x-medkit-unsupported-protocol`` - Requested protocol not available
+   - **503** ``service-unavailable`` - Max subscription capacity reached
 
    **Response 201 Created:**
 
@@ -864,7 +1172,8 @@ Subscriptions are temporary — they do not survive server restart.
 
 ``PUT /api/v1/{entity_type}/{entity_id}/cyclic-subscriptions/{id}``
    Update ``interval`` and/or ``duration`` of an existing subscription.
-   Only provided fields are updated.
+   Only provided fields are updated. Updating ``duration`` resets the
+   expiry timer from the current time (not from the original creation time).
 
    **Request Body:**
 
@@ -897,6 +1206,483 @@ Subscriptions are temporary — they do not survive server restart.
 
    The stream auto-closes when the duration expires, the client disconnects,
    or the subscription is deleted.
+
+**Multi-collection examples:**
+
+Subscribe to faults on a component:
+
+.. code-block:: json
+
+   {
+     "resource": "/api/v1/components/ecu1/faults",
+     "interval": "slow",
+     "duration": 600
+   }
+
+Subscribe to a specific configuration parameter:
+
+.. code-block:: json
+
+   {
+     "resource": "/api/v1/apps/temp_sensor/configurations/calibration_offset",
+     "interval": "normal",
+     "duration": 120
+   }
+
+Scripts
+-------
+
+Upload, manage, and execute diagnostic scripts on entities.
+*(ISO 17978-3, 7.15)*
+
+Scripts are available on **Components** and **Apps** entity types.
+The feature must be enabled by setting ``scripts.scripts_dir`` in the gateway configuration.
+
+Upload Script
+~~~~~~~~~~~~~
+
+``POST /api/v1/{entity_type}/{entity_id}/scripts``
+   Upload a diagnostic script via ``multipart/form-data``.
+
+   - **file** (required): The script file (Python, bash, or sh)
+   - **metadata** (optional): JSON with name, description, parameters_schema
+
+   Response: **201 Created** with ``Location`` header pointing to the new script.
+
+   .. note::
+
+      Uploads can be disabled by setting ``scripts.allow_uploads: false`` in the
+      gateway configuration. When disabled, POST returns 400. Pre-deployed
+      manifest scripts remain available for execution.
+
+List Scripts
+~~~~~~~~~~~~
+
+``GET /api/v1/{entity_type}/{entity_id}/scripts``
+   List all scripts for an entity. Returns ``{"items": [...]}``.
+
+Get Script
+~~~~~~~~~~
+
+``GET /api/v1/{entity_type}/{entity_id}/scripts/{script_id}``
+   Get metadata for a specific script.
+
+Delete Script
+~~~~~~~~~~~~~
+
+``DELETE /api/v1/{entity_type}/{entity_id}/scripts/{script_id}``
+   Delete an uploaded script. Returns **204 No Content**.
+   Returns **409** if the script is manifest-managed or currently executing.
+
+Start Execution
+~~~~~~~~~~~~~~~
+
+``POST /api/v1/{entity_type}/{entity_id}/scripts/{script_id}/executions``
+   Start a new execution of a script.
+
+   **Request Body:**
+
+   .. code-block:: json
+
+      {
+        "execution_type": "now",
+        "parameters": {"threshold": 0.1}
+      }
+
+   .. list-table::
+      :header-rows: 1
+      :widths: 25 15 10 50
+
+      * - Attribute
+        - Type
+        - Conv
+        - Description
+      * - ``execution_type``
+        - string
+        - M
+        - When to run: ``now``, ``on_restart``, ``now_and_on_restart``, ``once_on_restart``
+      * - ``parameters``
+        - object
+        - O
+        - Input parameters for the script
+      * - ``proximity_response``
+        - string
+        - O
+        - Co-location proof token
+
+   .. note::
+
+      The built-in script backend supports only ``now``. Other execution types
+      (``on_restart``, ``now_and_on_restart``, ``once_on_restart``) require a
+      plugin-provided ScriptProvider and will return 400 ``invalid-parameter``
+      if not supported.
+
+   Response: **202 Accepted** with ``Location`` header pointing to the execution status.
+
+Get Execution Status
+~~~~~~~~~~~~~~~~~~~~
+
+``GET /api/v1/{entity_type}/{entity_id}/scripts/{script_id}/executions/{execution_id}``
+   Poll the status of a script execution.
+
+   Status values: ``prepared``, ``running``, ``completed``, ``failed``, ``terminated``
+
+Terminate Execution
+~~~~~~~~~~~~~~~~~~~
+
+``PUT /api/v1/{entity_type}/{entity_id}/scripts/{script_id}/executions/{execution_id}``
+   Send a termination action to a running execution.
+
+   **Request Body:**
+
+   .. code-block:: json
+
+      {"action": "stop"}
+
+   Action values: ``stop`` (SIGTERM), ``forced_termination`` (SIGKILL).
+
+Delete Execution
+~~~~~~~~~~~~~~~~
+
+``DELETE /api/v1/{entity_type}/{entity_id}/scripts/{script_id}/executions/{execution_id}``
+   Remove a completed/terminated execution resource. Returns **204 No Content**.
+   Returns **409** if the execution is still running.
+
+Triggers
+--------
+
+Triggers provide condition-based push notifications for resource changes via
+Server-Sent Events (SSE). Unlike cyclic subscriptions - which poll a resource
+at a fixed interval and push every sample - triggers evaluate a condition
+against each change and only fire when the condition is met.
+
+**Key differences from Cyclic Subscriptions:**
+
+- Cyclic subscriptions push data at a fixed interval (``fast``/``normal``/``slow``)
+  regardless of whether the value changed
+- Triggers are event-driven: they only fire when a specific condition is satisfied
+  (e.g., value changed, entered a range, reached a threshold)
+- Triggers support persistence across gateway restarts (``persistent: true``)
+- Triggers can be one-shot (fire once, then auto-terminate) or multishot (continuous)
+
+**Supported entity types:** ``/areas``, ``/components``, ``/apps``, ``/functions``
+
+.. note::
+
+   **ros2_medkit extension:** SOVD defines triggers for apps and components only.
+   ros2_medkit extends trigger support to areas and functions, allowing
+   hierarchy-scoped monitoring. Area-level triggers catch changes from all
+   descendant entities within the area.
+
+**Observable resource collections:**
+
+- ``data`` - Topic data changes (driven by ``TriggerTopicSubscriber``)
+- ``faults`` - Fault state transitions (created, updated, cleared)
+- ``operations`` - Operation execution completions
+- ``updates`` - Software update status changes
+- ``logs`` - Log entries matching configured severity (x-medkit extension)
+
+Create Trigger
+~~~~~~~~~~~~~~
+
+``POST /api/v1/{entity_type}/{entity_id}/triggers``
+   Create a new condition-based trigger.
+
+   **Request Body:**
+
+   .. code-block:: json
+
+      {
+        "resource": "/api/v1/apps/temp_sensor/data/powertrain%2Fengine%2Ftemperature",
+        "trigger_condition": {
+          "condition_type": "LeaveRange",
+          "lower_bound": 20.0,
+          "upper_bound": 80.0
+        },
+        "path": "/data",
+        "protocol": "sse",
+        "multishot": true,
+        "persistent": false,
+        "lifetime": 300,
+        "log_settings": {
+          "severity": "warning",
+          "marker": "Temperature threshold exceeded"
+        }
+      }
+
+   **Fields:**
+
+   .. list-table::
+      :header-rows: 1
+      :widths: 20 10 70
+
+      * - Field
+        - Required
+        - Description
+      * - ``resource``
+        - Yes
+        - Full SOVD resource URI to observe (e.g. ``/api/v1/apps/{id}/data/{topic}``,
+          ``/api/v1/apps/{id}/faults``, ``/api/v1/areas/{id}/faults``).
+          Must reference the same entity as the route.
+      * - ``trigger_condition``
+        - Yes
+        - Object with ``condition_type`` and condition-specific parameters.
+          See `Trigger Conditions`_ below.
+      * - ``path``
+        - No
+        - JSON Pointer within the resource payload to evaluate. When set, the
+          condition is evaluated against the value at this path instead of the
+          full payload.
+      * - ``protocol``
+        - No
+        - Transport protocol. Only ``"sse"`` is supported. Default: ``"sse"``.
+      * - ``multishot``
+        - No
+        - If ``true``, the trigger fires repeatedly. If ``false``, the trigger
+          auto-terminates after the first event. Default: ``false``.
+      * - ``persistent``
+        - No
+        - If ``true``, the trigger survives gateway restarts (when
+          ``on_restart_behavior`` is ``"restore"``). Default: ``false``.
+      * - ``lifetime``
+        - No
+        - Time-to-live in seconds. The trigger auto-terminates after this
+          duration. Must be a positive integer. Omit for no expiry.
+      * - ``log_settings``
+        - No
+        - Temporary log entry injected when the trigger fires.
+          Accepts ``severity`` (log level: ``debug``, ``info``, ``warning``,
+          ``error``, ``fatal``; default: ``info``) and ``marker`` (descriptive
+          message text; default: ``"Trigger fired"``). The log entry includes
+          trigger metadata (trigger ID, condition type, resource URI).
+
+   **Response 201 Created:**
+
+   .. code-block:: json
+
+      {
+        "id": "trig_001",
+        "status": "active",
+        "observed_resource": "/api/v1/apps/temp_sensor/data/powertrain%2Fengine%2Ftemperature",
+        "event_source": "/api/v1/apps/temp_sensor/triggers/trig_001/events",
+        "protocol": "sse",
+        "trigger_condition": {
+          "condition_type": "LeaveRange",
+          "lower_bound": 20.0,
+          "upper_bound": 80.0
+        },
+        "multishot": true,
+        "persistent": false,
+        "lifetime": 300
+      }
+
+   **Error Responses:**
+
+   - **400** ``invalid-parameter`` - Missing or invalid ``resource``, ``trigger_condition``,
+     ``condition_type``, ``lifetime``, or condition-specific parameters
+   - **400** ``x-medkit-invalid-resource-uri`` - Malformed resource URI or path traversal
+   - **400** ``x-medkit-entity-mismatch`` - Resource URI references a different entity than
+     the route
+   - **503** ``service-unavailable`` - Maximum trigger capacity reached
+     (configurable via ``triggers.max_triggers``)
+
+List Triggers
+~~~~~~~~~~~~~
+
+``GET /api/v1/{entity_type}/{entity_id}/triggers``
+   List all triggers for an entity.
+
+   **Response 200:**
+
+   .. code-block:: json
+
+      {
+        "items": [
+          {
+            "id": "trig_001",
+            "status": "active",
+            "observed_resource": "/api/v1/apps/temp_sensor/faults",
+            "event_source": "/api/v1/apps/temp_sensor/triggers/trig_001/events",
+            "protocol": "sse",
+            "trigger_condition": {"condition_type": "OnChange"},
+            "multishot": true,
+            "persistent": false,
+            "lifetime": 300
+          }
+        ]
+      }
+
+Get Trigger
+~~~~~~~~~~~
+
+``GET /api/v1/{entity_type}/{entity_id}/triggers/{trigger_id}``
+   Get details of a single trigger.
+
+   **Response 200:** Same schema as creation response.
+
+   - **404** ``resource-not-found`` - Trigger not found or belongs to a different entity
+
+Update Trigger
+~~~~~~~~~~~~~~
+
+``PUT /api/v1/{entity_type}/{entity_id}/triggers/{trigger_id}``
+   Update the lifetime of an existing trigger. Updating ``lifetime`` resets the
+   expiry timer from the current time.
+
+   **Request Body:**
+
+   .. code-block:: json
+
+      {
+        "lifetime": 600
+      }
+
+   **Response 200:** Updated trigger object (same schema as creation response).
+
+   - **400** ``invalid-parameter`` - Missing or invalid ``lifetime``
+   - **404** ``resource-not-found`` - Trigger not found
+
+Delete Trigger
+~~~~~~~~~~~~~~
+
+``DELETE /api/v1/{entity_type}/{entity_id}/triggers/{trigger_id}``
+   Remove a trigger. Any active SSE connection for this trigger is closed.
+
+   - **204** No Content - Trigger deleted
+   - **404** ``resource-not-found`` - Trigger not found
+
+Trigger Events (SSE Stream)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``GET /api/v1/{entity_type}/{entity_id}/triggers/{trigger_id}/events``
+   SSE event stream for a trigger. Connect to receive events when the trigger
+   condition is met. The stream sends keepalive comments every 15 seconds.
+
+   **Response Headers:**
+
+   .. code-block:: text
+
+      Content-Type: text/event-stream
+      Cache-Control: no-cache
+
+   **EventEnvelope format:**
+
+   Each event is delivered as an SSE ``data:`` frame containing a JSON
+   EventEnvelope:
+
+   .. code-block:: text
+
+      data: {"timestamp":"2026-03-19T10:30:00.250Z","payload":{"data":{"data":85.5}}}
+
+   When an error occurs during evaluation:
+
+   .. code-block:: text
+
+      data: {"timestamp":"2026-03-19T10:30:00.250Z","error":"Failed to read resource"}
+
+   **EventEnvelope fields:**
+
+   - ``timestamp`` (string) - ISO 8601 timestamp of when the event was generated
+   - ``payload`` (object) - The resource value that satisfied the condition (present on success)
+   - ``error`` (string) - Error description (present on failure, mutually exclusive with payload)
+
+   The stream closes when:
+
+   - The trigger's ``lifetime`` expires
+   - The trigger is deleted
+   - A one-shot trigger fires (``multishot: false``)
+   - The client disconnects
+   - The gateway shuts down
+   - Maximum SSE client limit is reached (503 on connect)
+
+   **Example:**
+
+   .. code-block:: bash
+
+      curl -N http://localhost:8080/api/v1/apps/temp_sensor/triggers/trig_001/events
+
+   - **404** ``resource-not-found`` - Trigger not found or expired
+   - **503** ``service-unavailable`` - Maximum SSE client limit reached
+
+Trigger Conditions
+~~~~~~~~~~~~~~~~~~
+
+The ``trigger_condition`` object in the creation request specifies when the
+trigger fires. Four standard condition types are supported:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 18 32 50
+
+   * - Condition Type
+     - Parameters
+     - Behavior
+   * - ``OnChange``
+     - (none)
+     - Fires whenever the current value differs from the previous value.
+       First evaluation always fires.
+   * - ``OnChangeTo``
+     - ``target_value`` (any JSON value, required)
+     - Fires when the current value equals the target AND differs from the
+       previous value. First evaluation checks target only.
+   * - ``EnterRange``
+     - ``lower_bound`` (number, required), ``upper_bound`` (number, required)
+     - Fires when a numeric value transitions from outside the inclusive range
+       [lower_bound, upper_bound] to inside it. Requires a previous value
+       (first evaluation does not fire).
+   * - ``LeaveRange``
+     - ``lower_bound`` (number, required), ``upper_bound`` (number, required)
+     - Fires when a numeric value transitions from inside the inclusive range
+       [lower_bound, upper_bound] to outside it. Requires a previous value
+       (first evaluation does not fire).
+
+Plugins can register custom condition evaluators with ``x-`` prefixed names
+(e.g., ``x-threshold-count``) via the ``ConditionRegistry``.
+
+Configuration
+~~~~~~~~~~~~~
+
+Configure triggers in ``gateway_params.yaml``:
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       triggers:
+         # Enable/disable the trigger subsystem (default: true)
+         # When false, trigger endpoints return 501
+         enabled: true
+
+         # Maximum concurrent triggers across all entities (default: 1000)
+         # Returns HTTP 503 when this limit is reached
+         max_triggers: 1000
+
+         # Behavior on gateway restart for persistent triggers
+         # "reset": Clear all triggers on restart (default)
+         # "restore": Reload persistent triggers from storage
+         on_restart_behavior: "reset"
+
+         # Trigger persistence storage
+         storage:
+           # Path to SQLite database for persistent triggers
+           # Empty string = in-memory only (default)
+           # Example: "/var/lib/ros2_medkit/triggers.db"
+           path: ""
+
+Persistence
+~~~~~~~~~~~
+
+Triggers created with ``"persistent": true`` are stored in a SQLite database.
+On gateway restart, their behavior depends on the ``on_restart_behavior``
+configuration:
+
+- **reset** (default): All triggers are cleared on restart, regardless of
+  the ``persistent`` flag. This is the safest option for development.
+- **restore**: Persistent triggers are reloaded from the database. Their
+  ``previous_value`` state is preserved, allowing range-based conditions
+  (EnterRange, LeaveRange) to evaluate correctly without losing context.
+
+Non-persistent triggers are always cleared on restart.
 
 Rate Limiting
 -------------
@@ -999,6 +1785,248 @@ JWT-based authentication with Role-Based Access Control (RBAC).
 
       {"token": "dGhpcyBpcyBhIHJlZnJlc2g..."}
 
+Vendor Extension Endpoints (Plugins)
+-------------------------------------
+
+Plugin-registered endpoints use the ``x-medkit-`` prefix following the SOVD vendor extension
+mechanism. These endpoints are only available when the corresponding plugin is loaded
+(see :doc:`/tutorials/linux-introspection`).
+
+.. warning::
+
+   The procfs plugin exposes process command lines (``/proc/{pid}/cmdline``) via HTTP.
+   Command lines may contain sensitive data (API keys, passwords passed as arguments).
+   Enable authentication when using the procfs plugin in production environments.
+
+.. note::
+
+   Vendor extension endpoints are registered dynamically by plugins. They do not appear in
+   the ``GET /`` root endpoint list. Use entity capability responses (``GET /apps/{id}``,
+   ``GET /components/{id}``) to discover available extensions via the ``capabilities`` field.
+
+Linux Process Introspection (x-medkit-procfs)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Requires: ``procfs_introspection`` plugin.
+
+``GET /api/v1/apps/{id}/x-medkit-procfs``
+   Get process-level information for a single app.
+
+   **Response 200:**
+
+   .. code-block:: json
+
+      {
+        "pid": 1234,
+        "ppid": 1,
+        "state": "S",
+        "exe": "/usr/bin/talker",
+        "cmdline": "/usr/bin/talker --ros-args __node:=talker __ns:=/demo",
+        "rss_bytes": 524288,
+        "vm_size_bytes": 2097152,
+        "threads": 4,
+        "cpu_user_ticks": 1520,
+        "cpu_system_ticks": 340,
+        "cpu_user_seconds": 15.2,
+        "cpu_system_seconds": 3.4,
+        "uptime_seconds": 123.45
+      }
+
+   - **404:** Process not found (node not running or PID cache miss)
+   - **503:** Failed to read process information
+
+``GET /api/v1/components/{id}/x-medkit-procfs``
+   Aggregate process info for all apps in the component. Processes are
+   deduplicated by PID (multiple nodes in the same process appear once).
+
+   **Response 200:**
+
+   .. code-block:: json
+
+      {
+        "processes": [
+          {
+            "pid": 1234,
+            "node_ids": ["talker", "listener"],
+            "...": "same fields as app endpoint"
+          }
+        ]
+      }
+
+Systemd Unit Introspection (x-medkit-systemd)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Requires: ``systemd_introspection`` plugin and ``libsystemd``.
+
+``GET /api/v1/apps/{id}/x-medkit-systemd``
+   Get systemd unit information for the app's process.
+
+   **Response 200:**
+
+   .. code-block:: json
+
+      {
+        "unit": "ros2-talker.service",
+        "unit_type": "service",
+        "active_state": "active",
+        "sub_state": "running",
+        "restart_count": 2,
+        "watchdog_usec": 5000000
+      }
+
+   ``restart_count`` and ``watchdog_usec`` are only meaningful for service units.
+   For other unit types (timer, mount, etc.) they are always 0.
+
+   - **404:** Process not found or not managed by a systemd unit
+   - **503:** Failed to query systemd properties
+
+``GET /api/v1/components/{id}/x-medkit-systemd``
+   Aggregate systemd unit info for all apps in the component. Units are
+   deduplicated by unit name.
+
+   **Response 200:**
+
+   .. code-block:: json
+
+      {
+        "units": [
+          {
+            "unit": "ros2-talker.service",
+            "node_ids": ["talker", "listener"],
+            "...": "same fields as app endpoint"
+          }
+        ]
+      }
+
+Container Introspection (x-medkit-container)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Requires: ``container_introspection`` plugin. Only supports cgroup v2
+(Ubuntu 22.04+, Fedora 31+).
+
+``GET /api/v1/apps/{id}/x-medkit-container``
+   Get container information for the app's process.
+
+   **Response 200:**
+
+   .. code-block:: json
+
+      {
+        "container_id": "a1b2c3d4e5f6...",
+        "runtime": "docker",
+        "memory_limit_bytes": 1073741824,
+        "cpu_quota_us": 100000,
+        "cpu_period_us": 100000
+      }
+
+   Fields ``memory_limit_bytes``, ``cpu_quota_us``, and ``cpu_period_us`` are only present
+   when the container has resource limits configured.
+
+   - **404:** Process not found or not running in a container
+   - **503:** Failed to read cgroup information
+
+``GET /api/v1/components/{id}/x-medkit-container``
+   Aggregate container info for all apps in the component. Containers are
+   deduplicated by container ID.
+
+   **Response 200:**
+
+   .. code-block:: json
+
+      {
+        "containers": [
+          {
+            "container_id": "a1b2c3d4e5f6...",
+            "node_ids": ["talker", "listener"],
+            "...": "same fields as app endpoint"
+          }
+        ]
+      }
+
+x-medkit-topic-beacon
+~~~~~~~~~~~~~~~~~~~~~
+
+Provided by the ``ros2_medkit_topic_beacon`` plugin (not available when the
+plugin is not loaded). Returns beacon metadata for an entity populated from
+``MedkitDiscoveryHint`` messages published by the entity's node via a ROS 2
+topic (push-based).
+
+``GET /api/v1/apps/{id}/x-medkit-topic-beacon``
+
+``GET /api/v1/components/{id}/x-medkit-topic-beacon``
+
+**Example:**
+
+.. code-block:: bash
+
+   curl http://localhost:8080/api/v1/apps/engine_temp_sensor/x-medkit-topic-beacon
+
+**Response (200 OK):**
+
+.. code-block:: json
+
+   {
+     "entity_id": "engine_temp_sensor",
+     "status": "active",
+     "age_sec": 1.234,
+     "stable_id": "",
+     "display_name": "Engine Temperature Sensor",
+     "transport_type": "shared_memory",
+     "negotiated_format": "",
+     "process_id": 12345,
+     "process_name": "sensor_node",
+     "hostname": "robot-1",
+     "component_id": "powertrain",
+     "function_ids": ["monitoring"],
+     "depends_on": [],
+     "metadata": {"custom_key": "custom_value"}
+   }
+
+**Status values:**
+
+- ``active`` - Hint is within the configured ``beacon_ttl_sec``
+- ``stale`` - Hint is past TTL but within ``beacon_expiry_sec``
+
+**Notes:**
+
+- ``age_sec`` is the elapsed time in seconds since the last hint was received.
+- When no beacon data exists for an entity, the endpoint returns 404 with
+  error code ``x-medkit-beacon-not-found`` (not an ``"unknown"`` status).
+
+**Response Codes:**
+
+- **200 OK** - Beacon data found and returned
+- **404 Not Found** (code: ``ERR_ENTITY_NOT_FOUND``) - Entity does not exist
+- **404 Not Found** (code: ``x-medkit-beacon-not-found``) - Entity exists but no beacon data received
+
+x-medkit-param-beacon
+~~~~~~~~~~~~~~~~~~~~~
+
+Provided by the ``ros2_medkit_param_beacon`` plugin (not available when the
+plugin is not loaded). Returns beacon metadata for an entity populated by
+polling ROS 2 node parameters matching a configured prefix (pull-based).
+
+``GET /api/v1/apps/{id}/x-medkit-param-beacon``
+
+``GET /api/v1/components/{id}/x-medkit-param-beacon``
+
+**Example:**
+
+.. code-block:: bash
+
+   curl http://localhost:8080/api/v1/apps/engine_temp_sensor/x-medkit-param-beacon
+
+**Response (200 OK):**
+
+The response schema is identical to ``x-medkit-topic-beacon``. See above for
+the full field listing.
+
+**Response Codes:**
+
+- **200 OK** - Beacon data found and returned
+- **404 Not Found** (code: ``ERR_ENTITY_NOT_FOUND``) - Entity does not exist
+- **404 Not Found** (code: ``x-medkit-beacon-not-found``) - Entity exists but no beacon data received
+
 Error Responses
 ---------------
 
@@ -1067,33 +2095,161 @@ Topic and parameter paths containing ``/`` must be URL-encoded:
    * - ``/chassis/brakes/command``
      - ``chassis%2Fbrakes%2Fcommand``
 
+.. _sovd-compliance:
+
 SOVD Compliance
 ---------------
 
-The gateway implements a subset of the SOVD (Service-Oriented Vehicle Diagnostics) specification:
+The gateway implements a **pragmatic subset** of the SOVD (Service-Oriented Vehicle
+Diagnostics) standard. We follow SOVD where it matters for interoperability -
+endpoint contracts, data model, entity hierarchy - but extend it where ROS 2
+use cases benefit.
 
-**SOVD-Compliant Endpoints:**
+**SOVD-Aligned Capabilities:**
 
 - Discovery (``/areas``, ``/components``, ``/apps``, ``/functions``)
-- Data access (``/data``)
-- Operations (``/operations``, ``/executions``)
+- Data access (``/data``) with topic sampling and JSON serialization
+- Operations (``/operations``, ``/executions``) with async action support
 - Configurations (``/configurations``)
 - Faults (``/faults``) with ``environment_data`` and SOVD status object
-- Bulk Data (``/bulk-data``) for binary data downloads (rosbags, logs)
+- Logs (``/logs``) with severity filtering and per-entity configuration
+- Bulk Data (``/bulk-data``) with custom categories and rosbag downloads
 - Software Updates (``/updates``) with async prepare/execute lifecycle
-- Cyclic Subscriptions (``/cyclic-subscriptions``) with SSE-based periodic data delivery
+- Cyclic Subscriptions (``/cyclic-subscriptions``) with SSE-based delivery
+- Scripts (``/scripts``) with upload, execution, and lifecycle management
+- Triggers (``/triggers``) with condition-based push notifications
 
-**ros2_medkit Extensions:**
+**Pragmatic Extensions:**
 
-- ``/health`` - Health check endpoint
+The SOVD spec defines resource collections only for apps and components. ros2_medkit
+extends this to areas and functions where aggregation makes practical sense:
+
+.. list-table:: Resource Collection Support Matrix
+   :header-rows: 1
+   :widths: 20 16 16 16 16 16
+
+   * - Resource
+     - Areas
+     - Components
+     - Apps
+     - Functions
+     - SOVD Spec
+   * - data
+     - aggregated
+     - yes
+     - yes
+     - aggregated
+     - apps, components
+   * - operations
+     - aggregated
+     - yes
+     - yes
+     - aggregated
+     - apps, components
+   * - configurations
+     - aggregated
+     - yes
+     - yes
+     - aggregated
+     - apps, components
+   * - faults
+     - aggregated
+     - yes
+     - yes
+     - aggregated
+     - apps, components
+   * - logs
+     - prefix match
+     - prefix match
+     - exact match
+     - from hosts
+     - apps, components
+   * - bulk-data
+     - read-only
+     - full CRUD
+     - full CRUD
+     - read-only
+     - apps, components
+   * - cyclic-subscriptions
+     - \-
+     - yes
+     - yes
+     - yes
+     - apps, components
+   * - scripts
+     - \-
+     - yes
+     - yes
+     - \-
+     - apps, components
+   * - triggers
+     - yes (x-medkit)
+     - yes
+     - yes
+     - yes (x-medkit)
+     - apps, components
+
+Other extensions beyond SOVD:
+
+- Vendor extension fields using ``x-medkit`` prefix (per SOVD extension mechanism)
+- ``DELETE /faults`` - Clear all faults globally
+- ``GET /faults/stream`` - SSE real-time fault notifications
+- ``/health`` - Health check with discovery pipeline diagnostics
 - ``/version-info`` - Gateway version information
-- ``/manifest/status`` - Manifest discovery status
+- ``/docs`` - OpenAPI capability description
 - SSE fault streaming - Real-time fault notifications
 - ``x-medkit`` extension fields in responses
 
-See Also
---------
+Capability Description (OpenAPI Docs)
+--------------------------------------
 
+The gateway provides self-describing OpenAPI 3.1.0 capability descriptions at any level
+of the API hierarchy. Append ``/docs`` to any valid path to receive a context-scoped
+OpenAPI spec describing the available operations at that level.
+
+``GET /api/v1/docs``
+   Returns the full OpenAPI spec for the gateway root, including all server-level
+   endpoints, entity collections, and global resources.
+
+``GET /api/v1/{entity-collection}/docs``
+   Returns a spec scoped to the entity collection (e.g., ``/apps/docs``,
+   ``/components/docs``). Includes collection listing and detail endpoints.
+
+``GET /api/v1/{entity-type}/{entity-id}/docs``
+   Returns a spec for a specific entity, including all resource collection
+   endpoints supported by that entity (data, operations, configurations, faults,
+   logs, bulk-data, cyclic-subscriptions, triggers).
+
+``GET /api/v1/{entity-type}/{entity-id}/{resource}/docs``
+   Returns a spec for a specific resource collection, with detailed schemas
+   for each resource item.
+
+**Features:**
+
+- Specs include SOVD extensions (``x-sovd-version``, ``x-sovd-data-category``)
+- Entity-level specs reflect actual capabilities from the runtime entity cache
+- Specs are cached per entity cache generation for performance
+- Plugin-registered vendor routes appear in path-scoped specs when the requested
+  path matches a plugin route prefix (not in the root spec)
+
+**Configuration:**
+
+- ``docs.enabled`` (bool, default: ``true``) - Set to ``false`` to disable
+  the ``/docs`` endpoints. Returns 501 when disabled.
+
+**Swagger UI (optional):**
+
+When built with ``-DENABLE_SWAGGER_UI=ON``, the gateway serves an interactive
+Swagger UI at ``/api/v1/swagger-ui`` with embedded assets (no CDN dependency).
+
+**Error Responses:**
+
+- **404:** No capability description available for the requested path
+- **501:** Capability description is disabled (``docs.enabled=false``)
+
+See Also
+~~~~~~~~
+
+- :doc:`/config/discovery-options` for merge pipeline configuration
 - :doc:`/tutorials/authentication` - Configure authentication
 - :doc:`/config/server` - Server configuration options
-- `Postman Collection <https://github.com/selfpatch/ros2_medkit/tree/main/postman>`_ - Interactive API testing

@@ -15,6 +15,11 @@
 #include "ros2_medkit_gateway/discovery/discovery_manager.hpp"
 
 #include "ros2_medkit_gateway/discovery/hybrid_discovery.hpp"
+#include "ros2_medkit_gateway/discovery/layers/manifest_layer.hpp"
+#include "ros2_medkit_gateway/discovery/layers/plugin_layer.hpp"
+#include "ros2_medkit_gateway/discovery/layers/runtime_layer.hpp"
+#include "ros2_medkit_gateway/discovery/manifest/runtime_linker.hpp"
+#include "ros2_medkit_gateway/discovery/merge_pipeline.hpp"
 
 namespace ros2_medkit_gateway {
 
@@ -34,23 +39,58 @@ bool DiscoveryManager::initialize(const DiscoveryConfig & config) {
   if (config.mode == DiscoveryMode::MANIFEST_ONLY || config.mode == DiscoveryMode::HYBRID) {
     manifest_manager_ = std::make_unique<discovery::ManifestManager>(node_);
 
-    if (!config.manifest_path.empty()) {
-      if (!manifest_manager_->load_manifest(config.manifest_path, config.manifest_strict_validation)) {
-        if (config.mode == DiscoveryMode::MANIFEST_ONLY) {
-          RCLCPP_ERROR(node_->get_logger(), "Manifest load failed and mode is manifest_only. Cannot proceed.");
-          return false;
-        }
-        RCLCPP_WARN(node_->get_logger(), "Manifest load failed. Falling back to runtime-only discovery.");
+    if (config.manifest_path.empty()) {
+      if (config.mode == DiscoveryMode::HYBRID) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "No manifest_path set for hybrid mode. Falling back to runtime_only. "
+                    "This fallback is deprecated and will be removed in a future release.");
         config_.mode = DiscoveryMode::RUNTIME_ONLY;
+        create_strategy();
+        return true;
       }
-    } else if (config.mode == DiscoveryMode::MANIFEST_ONLY) {
-      RCLCPP_ERROR(node_->get_logger(), "Manifest path required for manifest_only mode.");
+      RCLCPP_ERROR(node_->get_logger(), "Manifest path required for %s mode. Set discovery.manifest_path.",
+                   discovery_mode_to_string(config.mode).c_str());
+      return false;
+    }
+
+    if (!manifest_manager_->load_manifest(config.manifest_path, config.manifest_strict_validation)) {
+      if (config.mode == DiscoveryMode::HYBRID) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Manifest load failed in hybrid mode. Falling back to runtime_only. "
+                    "This fallback is deprecated and will be removed in a future release.");
+        config_.mode = DiscoveryMode::RUNTIME_ONLY;
+        manifest_manager_.reset();
+        create_strategy();
+        return true;
+      }
+      RCLCPP_ERROR(node_->get_logger(), "Manifest load failed in %s mode. Cannot proceed.",
+                   discovery_mode_to_string(config.mode).c_str());
       return false;
     }
   }
 
   create_strategy();
   return true;
+}
+
+template <typename LayerT>
+void DiscoveryManager::apply_layer_policy_overrides(const std::string & layer_name, LayerT & layer) {
+  auto it = config_.merge_pipeline.layer_policies.find(layer_name);
+  if (it == config_.merge_pipeline.layer_policies.end()) {
+    return;
+  }
+  for (const auto & [fg_str, policy_str] : it->second) {
+    auto fg = discovery::field_group_from_string(fg_str);
+    auto policy = discovery::merge_policy_from_string(policy_str);
+    if (fg && policy) {
+      layer.set_policy(*fg, *policy);
+      RCLCPP_INFO(node_->get_logger(), "Layer '%s': override %s = %s", layer_name.c_str(), fg_str.c_str(),
+                  policy_str.c_str());
+    } else {
+      RCLCPP_WARN(node_->get_logger(), "Layer '%s': ignoring invalid override %s = %s", layer_name.c_str(),
+                  fg_str.c_str(), policy_str.c_str());
+    }
+  }
 }
 
 void DiscoveryManager::create_strategy() {
@@ -75,12 +115,45 @@ void DiscoveryManager::create_strategy() {
       RCLCPP_INFO(node_->get_logger(), "Discovery mode: manifest_only");
       break;
 
-    case DiscoveryMode::HYBRID:
-      hybrid_strategy_ =
-          std::make_unique<discovery::HybridDiscoveryStrategy>(node_, manifest_manager_.get(), runtime_strategy_.get());
+    case DiscoveryMode::HYBRID: {
+      discovery::MergePipeline pipeline(node_->get_logger());
+
+      if (config_.manifest_enabled) {
+        auto manifest_layer = std::make_unique<discovery::ManifestLayer>(manifest_manager_.get());
+        apply_layer_policy_overrides("manifest", *manifest_layer);
+        pipeline.add_layer(std::move(manifest_layer));
+      } else {
+        RCLCPP_INFO(node_->get_logger(), "Manifest layer disabled in hybrid mode");
+      }
+
+      if (config_.runtime_enabled) {
+        auto runtime_layer = std::make_unique<discovery::RuntimeLayer>(runtime_strategy_.get());
+        runtime_layer->set_gap_fill_config(config_.merge_pipeline.gap_fill);
+        apply_layer_policy_overrides("runtime", *runtime_layer);
+        pipeline.add_layer(std::move(runtime_layer));
+      } else {
+        RCLCPP_INFO(node_->get_logger(), "Runtime layer disabled in hybrid mode");
+      }
+
+      // Warn if no layers at all (plugins may still be loaded later)
+      if (!config_.manifest_enabled && !config_.runtime_enabled) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "Both manifest and runtime layers disabled in hybrid mode. "
+                    "Entity discovery relies entirely on plugins.");
+      }
+
+      // RuntimeLinker only makes sense when runtime is enabled
+      if (config_.runtime_enabled) {
+        auto manifest_config = manifest_manager_ ? manifest_manager_->get_config() : discovery::ManifestConfig{};
+        pipeline.set_linker(std::make_unique<discovery::RuntimeLinker>(node_), manifest_config);
+      }
+
+      hybrid_strategy_ = std::make_unique<discovery::HybridDiscoveryStrategy>(node_, std::move(pipeline));
       active_strategy_ = hybrid_strategy_.get();
-      RCLCPP_INFO(node_->get_logger(), "Discovery mode: hybrid");
+      RCLCPP_INFO(node_->get_logger(), "Discovery mode: hybrid (manifest=%s, runtime=%s)",
+                  config_.manifest_enabled ? "on" : "off", config_.runtime_enabled ? "on" : "off");
       break;
+    }
 
     default:
       active_strategy_ = runtime_strategy_.get();
@@ -119,10 +192,11 @@ std::vector<Function> DiscoveryManager::discover_functions() {
 }
 
 std::optional<Area> DiscoveryManager::get_area(const std::string & id) {
-  if (manifest_manager_ && manifest_manager_->is_manifest_active()) {
+  // In MANIFEST_ONLY mode, use direct manifest lookup (O(1))
+  if (config_.mode == DiscoveryMode::MANIFEST_ONLY && manifest_manager_ && manifest_manager_->is_manifest_active()) {
     return manifest_manager_->get_area(id);
   }
-  // Fallback to runtime lookup
+  // For HYBRID and RUNTIME modes, scan the strategy's output (cached for HYBRID)
   auto areas = discover_areas();
   for (const auto & a : areas) {
     if (a.id == id) {
@@ -133,7 +207,7 @@ std::optional<Area> DiscoveryManager::get_area(const std::string & id) {
 }
 
 std::optional<Component> DiscoveryManager::get_component(const std::string & id) {
-  if (manifest_manager_ && manifest_manager_->is_manifest_active()) {
+  if (config_.mode == DiscoveryMode::MANIFEST_ONLY && manifest_manager_ && manifest_manager_->is_manifest_active()) {
     return manifest_manager_->get_component(id);
   }
   auto components = discover_components();
@@ -146,10 +220,9 @@ std::optional<Component> DiscoveryManager::get_component(const std::string & id)
 }
 
 std::optional<App> DiscoveryManager::get_app(const std::string & id) {
-  if (manifest_manager_ && manifest_manager_->is_manifest_active()) {
+  if (config_.mode == DiscoveryMode::MANIFEST_ONLY && manifest_manager_ && manifest_manager_->is_manifest_active()) {
     return manifest_manager_->get_app(id);
   }
-  // Check runtime apps
   auto apps = discover_apps();
   for (const auto & app : apps) {
     if (app.id == id) {
@@ -160,34 +233,53 @@ std::optional<App> DiscoveryManager::get_app(const std::string & id) {
 }
 
 std::optional<Function> DiscoveryManager::get_function(const std::string & id) {
-  if (manifest_manager_ && manifest_manager_->is_manifest_active()) {
+  if (config_.mode == DiscoveryMode::MANIFEST_ONLY && manifest_manager_ && manifest_manager_->is_manifest_active()) {
     return manifest_manager_->get_function(id);
   }
-  return std::nullopt;  // No functions in runtime-only mode
+  auto functions = discover_functions();
+  for (const auto & f : functions) {
+    if (f.id == id) {
+      return f;
+    }
+  }
+  return std::nullopt;
 }
 
 std::vector<Area> DiscoveryManager::get_subareas(const std::string & area_id) {
-  if (manifest_manager_ && manifest_manager_->is_manifest_active()) {
+  if (config_.mode == DiscoveryMode::MANIFEST_ONLY && manifest_manager_ && manifest_manager_->is_manifest_active()) {
     return manifest_manager_->get_subareas(area_id);
   }
-  return {};  // No subareas in runtime mode
+  // HYBRID: filter from pipeline-merged output; RUNTIME: no subareas
+  std::vector<Area> result;
+  for (const auto & a : discover_areas()) {
+    if (a.parent_area_id == area_id) {
+      result.push_back(a);
+    }
+  }
+  return result;
 }
 
 std::vector<Component> DiscoveryManager::get_subcomponents(const std::string & component_id) {
-  if (manifest_manager_ && manifest_manager_->is_manifest_active()) {
+  if (config_.mode == DiscoveryMode::MANIFEST_ONLY && manifest_manager_ && manifest_manager_->is_manifest_active()) {
     return manifest_manager_->get_subcomponents(component_id);
   }
-  return {};  // No subcomponents in runtime mode
+  // HYBRID: filter from pipeline-merged output; RUNTIME: no subcomponents
+  std::vector<Component> result;
+  for (const auto & c : discover_components()) {
+    if (c.parent_component_id == component_id) {
+      result.push_back(c);
+    }
+  }
+  return result;
 }
 
 std::vector<Component> DiscoveryManager::get_components_for_area(const std::string & area_id) {
-  if (manifest_manager_ && manifest_manager_->is_manifest_active()) {
+  if (config_.mode == DiscoveryMode::MANIFEST_ONLY && manifest_manager_ && manifest_manager_->is_manifest_active()) {
     return manifest_manager_->get_components_for_area(area_id);
   }
-  // Fallback: filter runtime components by area
+  // HYBRID: filter from pipeline-merged output; RUNTIME: filter by area
   std::vector<Component> result;
-  auto all = discover_components();
-  for (const auto & c : all) {
+  for (const auto & c : discover_components()) {
     if (c.area == area_id) {
       result.push_back(c);
     }
@@ -196,13 +288,12 @@ std::vector<Component> DiscoveryManager::get_components_for_area(const std::stri
 }
 
 std::vector<App> DiscoveryManager::get_apps_for_component(const std::string & component_id) {
-  if (manifest_manager_ && manifest_manager_->is_manifest_active()) {
+  if (config_.mode == DiscoveryMode::MANIFEST_ONLY && manifest_manager_ && manifest_manager_->is_manifest_active()) {
     return manifest_manager_->get_apps_for_component(component_id);
   }
-  // Filter runtime apps by component_id
+  // HYBRID: filter from pipeline-merged output; RUNTIME: filter by component
   std::vector<App> result;
-  auto apps = discover_apps();
-  for (const auto & app : apps) {
+  for (const auto & app : discover_apps()) {
     if (app.component_id == component_id) {
       result.push_back(app);
     }
@@ -250,7 +341,7 @@ void DiscoveryManager::set_type_introspection(TypeIntrospection * introspection)
 void DiscoveryManager::refresh_topic_map() {
   runtime_strategy_->refresh_topic_map();
   if (hybrid_strategy_) {
-    hybrid_strategy_->refresh_linking();
+    hybrid_strategy_->refresh();
   }
 }
 
@@ -258,20 +349,23 @@ bool DiscoveryManager::is_topic_map_ready() const {
   return runtime_strategy_->is_topic_map_ready();
 }
 
-discovery::ManifestManager * DiscoveryManager::get_manifest_manager() {
-  return manifest_manager_.get();
+void DiscoveryManager::add_plugin_layer(const std::string & plugin_name, IntrospectionProvider * provider) {
+  if (!hybrid_strategy_) {
+    RCLCPP_WARN(node_->get_logger(), "Cannot add plugin layer '%s': not in hybrid mode", plugin_name.c_str());
+    return;
+  }
+  hybrid_strategy_->add_layer(std::make_unique<discovery::PluginLayer>(plugin_name, provider));
+  RCLCPP_INFO(node_->get_logger(), "Added plugin layer '%s' to merge pipeline", plugin_name.c_str());
 }
 
-bool DiscoveryManager::reload_manifest() {
-  if (!manifest_manager_) {
-    RCLCPP_WARN(node_->get_logger(), "No manifest manager to reload");
-    return false;
+void DiscoveryManager::refresh_pipeline() {
+  if (hybrid_strategy_) {
+    hybrid_strategy_->refresh();
   }
-  bool result = manifest_manager_->reload_manifest();
-  if (result && hybrid_strategy_) {
-    hybrid_strategy_->refresh_linking();
-  }
-  return result;
+}
+
+discovery::ManifestManager * DiscoveryManager::get_manifest_manager() {
+  return manifest_manager_.get();
 }
 
 std::string DiscoveryManager::get_strategy_name() const {
@@ -279,6 +373,20 @@ std::string DiscoveryManager::get_strategy_name() const {
     return active_strategy_->get_name();
   }
   return "unknown";
+}
+
+std::optional<discovery::MergeReport> DiscoveryManager::get_merge_report() const {
+  if (hybrid_strategy_) {
+    return hybrid_strategy_->get_merge_report();
+  }
+  return std::nullopt;
+}
+
+std::optional<discovery::LinkingResult> DiscoveryManager::get_linking_result() const {
+  if (hybrid_strategy_) {
+    return hybrid_strategy_->get_linking_result();
+  }
+  return std::nullopt;
 }
 
 }  // namespace ros2_medkit_gateway
