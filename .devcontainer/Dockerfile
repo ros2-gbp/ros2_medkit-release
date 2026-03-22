@@ -34,10 +34,12 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
     yq \
     ca-certificates \
     clang-format \
+    ccache \
     clang-tidy \
     graphviz \
     plantuml \
     lcov \
+    libsystemd-dev \
     && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 

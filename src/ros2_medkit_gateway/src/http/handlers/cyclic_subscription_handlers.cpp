@@ -14,16 +14,14 @@
 
 #include "ros2_medkit_gateway/http/handlers/cyclic_subscription_handlers.hpp"
 
-#include <chrono>
-#include <cstring>
 #include <regex>
-#include <sstream>
 
-#include "ros2_medkit_gateway/data_access_manager.hpp"
+#include <rclcpp/rclcpp.hpp>
+
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/error_codes.hpp"
 #include "ros2_medkit_gateway/http/http_utils.hpp"
-#include "ros2_medkit_gateway/native_topic_sampler.hpp"
+#include "ros2_medkit_gateway/models/entity_types.hpp"
 
 using json = nlohmann::json;
 
@@ -31,8 +29,13 @@ namespace ros2_medkit_gateway {
 namespace handlers {
 
 CyclicSubscriptionHandlers::CyclicSubscriptionHandlers(HandlerContext & ctx, SubscriptionManager & sub_mgr,
-                                                       std::shared_ptr<SSEClientTracker> client_tracker)
-  : ctx_(ctx), sub_mgr_(sub_mgr), client_tracker_(std::move(client_tracker)) {
+                                                       ResourceSamplerRegistry & sampler_registry,
+                                                       TransportRegistry & transport_registry, int max_duration_sec)
+  : ctx_(ctx)
+  , sub_mgr_(sub_mgr)
+  , sampler_registry_(sampler_registry)
+  , transport_registry_(transport_registry)
+  , max_duration_sec_(max_duration_sec) {
 }
 
 // ---------------------------------------------------------------------------
@@ -77,11 +80,14 @@ void CyclicSubscriptionHandlers::handle_create(const httplib::Request & req, htt
   std::string protocol = "sse";
   if (body.contains("protocol")) {
     protocol = body["protocol"].get<std::string>();
-    if (protocol != "sse") {
-      HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER, "Unsupported protocol. Only 'sse' is supported.",
-                                 {{"parameter", "protocol"}, {"value", protocol}});
-      return;
-    }
+  }
+
+  // Check transport is registered
+  auto * transport = transport_registry_.get_transport(protocol);
+  if (!transport) {
+    HandlerContext::send_error(res, 400, ERR_X_MEDKIT_UNSUPPORTED_PROTOCOL, "Protocol '" + protocol + "' not available",
+                               {{"parameter", "protocol"}, {"value", protocol}});
+    return;
   }
 
   // Parse interval
@@ -102,36 +108,90 @@ void CyclicSubscriptionHandlers::handle_create(const httplib::Request & req, htt
                                {{"parameter", "duration"}, {"value", duration}});
     return;
   }
+  if (duration > max_duration_sec_) {
+    HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER,
+                               "Duration must not exceed " + std::to_string(max_duration_sec_) + " seconds.",
+                               {{"parameter", "duration"}, {"max_value", max_duration_sec_}});
+    return;
+  }
 
-  // Parse resource URI to extract topic name
+  // Parse resource URI to extract collection and resource path
   std::string resource = body["resource"].get<std::string>();
-  auto topic_result = parse_resource_uri(resource);
-  if (!topic_result) {
-    HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER, "Invalid resource URI: " + topic_result.error(),
+  auto parsed = parse_resource_uri(resource);
+  if (!parsed) {
+    HandlerContext::send_error(res, 400, ERR_X_MEDKIT_INVALID_RESOURCE_URI, "Invalid resource URI: " + parsed.error(),
                                {{"parameter", "resource"}, {"value", resource}});
     return;
   }
 
   std::string entity_type = extract_entity_type(req);
 
-  // Validate resource URI references the same entity as the route
-  std::string expected_prefix = "/api/v1/" + entity_type + "/" + entity_id + "/data/";
-  if (resource.find(expected_prefix) != 0) {
-    HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER,
-                               "Resource URI must reference the same entity as the route",
-                               {{"parameter", "resource"}, {"value", resource}});
+  // Server-level resources (e.g. updates) skip entity-mismatch and collection checks
+  bool is_server_level = parsed->entity_type.empty();
+
+  if (!is_server_level) {
+    // Validate resource URI references the same entity as the route
+    if (parsed->entity_type != entity_type || parsed->entity_id != entity_id) {
+      HandlerContext::send_error(res, 400, ERR_X_MEDKIT_ENTITY_MISMATCH,
+                                 "Resource URI must reference the same entity as the route",
+                                 {{"parameter", "resource"}, {"value", resource}});
+      return;
+    }
+
+    // Validate collection support
+    auto known_collection = parse_resource_collection(parsed->collection);
+    if (known_collection.has_value()) {
+      // Known SOVD collection - check entity supports it
+      if (!entity->supports_collection(*known_collection)) {
+        HandlerContext::send_error(res, 400, ERR_X_MEDKIT_COLLECTION_NOT_SUPPORTED,
+                                   "Collection '" + parsed->collection + "' not supported for " + entity_type,
+                                   {{"collection", parsed->collection}, {"entity_type", entity_type}});
+        return;
+      }
+    } else if (parsed->collection.size() < 2 || parsed->collection.substr(0, 2) != "x-") {
+      // Not a known collection and not a vendor extension
+      HandlerContext::send_error(res, 400, ERR_X_MEDKIT_INVALID_RESOURCE_URI,
+                                 "Unknown collection '" + parsed->collection +
+                                     "'. Use a known SOVD collection or 'x-' vendor extension.",
+                                 {{"collection", parsed->collection}});
+      return;
+    }
+
+    // Data collection requires a resource path (topic name)
+    if (parsed->collection == "data" && parsed->resource_path.empty()) {
+      HandlerContext::send_error(res, 400, ERR_X_MEDKIT_INVALID_RESOURCE_URI,
+                                 "Data collection requires a resource path (e.g. /api/v1/apps/{id}/data/{topic})",
+                                 {{"parameter", "resource"}, {"value", resource}});
+      return;
+    }
+  }
+
+  // Check sampler is registered
+  if (!sampler_registry_.has_sampler(parsed->collection)) {
+    HandlerContext::send_error(res, 400, ERR_X_MEDKIT_COLLECTION_NOT_AVAILABLE,
+                               "No data provider for collection '" + parsed->collection + "'",
+                               {{"collection", parsed->collection}});
     return;
   }
 
   // Create subscription
-  auto result = sub_mgr_.create(entity_id, entity_type, resource, *topic_result, protocol, interval, duration);
+  auto result = sub_mgr_.create(entity_id, entity_type, resource, parsed->collection, parsed->resource_path, protocol,
+                                interval, duration);
   if (!result) {
     HandlerContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, result.error());
     return;
   }
 
-  std::string event_source = build_event_source(*result);
-  auto response_json = subscription_to_json(*result, event_source);
+  // Start transport delivery
+  auto sampler = sampler_registry_.get_sampler(parsed->collection);
+  auto event_source_result = transport->start(*result, *sampler, ctx_.node());
+  if (!event_source_result) {
+    sub_mgr_.remove(result->id);
+    HandlerContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, event_source_result.error());
+    return;
+  }
+
+  auto response_json = subscription_to_json(*result, *event_source_result);
 
   res.status = 201;
   HandlerContext::send_json(res, response_json);
@@ -222,6 +282,12 @@ void CyclicSubscriptionHandlers::handle_update(const httplib::Request & req, htt
                                  {{"parameter", "duration"}, {"value", *new_duration}});
       return;
     }
+    if (*new_duration > max_duration_sec_) {
+      HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER,
+                                 "Duration must not exceed " + std::to_string(max_duration_sec_) + " seconds.",
+                                 {{"parameter", "duration"}, {"max_value", max_duration_sec_}});
+      return;
+    }
   }
 
   // Verify subscription exists and belongs to this entity before updating
@@ -272,7 +338,7 @@ void CyclicSubscriptionHandlers::handle_delete(const httplib::Request & req, htt
 }
 
 // ---------------------------------------------------------------------------
-// GET /events — SSE stream
+// GET /events — SSE stream (delegates to transport provider)
 // ---------------------------------------------------------------------------
 void CyclicSubscriptionHandlers::handle_events(const httplib::Request & req, httplib::Response & res) {
   auto entity_id = req.matches[1].str();
@@ -289,121 +355,30 @@ void CyclicSubscriptionHandlers::handle_events(const httplib::Request & req, htt
     return;
   }
 
-  // Verify subscription belongs to this entity
   if (sub->entity_id != entity_id) {
     HandlerContext::send_error(res, 404, ERR_RESOURCE_NOT_FOUND, "Subscription not found",
                                {{"subscription_id", sub_id}});
     return;
   }
 
-  // Reject SSE connections for expired or inactive subscriptions
   if (!sub_mgr_.is_active(sub_id)) {
     HandlerContext::send_error(res, 404, ERR_RESOURCE_NOT_FOUND, "Subscription expired or inactive",
                                {{"subscription_id", sub_id}});
     return;
   }
 
-  // Check combined SSE client limit (shared with fault streams)
-  if (!client_tracker_->try_connect()) {
-    RCLCPP_WARN(HandlerContext::logger(),
-                "SSE client limit reached (%zu), rejecting cyclic subscription stream from %s",
-                client_tracker_->max_clients(), req.remote_addr.c_str());
-    HandlerContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE,
-                               "Maximum number of SSE clients reached. Please try again later.");
+  auto * transport = transport_registry_.get_transport(sub->protocol);
+  if (!transport) {
+    HandlerContext::send_error(res, 400, ERR_X_MEDKIT_UNSUPPORTED_PROTOCOL,
+                               "Transport for protocol '" + sub->protocol + "' not available",
+                               {{"protocol", sub->protocol}});
     return;
   }
 
-  RCLCPP_INFO(HandlerContext::logger(), "SSE cyclic subscription client connected from %s (%zu/%zu)",
-              req.remote_addr.c_str(), client_tracker_->connected_clients(), client_tracker_->max_clients());
-
-  // Set SSE headers (Content-Type set by set_chunked_content_provider below)
-  res.set_header("Cache-Control", "no-cache");
-  res.set_header("Connection", "keep-alive");
-  res.set_header("X-Accel-Buffering", "no");
-
-  auto captured_sub_id = sub->id;
-  auto captured_topic = sub->topic_name;
-
-  res.set_chunked_content_provider(
-      "text/event-stream",
-      [this, captured_sub_id, captured_topic](size_t /*offset*/, httplib::DataSink & sink) {
-        auto keepalive_timeout = std::chrono::seconds(kKeepaliveIntervalSec);
-        auto last_write = std::chrono::steady_clock::now();
-
-        while (true) {
-          // Check if subscription is still active
-          if (!sub_mgr_.is_active(captured_sub_id)) {
-            return false;  // Subscription expired or removed
-          }
-
-          // Send keepalive if no data was written recently (e.g. after a slow sample_topic)
-          auto since_last_write = std::chrono::steady_clock::now() - last_write;
-          if (since_last_write >= keepalive_timeout) {
-            const char * keepalive = ":keepalive\n\n";
-            if (!sink.write(keepalive, std::strlen(keepalive))) {
-              return false;  // Client disconnected
-            }
-            last_write = std::chrono::steady_clock::now();
-          }
-
-          // Get current interval from subscription (may have been updated)
-          auto current_sub = sub_mgr_.get(captured_sub_id);
-          if (!current_sub) {
-            return false;  // Removed
-          }
-
-          auto sample_interval = interval_to_duration(current_sub->interval);
-
-          // Sample the topic
-          auto * data_access_mgr = ctx_.node()->get_data_access_manager();
-          auto * native_sampler = data_access_mgr->get_native_sampler();
-          auto sample = native_sampler->sample_topic(captured_topic, data_access_mgr->get_topic_sample_timeout());
-
-          // Build EventEnvelope
-          json envelope;
-
-          // UTC timestamp in ISO 8601 format
-          auto now = std::chrono::system_clock::now();
-          auto time_t = std::chrono::system_clock::to_time_t(now);
-          auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
-          std::ostringstream ts;
-          struct tm tm_buf;
-          gmtime_r(&time_t, &tm_buf);
-          ts << std::put_time(&tm_buf, "%Y-%m-%dT%H:%M:%S");
-          ts << "." << std::setw(3) << std::setfill('0') << ms << "Z";
-          envelope["timestamp"] = ts.str();
-
-          if (sample.has_data && sample.data.has_value()) {
-            json payload;
-            payload["id"] = captured_topic;
-            payload["data"] = *sample.data;
-            envelope["payload"] = payload;
-          } else {
-            // No data available — send error event
-            json error;
-            error["error_code"] = ERR_X_MEDKIT_ROS2_TOPIC_UNAVAILABLE;
-            error["message"] = "Topic data not available: " + captured_topic;
-            envelope["error"] = error;
-          }
-
-          // Format SSE data frame
-          std::string sse_msg = "data: " + envelope.dump() + "\n\n";
-          if (!sink.write(sse_msg.data(), sse_msg.size())) {
-            return false;  // Client disconnected
-          }
-          last_write = std::chrono::steady_clock::now();
-
-          // Wait for interval or notification (update/delete/shutdown)
-          sub_mgr_.wait_for_update(captured_sub_id, sample_interval);
-        }
-
-        return true;
-      },
-      [this, captured_sub_id](bool /*success*/) {
-        client_tracker_->disconnect();
-        RCLCPP_DEBUG(rclcpp::get_logger("rest_server"), "SSE cyclic subscription stream disconnected: %s",
-                     captured_sub_id.c_str());
-      });
+  if (!transport->handle_client_connect(sub_id, req, res)) {
+    HandlerContext::send_error(res, 404, ERR_RESOURCE_NOT_FOUND, "Subscription stream not found",
+                               {{"subscription_id", sub_id}});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -426,25 +401,63 @@ std::string CyclicSubscriptionHandlers::build_event_source(const CyclicSubscript
 }
 
 std::string CyclicSubscriptionHandlers::extract_entity_type(const httplib::Request & req) {
-  // Path is like /api/v1/apps/{id}/cyclic-subscriptions or /api/v1/components/{id}/cyclic-subscriptions
-  if (req.path.find("/apps/") != std::string::npos) {
-    return "apps";
+  auto type = extract_entity_type_from_path(req.path);
+  switch (type) {
+    case SovdEntityType::APP:
+      return "apps";
+    case SovdEntityType::COMPONENT:
+      return "components";
+    case SovdEntityType::FUNCTION:
+      return "functions";
+    default:
+      RCLCPP_WARN(HandlerContext::logger(), "Unexpected entity type in cyclic subscription path: %s", req.path.c_str());
+      return "apps";
   }
-  if (req.path.find("/components/") != std::string::npos) {
-    return "components";
-  }
-  return "apps";  // Default fallback
 }
 
-tl::expected<std::string, std::string> CyclicSubscriptionHandlers::parse_resource_uri(const std::string & resource) {
-  // Expected format: /api/v1/{entity_type}/{entity_id}/data/{topic_path}
-  // We need to extract the topic path (everything after /data/)
-  static const std::regex resource_regex(R"(^/api/v1/(?:apps|components)/[^/]+/data(/.*))");
+tl::expected<ParsedResourceUri, std::string>
+CyclicSubscriptionHandlers::parse_resource_uri(const std::string & resource) {
+  // Try entity-scoped format first: /api/v1/{entity_type}/{entity_id}/{collection}[/{resource_path}]
+  static const std::regex entity_regex(R"(^/api/v1/(apps|components|functions)/([^/]+)/([^/]+)(/.*)?$)");
   std::smatch match;
-  if (!std::regex_match(resource, match, resource_regex)) {
-    return tl::make_unexpected("Resource URI must match /api/v1/{apps|components}/{id}/data/{topic}");
+  if (std::regex_match(resource, match, entity_regex)) {
+    ParsedResourceUri parsed;
+    parsed.entity_type = match[1].str();
+    parsed.entity_id = match[2].str();
+    parsed.collection = match[3].str();
+    parsed.resource_path = match[4].matched ? match[4].str() : "";
+
+    // Security: reject '..' as a path segment (not as substring of e.g. '/..foo')
+    if (!parsed.resource_path.empty()) {
+      std::string path = parsed.resource_path;
+      size_t pos = 0;
+      while (pos < path.size()) {
+        size_t next = path.find('/', pos + 1);
+        std::string segment = (next == std::string::npos) ? path.substr(pos) : path.substr(pos, next - pos);
+        if (segment == "/.." || segment == "..") {
+          return tl::make_unexpected("Resource path must not contain '..' as a path segment");
+        }
+        pos = (next == std::string::npos) ? path.size() : next;
+      }
+    }
+
+    return parsed;
   }
-  return match[1].str();
+
+  // Try server-level update status: /api/v1/updates/{update-package-id}/status
+  static const std::regex update_status_regex(R"(^/api/v1/updates/([^/]+)/status$)");
+  if (std::regex_match(resource, match, update_status_regex)) {
+    ParsedResourceUri parsed;
+    parsed.entity_type = "";  // server-level, no entity
+    parsed.entity_id = "";
+    parsed.collection = "updates";
+    parsed.resource_path = match[1].str();  // update package ID
+    return parsed;
+  }
+
+  return tl::make_unexpected(
+      "Resource URI must match /api/v1/{apps|components|functions}/{id}/{collection}[/{path}] "
+      "or /api/v1/updates/{id}/status");
 }
 
 }  // namespace handlers

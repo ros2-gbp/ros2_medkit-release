@@ -53,9 +53,9 @@ def generate_test_description():
     )
 
     gateway = create_gateway_node(extra_params={
-        'discovery_mode': 'manifest_only',
-        'manifest_path': manifest_path,
-        'manifest_strict_validation': False,
+        'discovery.mode': 'manifest_only',
+        'discovery.manifest_path': manifest_path,
+        'discovery.manifest_strict_validation': False,
     })
 
     # Launch a subset of demo nodes to verify apps become online
@@ -362,10 +362,91 @@ class TestScenarioDiscoveryManifest(GatewayTestCase):
         self.assertIn('items', data)
 
     # =========================================================================
+    # Regression: no synthetic/topic components leak into manifest_only mode
+    # =========================================================================
+
+    def test_25_no_topic_components_in_manifest_only(self):
+        """Components list contains only manifest-defined IDs.
+
+        Regression test: in manifest_only mode, runtime-discovered
+        topic-based components must not appear in the entity cache.
+        All component IDs must come from the manifest.
+        """
+        manifest_component_ids = {
+            'engine-ecu', 'temp-sensor-hw', 'rpm-sensor-hw',
+            'brake-ecu', 'brake-pressure-sensor-hw', 'brake-actuator-hw',
+            'door-sensor-hw', 'light-module', 'lidar-unit',
+        }
+        data = self.get_json('/components')
+        actual_ids = {c['id'] for c in data['items']}
+        extra = actual_ids - manifest_component_ids
+        self.assertEqual(
+            extra, set(),
+            f'Non-manifest components found in manifest_only mode: {extra}'
+        )
+
+    # =========================================================================
+    # Function + Area logs (ros2_medkit extension)
+    # =========================================================================
+
+    def test_26_function_logs_returns_200(self):
+        """GET /functions/{id}/logs returns 200 with items array.
+
+        Function logs aggregate from all hosted apps. engine-monitoring
+        is hosted by engine-temp-sensor and engine-rpm-sensor.
+        """
+        data = self.get_json('/functions/engine-monitoring/logs')
+        self.assertIn('items', data)
+        self.assertIsInstance(data['items'], list)
+
+    def test_27_function_logs_has_entries_from_hosts(self):
+        """GET /functions/{id}/logs returns entries from hosted apps.
+
+        Poll until log entries appear from at least one hosted app.
+        """
+        data = self.poll_endpoint_until(
+            '/functions/engine-monitoring/logs',
+            condition=lambda d: d if d.get('items') else None,
+            timeout=30.0,
+        )
+        self.assertGreater(
+            len(data['items']), 0,
+            'Expected log entries aggregated from hosted apps'
+        )
+
+    def test_28_function_logs_configuration_returns_200(self):
+        """GET /functions/{id}/logs/configuration returns default config."""
+        data = self.get_json('/functions/engine-monitoring/logs/configuration')
+        self.assertIn('severity_filter', data)
+        self.assertIn('max_entries', data)
+
+    def test_29_area_logs_returns_200(self):
+        """GET /areas/{id}/logs returns 200 with items array.
+
+        Area logs use namespace prefix matching. powertrain area should
+        capture logs from nodes in /powertrain/* namespace tree.
+        """
+        data = self.get_json('/areas/powertrain/logs')
+        self.assertIn('items', data)
+        self.assertIsInstance(data['items'], list)
+
+    def test_30_area_logs_has_entries(self):
+        """GET /areas/{id}/logs returns entries from nodes in area namespace."""
+        data = self.poll_endpoint_until(
+            '/areas/powertrain/logs',
+            condition=lambda d: d if d.get('items') else None,
+            timeout=15.0,
+        )
+        self.assertGreater(
+            len(data['items']), 0,
+            'Expected log entries from nodes in powertrain namespace'
+        )
+
+    # =========================================================================
     # Error Cases
     # =========================================================================
 
-    def test_26_invalid_area_id(self):
+    def test_31_invalid_area_id(self):
         """GET /areas/{id} with invalid ID format returns 400.
 
         Entity IDs only allow alphanumeric, underscore, and hyphen characters.
@@ -376,7 +457,7 @@ class TestScenarioDiscoveryManifest(GatewayTestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    def test_27_invalid_component_id(self):
+    def test_32_invalid_component_id(self):
         """GET /components/{id} with path traversal returns 404."""
         response = requests.get(
             f'{self.BASE_URL}/components/../etc/passwd', timeout=5

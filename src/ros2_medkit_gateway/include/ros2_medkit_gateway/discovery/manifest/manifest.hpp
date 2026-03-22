@@ -18,6 +18,7 @@
 #include "ros2_medkit_gateway/discovery/models/area.hpp"
 #include "ros2_medkit_gateway/discovery/models/component.hpp"
 #include "ros2_medkit_gateway/discovery/models/function.hpp"
+#include "ros2_medkit_gateway/script_types.hpp"
 
 #include <nlohmann/json.hpp>
 #include <string>
@@ -69,6 +70,15 @@ struct ManifestMetadata {
  * Represents a parsed manifest YAML file containing entity definitions
  * and discovery configuration.
  */
+/**
+ * @brief Per-entity lock configuration from manifest
+ */
+struct ManifestLockConfig {
+  std::vector<std::string> required_scopes;  ///< Scopes that must be locked (empty = no requirement)
+  bool breakable = true;                     ///< Whether locks on this entity can be broken
+  int max_expiration = 0;                    ///< Max expiration seconds (0 = use global default)
+};
+
 struct Manifest {
   std::string manifest_version;  ///< Must be "1.0"
   ManifestMetadata metadata;
@@ -79,8 +89,14 @@ struct Manifest {
   std::vector<App> apps;
   std::vector<Function> functions;
 
+  /// Script entries loaded from manifest
+  std::vector<ros2_medkit_gateway::ScriptEntryConfig> scripts;
+
   /// Custom capabilities overrides per entity
   std::unordered_map<std::string, json> capabilities;
+
+  /// Per-entity lock configuration overrides (entity_id -> lock config)
+  std::unordered_map<std::string, ManifestLockConfig> lock_overrides;
 
   /// Check if manifest has been loaded
   bool is_loaded() const {
