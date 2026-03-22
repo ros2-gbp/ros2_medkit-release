@@ -149,10 +149,13 @@ void DiscoveryHandlers::handle_get_area(const httplib::Request & req, httplib::R
     response["operations"] = base_uri + "/operations";
     response["configurations"] = base_uri + "/configurations";
     response["faults"] = base_uri + "/faults";
+    response["logs"] = base_uri + "/logs";
+    response["bulk-data"] = base_uri + "/bulk-data";
+    response["triggers"] = base_uri + "/triggers";
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::SUBAREAS,   Cap::CONTAINS,       Cap::DATA,
-                             Cap::OPERATIONS, Cap::CONFIGURATIONS, Cap::FAULTS};
+    std::vector<Cap> caps = {Cap::SUBAREAS, Cap::CONTAINS, Cap::DATA,      Cap::OPERATIONS, Cap::CONFIGURATIONS,
+                             Cap::FAULTS,   Cap::LOGS,     Cap::BULK_DATA, Cap::TRIGGERS};
     response["capabilities"] = CapabilityBuilder::build_capabilities("areas", area.id, caps);
     append_plugin_capabilities(response["capabilities"], "areas", area.id, SovdEntityType::AREA, ctx_.node());
 
@@ -457,6 +460,14 @@ void DiscoveryHandlers::handle_get_component(const httplib::Request & req, httpl
     response["faults"] = base + "/faults";
     response["subcomponents"] = base + "/subcomponents";
     response["hosts"] = base + "/hosts";
+    response["logs"] = base + "/logs";
+    response["bulk-data"] = base + "/bulk-data";
+    response["cyclic-subscriptions"] = base + "/cyclic-subscriptions";
+    response["triggers"] = base + "/triggers";
+
+    if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
+      response["scripts"] = base + "/scripts";
+    }
 
     if (!comp.depends_on.empty()) {
       response["depends-on"] = base + "/depends-on";
@@ -489,13 +500,23 @@ void DiscoveryHandlers::handle_get_component(const httplib::Request & req, httpl
     }
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::DATA,   Cap::OPERATIONS,    Cap::CONFIGURATIONS,
-                             Cap::FAULTS, Cap::SUBCOMPONENTS, Cap::HOSTS};
+    std::vector<Cap> caps = {
+        Cap::DATA,  Cap::OPERATIONS, Cap::CONFIGURATIONS,       Cap::FAULTS,  Cap::LOGS, Cap::SUBCOMPONENTS,
+        Cap::HOSTS, Cap::BULK_DATA,  Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+    if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
+      caps.push_back(Cap::SCRIPTS);
+    }
+    if (ctx_.node() && ctx_.node()->get_lock_manager()) {
+      caps.push_back(Cap::LOCKS);
+    }
     if (!comp.depends_on.empty()) {
       caps.push_back(Cap::DEPENDS_ON);
     }
     auto comp_caps = CapabilityBuilder::build_capabilities("components", comp.id, caps);
     append_plugin_capabilities(comp_caps, "components", comp.id, SovdEntityType::COMPONENT, ctx_.node());
+    // Capabilities at root level (SOVD standard) and in x-medkit (vendor extension for tools
+    // that only read x-medkit). Apps don't duplicate because they have no vendor extensions block.
+    response["capabilities"] = comp_caps;
     ext.add("capabilities", comp_caps);
     response["x-medkit"] = ext.build();
 
@@ -802,6 +823,14 @@ void DiscoveryHandlers::handle_get_app(const httplib::Request & req, httplib::Re
     response["operations"] = base_uri + "/operations";
     response["configurations"] = base_uri + "/configurations";
     response["faults"] = base_uri + "/faults";
+    response["logs"] = base_uri + "/logs";
+    response["bulk-data"] = base_uri + "/bulk-data";
+    response["cyclic-subscriptions"] = base_uri + "/cyclic-subscriptions";
+    response["triggers"] = base_uri + "/triggers";
+
+    if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
+      response["scripts"] = base_uri + "/scripts";
+    }
 
     if (!app.component_id.empty()) {
       response["is-located-on"] = "/api/v1/components/" + app.component_id;
@@ -812,7 +841,14 @@ void DiscoveryHandlers::handle_get_app(const httplib::Request & req, httplib::Re
     }
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::DATA, Cap::OPERATIONS, Cap::CONFIGURATIONS, Cap::FAULTS};
+    std::vector<Cap> caps = {Cap::DATA, Cap::OPERATIONS, Cap::CONFIGURATIONS,       Cap::FAULTS,
+                             Cap::LOGS, Cap::BULK_DATA,  Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+    if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
+      caps.push_back(Cap::SCRIPTS);
+    }
+    if (ctx_.node() && ctx_.node()->get_lock_manager()) {
+      caps.push_back(Cap::LOCKS);
+    }
     response["capabilities"] = CapabilityBuilder::build_capabilities("apps", app.id, caps);
     append_plugin_capabilities(response["capabilities"], "apps", app.id, SovdEntityType::APP, ctx_.node());
 
@@ -918,6 +954,83 @@ void DiscoveryHandlers::handle_app_depends_on(const httplib::Request & req, http
   }
 }
 
+void DiscoveryHandlers::handle_app_is_located_on(const httplib::Request & req, httplib::Response & res) {
+  try {
+    if (req.matches.size() < 2) {
+      HandlerContext::send_error(res, 400, ERR_INVALID_REQUEST, "Invalid request");
+      return;
+    }
+
+    std::string app_id = req.matches[1];
+
+    auto validation_result = ctx_.validate_entity_id(app_id);
+    if (!validation_result) {
+      HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER, "Invalid app ID",
+                                 {{"details", validation_result.error()}, {"app_id", app_id}});
+      return;
+    }
+
+    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    auto discovery = ctx_.node()->get_discovery_manager();
+    auto app_opt = cache.get_app(app_id);
+    if (!app_opt) {
+      app_opt = discovery->get_app(app_id);
+    }
+
+    if (!app_opt) {
+      HandlerContext::send_error(res, 404, ERR_ENTITY_NOT_FOUND, "App not found", {{"app_id", app_id}});
+      return;
+    }
+
+    json items = json::array();
+    const auto & app = *app_opt;
+
+    if (!app.component_id.empty()) {
+      auto component_opt = cache.get_component(app.component_id);
+      if (!component_opt) {
+        component_opt = discovery->get_component(app.component_id);
+      }
+      if (component_opt) {
+        json item;
+        item["id"] = component_opt->id;
+        item["name"] = component_opt->name.empty() ? component_opt->id : component_opt->name;
+        item["href"] = "/api/v1/components/" + component_opt->id;
+        items.push_back(item);
+      } else {
+        json item;
+        item["id"] = app.component_id;
+        item["name"] = app.component_id;
+        item["href"] = "/api/v1/components/" + app.component_id;
+
+        XMedkit ext;
+        ext.add("missing", true);
+        item["x-medkit"] = ext.build();
+        items.push_back(item);
+
+        RCLCPP_WARN(HandlerContext::logger(), "App '%s' references unknown component '%s'", app_id.c_str(),
+                    app.component_id.c_str());
+      }
+    }
+
+    json response;
+    response["items"] = items;
+
+    XMedkit resp_ext;
+    resp_ext.add("total_count", items.size());
+    response["x-medkit"] = resp_ext.build();
+
+    json links;
+    links["self"] = "/api/v1/apps/" + app_id + "/is-located-on";
+    links["app"] = "/api/v1/apps/" + app_id;
+    response["_links"] = links;
+
+    HandlerContext::send_json(res, response);
+  } catch (const std::exception & e) {
+    HandlerContext::send_error(res, 500, ERR_INTERNAL_ERROR, "Internal server error", {{"details", e.what()}});
+    RCLCPP_ERROR(HandlerContext::logger(), "Error in handle_app_is_located_on: %s", e.what());
+  }
+}
+
 // =============================================================================
 // Function handlers
 // =============================================================================
@@ -981,8 +1094,12 @@ void DiscoveryHandlers::handle_get_function(const httplib::Request & req, httpli
       return;
     }
 
-    auto discovery = ctx_.node()->get_discovery_manager();
-    auto func_opt = discovery->get_function(function_id);
+    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    auto func_opt = cache.get_function(function_id);
+    if (!func_opt) {
+      auto discovery = ctx_.node()->get_discovery_manager();
+      func_opt = discovery->get_function(function_id);
+    }
 
     if (!func_opt) {
       HandlerContext::send_error(res, 404, ERR_ENTITY_NOT_FOUND, "Function not found", {{"function_id", function_id}});
@@ -1011,9 +1128,15 @@ void DiscoveryHandlers::handle_get_function(const httplib::Request & req, httpli
     response["operations"] = base_uri + "/operations";
     response["configurations"] = base_uri + "/configurations";
     response["faults"] = base_uri + "/faults";
+    response["logs"] = base_uri + "/logs";
+    response["bulk-data"] = base_uri + "/bulk-data";
+    response["x-medkit-graph"] = base_uri + "/x-medkit-graph";
+    response["cyclic-subscriptions"] = base_uri + "/cyclic-subscriptions";
+    response["triggers"] = base_uri + "/triggers";
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::HOSTS, Cap::DATA, Cap::OPERATIONS, Cap::CONFIGURATIONS, Cap::FAULTS};
+    std::vector<Cap> caps = {Cap::HOSTS, Cap::DATA,      Cap::OPERATIONS,           Cap::CONFIGURATIONS, Cap::FAULTS,
+                             Cap::LOGS,  Cap::BULK_DATA, Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
     response["capabilities"] = CapabilityBuilder::build_capabilities("functions", func.id, caps);
     append_plugin_capabilities(response["capabilities"], "functions", func.id, SovdEntityType::FUNCTION, ctx_.node());
 

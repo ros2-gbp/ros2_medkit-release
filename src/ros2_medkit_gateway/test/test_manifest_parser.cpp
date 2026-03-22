@@ -266,6 +266,216 @@ functions:
 }
 
 // =============================================================================
+// Script Parsing Tests
+// =============================================================================
+
+// @verifies REQ_INTEROP_041
+TEST_F(ManifestParserTest, ParseScripts) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+scripts:
+  - id: "run-diagnostics"
+    name: "Run Diagnostics"
+    description: "Check health of all sensors"
+    path: "/opt/scripts/run-diagnostics.sh"
+    format: "bash"
+    timeout_sec: 30
+    entity_filter:
+      - "components/*"
+      - "apps/*"
+    env:
+      GATEWAY_URL: "http://localhost:8080"
+      LOG_LEVEL: "debug"
+  - id: "inject-nan"
+    name: "Inject NaN Fault"
+    path: "/opt/scripts/inject-nan.sh"
+    format: "bash"
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  ASSERT_EQ(manifest.scripts.size(), 2);
+
+  const auto & s1 = manifest.scripts[0];
+  EXPECT_EQ(s1.id, "run-diagnostics");
+  EXPECT_EQ(s1.name, "Run Diagnostics");
+  EXPECT_EQ(s1.description, "Check health of all sensors");
+  EXPECT_EQ(s1.path, "/opt/scripts/run-diagnostics.sh");
+  EXPECT_EQ(s1.format, "bash");
+  EXPECT_EQ(s1.timeout_sec, 30);
+  ASSERT_EQ(s1.entity_filter.size(), 2);
+  EXPECT_EQ(s1.entity_filter[0], "components/*");
+  EXPECT_EQ(s1.entity_filter[1], "apps/*");
+  ASSERT_EQ(s1.env.size(), 2);
+  EXPECT_EQ(s1.env.at("GATEWAY_URL"), "http://localhost:8080");
+  EXPECT_EQ(s1.env.at("LOG_LEVEL"), "debug");
+
+  const auto & s2 = manifest.scripts[1];
+  EXPECT_EQ(s2.id, "inject-nan");
+  EXPECT_EQ(s2.name, "Inject NaN Fault");
+  EXPECT_EQ(s2.path, "/opt/scripts/inject-nan.sh");
+  EXPECT_EQ(s2.format, "bash");
+  EXPECT_EQ(s2.timeout_sec, 300);  // default
+  EXPECT_TRUE(s2.entity_filter.empty());
+  EXPECT_TRUE(s2.env.empty());
+}
+
+TEST_F(ManifestParserTest, ParseScriptsWithArgs) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+scripts:
+  - id: "calibrate"
+    path: "/opt/scripts/calibrate.py"
+    format: "python"
+    args:
+      - name: "threshold"
+        type: "float"
+        flag: "--threshold"
+      - name: "verbose"
+        type: "bool"
+        flag: "-v"
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  ASSERT_EQ(manifest.scripts.size(), 1);
+  const auto & s = manifest.scripts[0];
+  EXPECT_EQ(s.name, "calibrate");  // defaults to id
+  ASSERT_TRUE(s.args.is_array());
+  ASSERT_EQ(s.args.size(), 2);
+  EXPECT_EQ(s.args[0]["name"], "threshold");
+  EXPECT_EQ(s.args[0]["type"], "float");
+  EXPECT_EQ(s.args[0]["flag"], "--threshold");
+  EXPECT_EQ(s.args[1]["name"], "verbose");
+}
+
+TEST_F(ManifestParserTest, ParseScriptsWithParametersSchema) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+scripts:
+  - id: "test-script"
+    path: "/opt/scripts/test.sh"
+    format: "bash"
+    parameters_schema:
+      type: "object"
+      required: "threshold"
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  ASSERT_EQ(manifest.scripts.size(), 1);
+  ASSERT_TRUE(manifest.scripts[0].parameters_schema.has_value());
+  EXPECT_EQ(manifest.scripts[0].parameters_schema->at("type"), "object");
+}
+
+TEST_F(ManifestParserTest, ParseScriptsParametersSchemaPreservesNestedObjects) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+scripts:
+  - id: "nested-schema"
+    path: "/opt/scripts/test.sh"
+    format: "bash"
+    parameters_schema:
+      type: "object"
+      properties:
+        threshold:
+          type: "number"
+      required:
+        - threshold
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  ASSERT_EQ(manifest.scripts.size(), 1);
+  ASSERT_TRUE(manifest.scripts[0].parameters_schema.has_value());
+  const auto & schema = *manifest.scripts[0].parameters_schema;
+  EXPECT_EQ(schema.at("type"), "object");
+  // Nested objects are preserved via recursive YAML-to-JSON conversion
+  ASSERT_TRUE(schema.contains("properties"));
+  EXPECT_EQ(schema["properties"]["threshold"]["type"], "number");
+  // Arrays are preserved
+  ASSERT_TRUE(schema.contains("required"));
+  ASSERT_TRUE(schema["required"].is_array());
+  EXPECT_EQ(schema["required"][0], "threshold");
+}
+
+// @verifies REQ_INTEROP_041
+TEST_F(ManifestParserTest, ParseScriptsMissingId) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+scripts:
+  - name: "No ID Script"
+    path: "/opt/scripts/test.sh"
+)";
+
+  EXPECT_THROW(parser_.parse_string(yaml), std::runtime_error);
+}
+
+// @verifies REQ_INTEROP_041
+TEST_F(ManifestParserTest, ParseScriptsMissingPath) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+scripts:
+  - id: "no-path"
+    format: "bash"
+)";
+
+  EXPECT_THROW(parser_.parse_string(yaml), std::runtime_error);
+}
+
+// @verifies REQ_INTEROP_041
+TEST_F(ManifestParserTest, ParseScriptsMissingFormat) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+scripts:
+  - id: "no-format"
+    path: "/opt/scripts/test.sh"
+)";
+
+  EXPECT_THROW(parser_.parse_string(yaml), std::runtime_error);
+}
+
+// @verifies REQ_INTEROP_041
+TEST_F(ManifestParserTest, ParseScriptsTimeoutClampedToMinimum) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+scripts:
+  - id: "clamped"
+    path: "/opt/scripts/test.sh"
+    format: "bash"
+    timeout_sec: 0
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+
+  ASSERT_EQ(manifest.scripts.size(), 1);
+  EXPECT_EQ(manifest.scripts[0].timeout_sec, 1);  // clamped from 0
+}
+
+TEST_F(ManifestParserTest, ParseScriptsUnknownFormat) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+scripts:
+  - id: "bad-format"
+    path: "/opt/scripts/test.sh"
+    format: "ruby"
+)";
+
+  EXPECT_THROW(parser_.parse_string(yaml), std::runtime_error);
+}
+
+TEST_F(ManifestParserTest, ParseNoScriptsSection) {
+  const std::string yaml = R"(
+manifest_version: "1.0"
+areas:
+  - id: "test-area"
+)";
+
+  auto manifest = parser_.parse_string(yaml);
+  EXPECT_TRUE(manifest.scripts.empty());
+}
+
+// =============================================================================
 // Error Cases Tests
 // =============================================================================
 

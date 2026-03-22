@@ -16,8 +16,11 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
+
+#include "ros2_medkit_serialization/json_serializer.hpp"
 
 namespace ros2_medkit_gateway {
 namespace discovery {
@@ -69,14 +72,22 @@ Manifest ManifestParser::parse_string(const std::string & yaml_content) const {
   // Parse components
   if (root["components"] && root["components"].IsSequence()) {
     for (const auto & node : root["components"]) {
-      manifest.components.push_back(parse_component(node));
+      auto comp = parse_component(node);
+      if (node["lock"] && node["lock"].IsMap()) {
+        manifest.lock_overrides[comp.id] = parse_lock_config(node["lock"]);
+      }
+      manifest.components.push_back(std::move(comp));
     }
   }
 
   // Parse apps
   if (root["apps"] && root["apps"].IsSequence()) {
     for (const auto & node : root["apps"]) {
-      manifest.apps.push_back(parse_app(node));
+      auto app = parse_app(node);
+      if (node["lock"] && node["lock"].IsMap()) {
+        manifest.lock_overrides[app.id] = parse_lock_config(node["lock"]);
+      }
+      manifest.apps.push_back(std::move(app));
     }
   }
 
@@ -84,6 +95,13 @@ Manifest ManifestParser::parse_string(const std::string & yaml_content) const {
   if (root["functions"] && root["functions"].IsSequence()) {
     for (const auto & node : root["functions"]) {
       manifest.functions.push_back(parse_function(node));
+    }
+  }
+
+  // Parse scripts
+  if (root["scripts"] && root["scripts"].IsSequence()) {
+    for (const auto & node : root["scripts"]) {
+      manifest.scripts.push_back(parse_script_entry(node));
     }
   }
 
@@ -136,6 +154,7 @@ void ManifestParser::parse_area_recursive(const YAML::Node & node, const std::st
   area.tags = get_string_vector(node, "tags");
   // Set parent from recursive call, or from explicit parent_area field
   area.parent_area_id = parent_id.empty() ? get_string(node, "parent_area") : parent_id;
+  area.source = "manifest";
 
   areas.push_back(area);
 
@@ -262,6 +281,81 @@ std::string ManifestConfig::policy_to_string(UnmanifestedNodePolicy policy) {
     default:
       return "warn";
   }
+}
+
+ros2_medkit_gateway::ScriptEntryConfig ManifestParser::parse_script_entry(const YAML::Node & node) const {
+  ros2_medkit_gateway::ScriptEntryConfig entry;
+  entry.id = get_string(node, "id");
+  if (entry.id.empty()) {
+    throw std::runtime_error("Script entry missing required field: id");
+  }
+  entry.name = get_string(node, "name", entry.id);
+  entry.description = get_string(node, "description");
+  entry.path = get_string(node, "path");
+  if (entry.path.empty()) {
+    throw std::runtime_error("Script entry '" + entry.id + "' missing required field: path");
+  }
+  entry.format = get_string(node, "format");
+  if (entry.format.empty()) {
+    throw std::runtime_error("Script entry '" + entry.id + "' missing required field: format");
+  }
+  if (entry.format != "bash" && entry.format != "python" && entry.format != "sh") {
+    throw std::runtime_error("Script entry '" + entry.id + "' has unknown format: '" + entry.format +
+                             "' (expected: bash, python, sh)");
+  }
+  if (node["timeout_sec"]) {
+    entry.timeout_sec = std::max(1, node["timeout_sec"].as<int>());
+  }
+  entry.entity_filter = get_string_vector(node, "entity_filter");
+
+  // Parse env map (skip non-scalar values to avoid yaml-cpp exceptions)
+  if (node["env"] && node["env"].IsMap()) {
+    for (const auto & it : node["env"]) {
+      if (it.second.IsScalar()) {
+        entry.env[it.first.as<std::string>()] = it.second.as<std::string>();
+      }
+    }
+  }
+
+  // Parse args (JSON array of {name, type, flag} objects)
+  if (node["args"] && node["args"].IsSequence()) {
+    entry.args = json::array();
+    for (const auto & arg_node : node["args"]) {
+      json arg_obj;
+      if (arg_node["name"]) {
+        arg_obj["name"] = arg_node["name"].as<std::string>();
+      }
+      if (arg_node["type"]) {
+        arg_obj["type"] = arg_node["type"].as<std::string>();
+      }
+      if (arg_node["flag"]) {
+        arg_obj["flag"] = arg_node["flag"].as<std::string>();
+      }
+      entry.args.push_back(arg_obj);
+    }
+  }
+
+  // Parse parameters_schema via recursive YAML-to-JSON conversion
+  if (node["parameters_schema"]) {
+    auto schema = ros2_medkit_serialization::JsonSerializer::yaml_to_json(node["parameters_schema"]);
+    if (!schema.is_null() && !schema.empty()) {
+      entry.parameters_schema = schema;
+    }
+  }
+
+  return entry;
+}
+
+ManifestLockConfig ManifestParser::parse_lock_config(const YAML::Node & node) const {
+  ManifestLockConfig config;
+  config.required_scopes = get_string_vector(node, "required_scopes");
+  if (node["breakable"]) {
+    config.breakable = node["breakable"].as<bool>();
+  }
+  if (node["max_expiration"]) {
+    config.max_expiration = std::max(0, node["max_expiration"].as<int>());
+  }
+  return config;
 }
 
 }  // namespace discovery
