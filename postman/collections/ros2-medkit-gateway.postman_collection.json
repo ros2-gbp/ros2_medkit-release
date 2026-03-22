@@ -324,7 +324,7 @@
                 "version-info"
               ]
             },
-            "description": "Get SOVD server version information. Returns sovd_info array with supported SOVD versions, base URIs, and vendor information. Response format: { sovd_info: [{ version, base_uri, vendor_info: { version, name } }] }"
+            "description": "Get SOVD server version information. Returns items array with supported SOVD versions, base URIs, and vendor information. Response format: { items: [{ version, base_uri, vendor_info: { version, name } }] }"
           },
           "response": []
         },
@@ -1982,6 +1982,120 @@
               ]
             },
             "description": "Step 8: View full fault history including cleared faults. All previously active faults should now show status=CLEARED."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Vendor Extensions",
+      "description": "Vendor-specific extension endpoints (x-medkit-* prefix). These endpoints expose beacon plugin state for apps and components.",
+      "item": [
+        {
+          "name": "GET App Topic Beacon State",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/apps/:app_id/x-medkit-topic-beacon",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "apps",
+                ":app_id",
+                "x-medkit-topic-beacon"
+              ],
+              "variable": [
+                {
+                  "key": "app_id",
+                  "value": "engine_temp_sensor",
+                  "description": "App entity ID"
+                }
+              ]
+            },
+            "description": "Get the current topic beacon state for an app. Returns beacon status (active/stale), age, transport metadata, process info, and custom metadata from the most recent MedkitDiscoveryHint published by the node. Returns 404 if no hint has been received for this app."
+          },
+          "response": []
+        },
+        {
+          "name": "GET App Parameter Beacon State",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/apps/:app_id/x-medkit-param-beacon",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "apps",
+                ":app_id",
+                "x-medkit-param-beacon"
+              ],
+              "variable": [
+                {
+                  "key": "app_id",
+                  "value": "engine_temp_sensor",
+                  "description": "App entity ID"
+                }
+              ]
+            },
+            "description": "Get the current parameter beacon state for an app. Returns beacon status (active/stale), age, and metadata collected by polling the node's ROS 2 parameters under the configured prefix (default: ros2_medkit.discovery). Returns 404 if no hint has been collected for this app."
+          },
+          "response": []
+        },
+        {
+          "name": "GET Component Topic Beacon State",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/components/:component_id/x-medkit-topic-beacon",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "components",
+                ":component_id",
+                "x-medkit-topic-beacon"
+              ],
+              "variable": [
+                {
+                  "key": "component_id",
+                  "value": "powertrain_engine",
+                  "description": "Component entity ID"
+                }
+              ]
+            },
+            "description": "Get the current topic beacon state for a component."
+          },
+          "response": []
+        },
+        {
+          "name": "GET Component Parameter Beacon State",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/components/:component_id/x-medkit-param-beacon",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "components",
+                ":component_id",
+                "x-medkit-param-beacon"
+              ],
+              "variable": [
+                {
+                  "key": "component_id",
+                  "value": "powertrain_engine",
+                  "description": "Component entity ID"
+                }
+              ]
+            },
+            "description": "Get the current parameter beacon state for a component."
           },
           "response": []
         }

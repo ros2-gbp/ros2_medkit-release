@@ -36,11 +36,12 @@ from launch.actions import TimerAction
 import launch_ros.actions
 import launch_testing
 import launch_testing.actions
+from ros2_medkit_test_utils.constants import get_test_port
 from ros2_medkit_test_utils.coverage import get_coverage_env
 import urllib3
 
-# Port for HTTPS testing (different from default HTTP port)
-HTTPS_PORT = 8443
+# Port for HTTPS testing
+HTTPS_PORT = get_test_port()
 HTTPS_BASE_URL = f'https://localhost:{HTTPS_PORT}'
 
 
@@ -233,11 +234,11 @@ class TestHttpsEndpoints(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        # sovd_info array with version, base_uri, vendor_info
-        self.assertIn('sovd_info', data)
-        self.assertIsInstance(data['sovd_info'], list)
-        self.assertGreater(len(data['sovd_info']), 0)
-        info = data['sovd_info'][0]
+        # items array (SOVD-standard wrapper key)
+        self.assertIn('items', data)
+        self.assertIsInstance(data['items'], list)
+        self.assertGreater(len(data['items']), 0)
+        info = data['items'][0]
         self.assertIn('version', info)
         self.assertIn('base_uri', info)
 

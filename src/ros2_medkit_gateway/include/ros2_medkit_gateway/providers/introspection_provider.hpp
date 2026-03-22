@@ -43,14 +43,16 @@ struct NewEntities {
   std::vector<Area> areas;
   std::vector<Component> components;
   std::vector<App> apps;
+  std::vector<Function> functions;
 };
 
 /**
  * @brief Result returned by IntrospectionProvider::introspect()
  */
 struct IntrospectionResult {
-  /// Per-entity metadata enrichment. Key = entity_id.
-  /// Values are deep-merged into the entity's x-medkit vendor extension.
+  /// Per-entity metadata for plugin-internal use. Key = entity_id.
+  /// Plugins serve this data as SOVD vendor extension resources
+  /// via register_routes() and register_capability().
   std::unordered_map<std::string, nlohmann::json> metadata;
 
   /// New entities discovered by this provider
@@ -73,9 +75,10 @@ class IntrospectionProvider {
   /**
    * @brief Core introspection method
    *
-   * Called after each discovery cycle, before EntityCache update.
+   * Called during each discovery cycle by the merge pipeline.
+   * Input contains entities from all higher-priority layers (manifest + runtime).
    *
-   * @param input Snapshot of currently discovered entities
+   * @param input Snapshot of entities discovered by previous layers
    * @return Metadata enrichments and new entities
    */
   virtual IntrospectionResult introspect(const IntrospectionInput & input) = 0;

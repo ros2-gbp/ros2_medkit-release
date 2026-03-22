@@ -24,6 +24,9 @@
 #include "ros2_medkit_gateway/http/error_codes.hpp"
 #include "ros2_medkit_gateway/http/http_utils.hpp"
 
+#include "../openapi/route_registry.hpp"
+#include "../openapi/schema_builder.hpp"
+
 namespace ros2_medkit_gateway {
 
 namespace {
@@ -50,17 +53,17 @@ struct HttplibExceptionHandlerAdapter {
       set_internal_server_error(res, "Unknown exception");
     } catch (const std::exception & e) {
       RCLCPP_ERROR(rclcpp::get_logger("rest_server"), "Unhandled exception: %s", e.what());
-      set_internal_server_error(res, e.what());
+      set_internal_server_error(res, "An internal error occurred");
     } catch (...) {
       RCLCPP_ERROR(rclcpp::get_logger("rest_server"), "Unknown exception caught");
-      set_internal_server_error(res, "Unknown exception");
+      set_internal_server_error(res, "An internal error occurred");
     }
   }
 
   // Older cpp-httplib versions pass std::exception directly.
   void operator()(const httplib::Request & /*req*/, httplib::Response & res, const std::exception & e) const {
     RCLCPP_ERROR(rclcpp::get_logger("rest_server"), "Unhandled exception: %s", e.what());
-    set_internal_server_error(res, e.what());
+    set_internal_server_error(res, "An internal error occurred");
   }
 };
 
@@ -113,23 +116,44 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   handler_ctx_ = std::make_unique<handlers::HandlerContext>(node_, cors_config_, auth_config_, tls_config_,
                                                             auth_manager_.get(), node_->get_bulk_data_store());
 
-  health_handlers_ = std::make_unique<handlers::HealthHandlers>(*handler_ctx_);
+  // Create route registry before handlers that need it (HealthHandlers, DocsHandlers).
+  // Routes are populated later in setup_routes(), but both handlers only access
+  // the registry lazily at request time, so the pointer is valid.
+  route_registry_ = std::make_unique<openapi::RouteRegistry>();
+  route_registry_->set_auth_enabled(auth_config_.enabled);
+
+  health_handlers_ = std::make_unique<handlers::HealthHandlers>(*handler_ctx_, route_registry_.get());
   discovery_handlers_ = std::make_unique<handlers::DiscoveryHandlers>(*handler_ctx_);
   data_handlers_ = std::make_unique<handlers::DataHandlers>(*handler_ctx_);
   operation_handlers_ = std::make_unique<handlers::OperationHandlers>(*handler_ctx_);
   config_handlers_ = std::make_unique<handlers::ConfigHandlers>(*handler_ctx_);
   fault_handlers_ = std::make_unique<handlers::FaultHandlers>(*handler_ctx_);
+  log_handlers_ = std::make_unique<handlers::LogHandlers>(*handler_ctx_);
   auth_handlers_ = std::make_unique<handlers::AuthHandlers>(*handler_ctx_);
-  auto max_sse_clients = static_cast<size_t>(node_->get_parameter("sse.max_clients").as_int());
-  sse_client_tracker_ = std::make_shared<SSEClientTracker>(max_sse_clients);
+  sse_client_tracker_ = node_->get_sse_client_tracker();
   sse_fault_handler_ = std::make_unique<handlers::SSEFaultHandler>(*handler_ctx_, sse_client_tracker_);
   bulkdata_handlers_ = std::make_unique<handlers::BulkDataHandlers>(*handler_ctx_);
+  auto max_duration_sec = static_cast<int>(node_->get_parameter("sse.max_duration_sec").as_int());
+  if (max_duration_sec <= 0) {
+    RCLCPP_WARN(node_->get_logger(), "sse.max_duration_sec must be > 0, using default 3600");
+    max_duration_sec = 3600;
+  }
   cyclic_sub_handlers_ = std::make_unique<handlers::CyclicSubscriptionHandlers>(
-      *handler_ctx_, *node_->get_subscription_manager(), sse_client_tracker_);
+      *handler_ctx_, *node_->get_subscription_manager(), *node_->get_sampler_registry(),
+      *node_->get_transport_registry(), max_duration_sec);
 
   if (node_->get_update_manager()) {
     update_handlers_ = std::make_unique<handlers::UpdateHandlers>(*handler_ctx_, node_->get_update_manager());
   }
+
+  lock_handlers_ = std::make_unique<handlers::LockHandlers>(*handler_ctx_, node_->get_lock_manager());
+
+  if (node_->get_script_manager()) {
+    script_handlers_ = std::make_unique<handlers::ScriptHandlers>(*handler_ctx_, node_->get_script_manager());
+  }
+
+  docs_handlers_ = std::make_unique<handlers::DocsHandlers>(*handler_ctx_, *node_, node_->get_plugin_manager(),
+                                                            route_registry_.get());
 
   // Set up global error handlers for SOVD GenericError compliance
   setup_global_error_handlers();
@@ -238,6 +262,10 @@ void RESTServer::setup_global_error_handlers() {
   srv->set_exception_handler(HttplibExceptionHandlerAdapter{});
 }
 
+void RESTServer::set_trigger_handlers(TriggerManager & trigger_mgr) {
+  trigger_handlers_ = std::make_unique<handlers::TriggerHandlers>(*handler_ctx_, trigger_mgr, sse_client_tracker_);
+}
+
 RESTServer::~RESTServer() {
   stop();
 }
@@ -248,802 +276,1097 @@ void RESTServer::setup_routes() {
     throw std::runtime_error("No server instance available for route setup");
   }
 
-  // Health check
-  srv->Get(api_path("/health"), [this](const httplib::Request & req, httplib::Response & res) {
-    health_handlers_->handle_health(req, res);
+  // === Docs routes - MUST be before data/config item routes to avoid (.+) capture collision ===
+  // These use special regex patterns that don't map cleanly to OpenAPI {param} style,
+  // so they are registered directly with the server rather than through the route registry.
+  srv->Get(api_path("/docs"), [this](const httplib::Request & req, httplib::Response & res) {
+    docs_handlers_->handle_docs_root(req, res);
+  });
+  srv->Get((api_path("") + R"((.+)/docs$)"), [this](const httplib::Request & req, httplib::Response & res) {
+    docs_handlers_->handle_docs_any_path(req, res);
   });
 
-  // Root - server capabilities and entry points (REQ_INTEROP_010)
-  srv->Get(api_path("/"), [this](const httplib::Request & req, httplib::Response & res) {
-    health_handlers_->handle_root(req, res);
+#ifdef ENABLE_SWAGGER_UI
+  // Swagger UI - interactive API documentation browser
+  srv->Get(api_path("/swagger-ui"), [this](const httplib::Request & req, httplib::Response & res) {
+    docs_handlers_->handle_swagger_ui(req, res);
   });
-
-  // Version info (REQ_INTEROP_001)
-  srv->Get(api_path("/version-info"), [this](const httplib::Request & req, httplib::Response & res) {
-    health_handlers_->handle_version_info(req, res);
+  srv->Get(api_path(R"(/swagger-ui/([^/]+))"), [this](const httplib::Request & req, httplib::Response & res) {
+    docs_handlers_->handle_swagger_asset(req, res);
   });
-
-  // Areas
-  srv->Get(api_path("/areas"), [this](const httplib::Request & req, httplib::Response & res) {
-    discovery_handlers_->handle_list_areas(req, res);
-  });
-
-  // Apps - must register before /apps/{id} to avoid regex conflict
-  srv->Get(api_path("/apps"), [this](const httplib::Request & req, httplib::Response & res) {
-    discovery_handlers_->handle_list_apps(req, res);
-  });
-
-  // App data item (specific topic) - register before /apps/{id}/data
-  srv->Get((api_path("/apps") + R"(/([^/]+)/data/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_get_data_item(req, res);
-           });
-
-  // App data write (PUT) - publish data to topic
-  srv->Put((api_path("/apps") + R"(/([^/]+)/data/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_put_data_item(req, res);
-           });
-
-  // App data-categories (not implemented for ROS 2)
-  srv->Get((api_path("/apps") + R"(/([^/]+)/data-categories$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_data_categories(req, res);
-           });
-
-  // App data-groups (not implemented for ROS 2)
-  srv->Get((api_path("/apps") + R"(/([^/]+)/data-groups$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_data_groups(req, res);
-           });
-
-  // App data (all topics)
-  srv->Get((api_path("/apps") + R"(/([^/]+)/data$)"), [this](const httplib::Request & req, httplib::Response & res) {
-    data_handlers_->handle_list_data(req, res);
-  });
-
-  // App operations
-  srv->Get((api_path("/apps") + R"(/([^/]+)/operations$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_list_operations(req, res);
-           });
-
-  // App operation details (GET) - get single operation info
-  srv->Get((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_get_operation(req, res);
-           });
-
-  // Execution endpoints for apps
-  // POST /{entity}/operations/{op-id}/executions - start execution
-  srv->Post((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
-            [this](const httplib::Request & req, httplib::Response & res) {
-              operation_handlers_->handle_create_execution(req, res);
-            });
-
-  // GET /{entity}/operations/{op-id}/executions - list executions
-  srv->Get((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_list_executions(req, res);
-           });
-
-  // GET /{entity}/operations/{op-id}/executions/{exec-id} - get execution status
-  srv->Get((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_get_execution(req, res);
-           });
-
-  // PUT /{entity}/operations/{op-id}/executions/{exec-id} - update execution
-  srv->Put((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_update_execution(req, res);
-           });
-
-  // DELETE /{entity}/operations/{op-id}/executions/{exec-id} - cancel execution
-  srv->Delete((api_path("/apps") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                operation_handlers_->handle_cancel_execution(req, res);
-              });
-
-  // App configurations - list all
-  srv->Get((api_path("/apps") + R"(/([^/]+)/configurations$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_list_configurations(req, res);
-           });
-
-  // App configurations - get specific
-  // Use (.+) for config_id to accept slashes from percent-encoded URLs (%2F -> /)
-  // ROS2 parameters like qos_overrides./parameter_events.publisher.depth contain slashes
-  srv->Get((api_path("/apps") + R"(/([^/]+)/configurations/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_get_configuration(req, res);
-           });
-
-  // App configurations - set
-  srv->Put((api_path("/apps") + R"(/([^/]+)/configurations/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_set_configuration(req, res);
-           });
-
-  // App configurations - delete single
-  srv->Delete((api_path("/apps") + R"(/([^/]+)/configurations/(.+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                config_handlers_->handle_delete_configuration(req, res);
-              });
-
-  // App configurations - delete all
-  srv->Delete((api_path("/apps") + R"(/([^/]+)/configurations$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                config_handlers_->handle_delete_all_configurations(req, res);
-              });
-
-  // App depends-on (relationship endpoint)
-  srv->Get((api_path("/apps") + R"(/([^/]+)/depends-on$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             discovery_handlers_->handle_app_depends_on(req, res);
-           });
-
-  // Single app (capabilities) - must be after more specific routes
-  srv->Get((api_path("/apps") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
-    discovery_handlers_->handle_get_app(req, res);
-  });
-
-  // Functions - list all functions
-  srv->Get(api_path("/functions"), [this](const httplib::Request & req, httplib::Response & res) {
-    discovery_handlers_->handle_list_functions(req, res);
-  });
-
-  // Function hosts
-  srv->Get((api_path("/functions") + R"(/([^/]+)/hosts$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             discovery_handlers_->handle_function_hosts(req, res);
-           });
-
-  // Function data item (specific topic) - register before /functions/{id}/data
-  srv->Get((api_path("/functions") + R"(/([^/]+)/data/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_get_data_item(req, res);
-           });
-
-  // Function data write (PUT) - publish data to topic
-  srv->Put((api_path("/functions") + R"(/([^/]+)/data/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_put_data_item(req, res);
-           });
-
-  // Function data (aggregated from host apps)
-  srv->Get((api_path("/functions") + R"(/([^/]+)/data$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_list_data(req, res);
-           });
-
-  // Function operations (aggregated from host apps)
-  srv->Get((api_path("/functions") + R"(/([^/]+)/operations$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_list_operations(req, res);
-           });
-
-  // Function operation details (GET) - get single operation info
-  srv->Get((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_get_operation(req, res);
-           });
-
-  // Execution endpoints for functions
-  srv->Post((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
-            [this](const httplib::Request & req, httplib::Response & res) {
-              operation_handlers_->handle_create_execution(req, res);
-            });
-
-  srv->Get((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_list_executions(req, res);
-           });
-
-  srv->Get((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_get_execution(req, res);
-           });
-
-  srv->Put((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_update_execution(req, res);
-           });
-
-  srv->Delete((api_path("/functions") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                operation_handlers_->handle_cancel_execution(req, res);
-              });
-
-  // Function configurations
-  srv->Get((api_path("/functions") + R"(/([^/]+)/configurations$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_list_configurations(req, res);
-           });
-
-  srv->Get((api_path("/functions") + R"(/([^/]+)/configurations/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_get_configuration(req, res);
-           });
-
-  srv->Put((api_path("/functions") + R"(/([^/]+)/configurations/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_set_configuration(req, res);
-           });
-
-  srv->Delete((api_path("/functions") + R"(/([^/]+)/configurations/(.+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                config_handlers_->handle_delete_configuration(req, res);
-              });
-
-  srv->Delete((api_path("/functions") + R"(/([^/]+)/configurations$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                config_handlers_->handle_delete_all_configurations(req, res);
-              });
-
-  // Function faults
-  srv->Get((api_path("/functions") + R"(/([^/]+)/faults$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             fault_handlers_->handle_list_faults(req, res);
-           });
-
-  srv->Get((api_path("/functions") + R"(/([^/]+)/faults/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             fault_handlers_->handle_get_fault(req, res);
-           });
-
-  srv->Delete((api_path("/functions") + R"(/([^/]+)/faults/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                fault_handlers_->handle_clear_fault(req, res);
-              });
-
-  srv->Delete((api_path("/functions") + R"(/([^/]+)/faults$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                fault_handlers_->handle_clear_all_faults(req, res);
-              });
-
-  // Single function (capabilities) - must be after more specific routes
-  srv->Get((api_path("/functions") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
-    discovery_handlers_->handle_get_function(req, res);
-  });
-
-  // Components
-  srv->Get(api_path("/components"), [this](const httplib::Request & req, httplib::Response & res) {
-    discovery_handlers_->handle_list_components(req, res);
-  });
-
-  // Area components
-  srv->Get((api_path("/areas") + R"(/([^/]+)/components)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             discovery_handlers_->handle_area_components(req, res);
-           });
-
-  // Area subareas (relationship endpoint)
-  srv->Get((api_path("/areas") + R"(/([^/]+)/subareas$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             discovery_handlers_->handle_get_subareas(req, res);
-           });
-
-  // Area contains
-  srv->Get((api_path("/areas") + R"(/([^/]+)/contains$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             discovery_handlers_->handle_get_contains(req, res);
-           });
-
-  // Area data item (specific topic) - register before /areas/{id}/data
-  srv->Get((api_path("/areas") + R"(/([^/]+)/data/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_get_data_item(req, res);
-           });
-
-  // Area data write (PUT) - publish data to topic
-  srv->Put((api_path("/areas") + R"(/([^/]+)/data/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_put_data_item(req, res);
-           });
-
-  // Area data (aggregated from contained components)
-  srv->Get((api_path("/areas") + R"(/([^/]+)/data$)"), [this](const httplib::Request & req, httplib::Response & res) {
-    data_handlers_->handle_list_data(req, res);
-  });
-
-  // Area operations
-  srv->Get((api_path("/areas") + R"(/([^/]+)/operations$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_list_operations(req, res);
-           });
-
-  // Area operation details (GET) - get single operation info
-  srv->Get((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_get_operation(req, res);
-           });
-
-  // Execution endpoints for areas
-  srv->Post((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
-            [this](const httplib::Request & req, httplib::Response & res) {
-              operation_handlers_->handle_create_execution(req, res);
-            });
-
-  srv->Get((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_list_executions(req, res);
-           });
-
-  srv->Get((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_get_execution(req, res);
-           });
-
-  srv->Put((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_update_execution(req, res);
-           });
-
-  srv->Delete((api_path("/areas") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                operation_handlers_->handle_cancel_execution(req, res);
-              });
-
-  // Area configurations
-  srv->Get((api_path("/areas") + R"(/([^/]+)/configurations$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_list_configurations(req, res);
-           });
-
-  srv->Get((api_path("/areas") + R"(/([^/]+)/configurations/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_get_configuration(req, res);
-           });
-
-  srv->Put((api_path("/areas") + R"(/([^/]+)/configurations/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_set_configuration(req, res);
-           });
-
-  srv->Delete((api_path("/areas") + R"(/([^/]+)/configurations/(.+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                config_handlers_->handle_delete_configuration(req, res);
-              });
-
-  srv->Delete((api_path("/areas") + R"(/([^/]+)/configurations$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                config_handlers_->handle_delete_all_configurations(req, res);
-              });
-
-  // Area faults
-  srv->Get((api_path("/areas") + R"(/([^/]+)/faults$)"), [this](const httplib::Request & req, httplib::Response & res) {
-    fault_handlers_->handle_list_faults(req, res);
-  });
-
-  srv->Get((api_path("/areas") + R"(/([^/]+)/faults/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             fault_handlers_->handle_get_fault(req, res);
-           });
-
-  srv->Delete((api_path("/areas") + R"(/([^/]+)/faults/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                fault_handlers_->handle_clear_fault(req, res);
-              });
-
-  srv->Delete((api_path("/areas") + R"(/([^/]+)/faults$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                fault_handlers_->handle_clear_all_faults(req, res);
-              });
-
-  // Single area (capabilities) - must be after more specific routes
-  srv->Get((api_path("/areas") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
-    discovery_handlers_->handle_get_area(req, res);
-  });
-
-  // Component topic data (specific topic) - register before general route
-  // Use (.+) for topic_name to accept slashes from percent-encoded URLs (%2F -> /)
-  srv->Get((api_path("/components") + R"(/([^/]+)/data/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_get_data_item(req, res);
-           });
-
-  // Component data (all topics)
-  srv->Get((api_path("/components") + R"(/([^/]+)/data$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_list_data(req, res);
-           });
-
-  // Component subcomponents (relationship endpoint)
-  srv->Get((api_path("/components") + R"(/([^/]+)/subcomponents$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             discovery_handlers_->handle_get_subcomponents(req, res);
-           });
-
-  // Component hosts
-  srv->Get((api_path("/components") + R"(/([^/]+)/hosts$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             discovery_handlers_->handle_get_hosts(req, res);
-           });
-
-  // Component depends-on (relationship endpoint)
-  srv->Get((api_path("/components") + R"(/([^/]+)/depends-on$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             discovery_handlers_->handle_component_depends_on(req, res);
-           });
-
-  // Single component (capabilities) - must be after more specific routes
-  srv->Get((api_path("/components") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
-    discovery_handlers_->handle_get_component(req, res);
-  });
-
-  // Component topic publish (PUT)
-  // Use (.+) for topic_name to accept slashes from percent-encoded URLs (%2F -> /)
-  srv->Put((api_path("/components") + R"(/([^/]+)/data/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             data_handlers_->handle_put_data_item(req, res);
-           });
-
-  // List component operations (GET) - list all services and actions for a component
-  srv->Get((api_path("/components") + R"(/([^/]+)/operations$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_list_operations(req, res);
-           });
-
-  // Component operation details (GET) - get single operation info
-  srv->Get((api_path("/components") + R"(/([^/]+)/operations/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_get_operation(req, res);
-           });
-
-  // Execution endpoints for components
-  // POST /{entity}/operations/{op-id}/executions - start execution
-  srv->Post((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
-            [this](const httplib::Request & req, httplib::Response & res) {
-              operation_handlers_->handle_create_execution(req, res);
-            });
-
-  // GET /{entity}/operations/{op-id}/executions - list executions
-  srv->Get((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_list_executions(req, res);
-           });
-
-  // GET /{entity}/operations/{op-id}/executions/{exec-id} - get execution status
-  srv->Get((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_get_execution(req, res);
-           });
-
-  // PUT /{entity}/operations/{op-id}/executions/{exec-id} - update execution
-  srv->Put((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             operation_handlers_->handle_update_execution(req, res);
-           });
-
-  // DELETE /{entity}/operations/{op-id}/executions/{exec-id} - cancel execution
-  srv->Delete((api_path("/components") + R"(/([^/]+)/operations/([^/]+)/executions/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                operation_handlers_->handle_cancel_execution(req, res);
-              });
-
-  // Configurations endpoints - SOVD Configurations API mapped to ROS2 parameters
-  // List all configurations (parameters) for a component
-  srv->Get((api_path("/components") + R"(/([^/]+)/configurations$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_list_configurations(req, res);
-           });
-
-  // Get specific configuration (parameter) - register before general route
-  srv->Get((api_path("/components") + R"(/([^/]+)/configurations/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_get_configuration(req, res);
-           });
-
-  // Set configuration (parameter)
-  srv->Put((api_path("/components") + R"(/([^/]+)/configurations/(.+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             config_handlers_->handle_set_configuration(req, res);
-           });
-
-  // Delete (reset) single configuration to default value
-  srv->Delete((api_path("/components") + R"(/([^/]+)/configurations/(.+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                config_handlers_->handle_delete_configuration(req, res);
-              });
-
-  // Delete (reset) all configurations to default values
-  srv->Delete((api_path("/components") + R"(/([^/]+)/configurations$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                config_handlers_->handle_delete_all_configurations(req, res);
-              });
-
-  // Fault endpoints
-  // SSE stream for real-time fault events - must be registered before /faults to avoid regex conflict
-  srv->Get(api_path("/faults/stream"), [this](const httplib::Request & req, httplib::Response & res) {
-    sse_fault_handler_->handle_stream(req, res);
-  });
-
-  // GET /faults - convenience API to retrieve all faults across the system
-  // Useful for dashboards and monitoring tools that need a complete system health view
-  srv->Get(api_path("/faults"), [this](const httplib::Request & req, httplib::Response & res) {
-    fault_handlers_->handle_list_all_faults(req, res);
-  });
-
-  // DELETE /faults - extension: clear all faults globally (not SOVD)
-  srv->Delete(api_path("/faults"), [this](const httplib::Request & req, httplib::Response & res) {
-    fault_handlers_->handle_clear_all_faults_global(req, res);
-  });
-
-  // List all faults for a component (REQ_INTEROP_012)
-  srv->Get((api_path("/components") + R"(/([^/]+)/faults$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             fault_handlers_->handle_list_faults(req, res);
-           });
-
-  // List all faults for an app (same handler, entity-agnostic)
-  srv->Get((api_path("/apps") + R"(/([^/]+)/faults$)"), [this](const httplib::Request & req, httplib::Response & res) {
-    fault_handlers_->handle_list_faults(req, res);
-  });
-
-  // Get specific fault by code (REQ_INTEROP_013)
-  srv->Get((api_path("/components") + R"(/([^/]+)/faults/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             fault_handlers_->handle_get_fault(req, res);
-           });
-
-  // Get specific fault by code for an app
-  srv->Get((api_path("/apps") + R"(/([^/]+)/faults/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             fault_handlers_->handle_get_fault(req, res);
-           });
-
-  // Clear a fault (REQ_INTEROP_015)
-  srv->Delete((api_path("/components") + R"(/([^/]+)/faults/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                fault_handlers_->handle_clear_fault(req, res);
-              });
-
-  // Clear a fault for an app
-  srv->Delete((api_path("/apps") + R"(/([^/]+)/faults/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                fault_handlers_->handle_clear_fault(req, res);
-              });
-
-  // Clear all faults for a component
-  srv->Delete((api_path("/components") + R"(/([^/]+)/faults$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                fault_handlers_->handle_clear_all_faults(req, res);
-              });
-
-  // Clear all faults for an app
-  srv->Delete((api_path("/apps") + R"(/([^/]+)/faults$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                fault_handlers_->handle_clear_all_faults(req, res);
-              });
-
-  // === Bulk Data Routes (REQ_INTEROP_071-073) ===
-  // List bulk-data categories
-  srv->Get((api_path("/apps") + R"(/([^/]+)/bulk-data$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_categories(req, res);
-           });
-  srv->Get((api_path("/components") + R"(/([^/]+)/bulk-data$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_categories(req, res);
-           });
-  srv->Get((api_path("/areas") + R"(/([^/]+)/bulk-data$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_categories(req, res);
-           });
-  srv->Get((api_path("/functions") + R"(/([^/]+)/bulk-data$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_categories(req, res);
-           });
-
-  // List bulk-data descriptors (by category)
-  srv->Get((api_path("/apps") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_descriptors(req, res);
-           });
-  srv->Get((api_path("/components") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_descriptors(req, res);
-           });
-  srv->Get((api_path("/areas") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_descriptors(req, res);
-           });
-  srv->Get((api_path("/functions") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_descriptors(req, res);
-           });
-
-  // Download bulk-data file
-  srv->Get((api_path("/apps") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_download(req, res);
-           });
-  srv->Get((api_path("/components") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_download(req, res);
-           });
-  srv->Get((api_path("/areas") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_download(req, res);
-           });
-  srv->Get((api_path("/functions") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_download(req, res);
-           });
-
-  // Upload bulk-data (POST) — apps and components only (REQ_INTEROP_074)
-  srv->Post((api_path("/apps") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
-            [this](const httplib::Request & req, httplib::Response & res) {
-              bulkdata_handlers_->handle_upload(req, res);
-            });
-  srv->Post((api_path("/components") + R"(/([^/]+)/bulk-data/([^/]+)$)"),
-            [this](const httplib::Request & req, httplib::Response & res) {
-              bulkdata_handlers_->handle_upload(req, res);
-            });
-  // Bulk data upload not supported for areas and functions (405)
-  auto bulk_upload_405 = [this](const httplib::Request & /*req*/, httplib::Response & res) {
-    handlers::HandlerContext::send_error(res, 405, ERR_INVALID_REQUEST,
-                                         "Bulk data upload is only supported for components and apps");
+#endif
+
+  auto & reg = *route_registry_;
+  using SB = openapi::SchemaBuilder;
+
+  auto capitalize = [](const std::string & s) -> std::string {
+    if (s.empty()) {
+      return s;
+    }
+    std::string result = s;
+    result[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(result[0])));
+    return result;
   };
-  srv->Post((api_path("/areas") + R"(/([^/]+)/bulk-data/([^/]+)$)"), bulk_upload_405);
-  srv->Post((api_path("/functions") + R"(/([^/]+)/bulk-data/([^/]+)$)"), bulk_upload_405);
 
-  // Delete bulk-data (DELETE) — apps and components only (REQ_INTEROP_074)
-  srv->Delete((api_path("/apps") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                bulkdata_handlers_->handle_delete(req, res);
-              });
-  srv->Delete((api_path("/components") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                bulkdata_handlers_->handle_delete(req, res);
-              });
-  // Bulk data deletion not supported for areas and functions (405)
-  auto bulk_delete_405 = [this](const httplib::Request & /*req*/, httplib::Response & res) {
-    handlers::HandlerContext::send_error(res, 405, ERR_INVALID_REQUEST,
-                                         "Bulk data deletion is only supported for components and apps");
+  // === Server endpoints ===
+  reg.get("/health",
+          [this](auto & req, auto & res) {
+            health_handlers_->handle_health(req, res);
+          })
+      .tag("Server")
+      .summary("Health check")
+      .description("Returns gateway health status.")
+      .response(200, "Gateway is healthy", SB::ref("HealthStatus"))
+      .operation_id("getHealth");
+
+  reg.get("/",
+          [this](auto & req, auto & res) {
+            health_handlers_->handle_root(req, res);
+          })
+      .tag("Server")
+      .summary("API overview")
+      .description("Returns gateway metadata, available endpoints, and capabilities.")
+      .response(200, "API metadata", SB::ref("RootOverview"))
+      .operation_id("getRoot");
+
+  reg.get("/version-info",
+          [this](auto & req, auto & res) {
+            health_handlers_->handle_version_info(req, res);
+          })
+      .tag("Server")
+      .summary("SOVD version information")
+      .description("Returns SOVD specification version and vendor info.")
+      .response(200, "Version info", SB::ref("VersionInfo"))
+      .operation_id("getVersionInfo");
+
+  // === Discovery - entity collections ===
+  reg.get("/areas",
+          [this](auto & req, auto & res) {
+            discovery_handlers_->handle_list_areas(req, res);
+          })
+      .tag("Discovery")
+      .summary("List areas")
+      .description("Lists all discovered areas in the system.")
+      .response(200, "Area list", SB::ref("EntityList"))
+      .operation_id("listAreas");
+
+  reg.get("/apps",
+          [this](auto & req, auto & res) {
+            discovery_handlers_->handle_list_apps(req, res);
+          })
+      .tag("Discovery")
+      .summary("List apps")
+      .description("Lists all discovered apps (ROS 2 nodes) in the system.")
+      .response(200, "App list", SB::ref("EntityList"))
+      .operation_id("listApps");
+
+  reg.get("/components",
+          [this](auto & req, auto & res) {
+            discovery_handlers_->handle_list_components(req, res);
+          })
+      .tag("Discovery")
+      .summary("List components")
+      .description("Lists all discovered components in the system.")
+      .response(200, "Component list", SB::ref("EntityList"))
+      .operation_id("listComponents");
+
+  reg.get("/functions",
+          [this](auto & req, auto & res) {
+            discovery_handlers_->handle_list_functions(req, res);
+          })
+      .tag("Discovery")
+      .summary("List functions")
+      .description("Lists all discovered functions in the system.")
+      .response(200, "Function list", SB::ref("EntityList"))
+      .operation_id("listFunctions");
+
+  // === Per-entity-type resource routes ===
+  // Entity types: areas, components, apps, functions
+  // For each entity type, register data, operations, configurations, faults, logs, bulk-data,
+  // and discovery relationship endpoints.
+
+  // Helper lambdas for entity-type-specific discovery detail handlers
+  using HandlerFn = openapi::HandlerFn;
+  struct EntityHandlers {
+    const char * type;
+    const char * singular;
+    HandlerFn detail_handler;
   };
-  srv->Delete((api_path("/areas") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"), bulk_delete_405);
-  srv->Delete((api_path("/functions") + R"(/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"), bulk_delete_405);
 
-  // Nested entities - subareas
-  srv->Get((api_path("/areas") + R"(/([^/]+)/subareas/([^/]+)/bulk-data$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_categories(req, res);
-           });
-  srv->Get((api_path("/areas") + R"(/([^/]+)/subareas/([^/]+)/bulk-data/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_descriptors(req, res);
-           });
-  srv->Get((api_path("/areas") + R"(/([^/]+)/subareas/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_download(req, res);
-           });
+  // clang-format off
+  std::vector<EntityHandlers> entity_types = {
+      {"areas", "area", [this](auto & req, auto & res) { discovery_handlers_->handle_get_area(req, res); }},
+      {"components", "component", [this](auto & req, auto & res) { discovery_handlers_->handle_get_component(req, res); }},
+      {"apps", "app", [this](auto & req, auto & res) { discovery_handlers_->handle_get_app(req, res); }},
+      {"functions", "function", [this](auto & req, auto & res) { discovery_handlers_->handle_get_function(req, res); }},
+  };
+  // clang-format on
 
-  // Nested entities - subcomponents
-  srv->Get((api_path("/components") + R"(/([^/]+)/subcomponents/([^/]+)/bulk-data$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_categories(req, res);
-           });
-  srv->Get((api_path("/components") + R"(/([^/]+)/subcomponents/([^/]+)/bulk-data/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_list_descriptors(req, res);
-           });
-  srv->Get((api_path("/components") + R"(/([^/]+)/subcomponents/([^/]+)/bulk-data/([^/]+)/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             bulkdata_handlers_->handle_download(req, res);
-           });
+  for (const auto & et : entity_types) {
+    std::string base = std::string("/") + et.type;
+    std::string entity_path = base + "/{" + et.singular + "_id}";
 
-  // === Cyclic Subscription Routes (REQ_INTEROP_025-028, REQ_INTEROP_089-090) ===
-  // SSE events stream - must be registered before CRUD routes to avoid regex conflict
-  srv->Get((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)/events$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             cyclic_sub_handlers_->handle_events(req, res);
-           });
-  srv->Get((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)/events$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             cyclic_sub_handlers_->handle_events(req, res);
-           });
+    // --- Data ---
+    // Data item (specific topic) - MUST be before data collection to avoid (.+) capture
+    reg.get(entity_path + "/data/{data_id}",
+            [this](auto & req, auto & res) {
+              data_handlers_->handle_get_data_item(req, res);
+            })
+        .tag("Data")
+        .summary(std::string("Get data item for ") + et.singular)
+        .description(std::string("Returns the latest value from a ROS 2 topic for this ") + et.singular + ".")
+        .response(200, "Data value", SB::generic_object_schema())
+        .operation_id(std::string("get") + capitalize(et.singular) + "DataItem");
 
-  // Create cyclic subscription
-  srv->Post((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions$)"),
-            [this](const httplib::Request & req, httplib::Response & res) {
-              cyclic_sub_handlers_->handle_create(req, res);
-            });
-  srv->Post((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions$)"),
-            [this](const httplib::Request & req, httplib::Response & res) {
-              cyclic_sub_handlers_->handle_create(req, res);
-            });
+    reg.put(entity_path + "/data/{data_id}",
+            [this](auto & req, auto & res) {
+              data_handlers_->handle_put_data_item(req, res);
+            })
+        .tag("Data")
+        .summary(std::string("Write data item for ") + et.singular)
+        .description(std::string("Publishes a value to a ROS 2 topic on this ") + et.singular + ".")
+        .request_body("Data value to write", SB::generic_object_schema())
+        .response(200, "Written value", SB::generic_object_schema())
+        .operation_id(std::string("put") + capitalize(et.singular) + "DataItem");
 
-  // List cyclic subscriptions
-  srv->Get((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             cyclic_sub_handlers_->handle_list(req, res);
-           });
-  srv->Get((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             cyclic_sub_handlers_->handle_list(req, res);
-           });
+    // Data-categories (returns 501 - not yet implemented)
+    reg.get(entity_path + "/data-categories",
+            [this](auto & req, auto & res) {
+              data_handlers_->handle_data_categories(req, res);
+            })
+        .tag("Data")
+        .summary(std::string("List data categories for ") + et.singular)
+        .description(std::string("Lists available data categories for this ") + et.singular + ".")
+        .response(200, "Category list", SB::ref("BulkDataCategoryList"))
+        .operation_id(std::string("list") + capitalize(et.singular) + "DataCategories");
 
-  // Get single subscription
-  srv->Get((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             cyclic_sub_handlers_->handle_get(req, res);
-           });
-  srv->Get((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             cyclic_sub_handlers_->handle_get(req, res);
-           });
+    // Data-groups (returns 501 - not yet implemented)
+    reg.get(entity_path + "/data-groups",
+            [this](auto & req, auto & res) {
+              data_handlers_->handle_data_groups(req, res);
+            })
+        .tag("Data")
+        .summary(std::string("List data groups for ") + et.singular)
+        .description(std::string("Lists available data groups for this ") + et.singular + ".")
+        .response(200, "Group list", SB::items_wrapper(SB::generic_object_schema()))
+        .operation_id(std::string("list") + capitalize(et.singular) + "DataGroups");
 
-  // Update subscription
-  srv->Put((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             cyclic_sub_handlers_->handle_update(req, res);
-           });
-  srv->Put((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
-           [this](const httplib::Request & req, httplib::Response & res) {
-             cyclic_sub_handlers_->handle_update(req, res);
-           });
+    // Data collection (all topics)
+    reg.get(entity_path + "/data",
+            [this](auto & req, auto & res) {
+              data_handlers_->handle_list_data(req, res);
+            })
+        .tag("Data")
+        .summary(std::string("List data items for ") + et.singular)
+        .description(std::string("Lists all data items (ROS 2 topics) available on this ") + et.singular + ".")
+        .response(200, "Data item list", SB::ref("DataItemList"))
+        .operation_id(std::string("list") + capitalize(et.singular) + "Data");
 
-  // Delete subscription
-  srv->Delete((api_path("/apps") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
+    // --- Operations ---
+    reg.get(entity_path + "/operations",
+            [this](auto & req, auto & res) {
+              operation_handlers_->handle_list_operations(req, res);
+            })
+        .tag("Operations")
+        .summary(std::string("List operations for ") + et.singular)
+        .description(std::string("Lists all ROS 2 services and actions available on this ") + et.singular + ".")
+        .response(200, "Operation list", SB::ref("OperationItemList"))
+        .operation_id(std::string("list") + capitalize(et.singular) + "Operations");
+
+    reg.get(entity_path + "/operations/{operation_id}",
+            [this](auto & req, auto & res) {
+              operation_handlers_->handle_get_operation(req, res);
+            })
+        .tag("Operations")
+        .summary(std::string("Get operation details for ") + et.singular)
+        .description(std::string("Returns operation details including request/response schema for this ") +
+                     et.singular + ".")
+        .response(200, "Operation details", SB::ref("OperationItem"))
+        .operation_id(std::string("get") + capitalize(et.singular) + "Operation");
+
+    // Execution endpoints
+    reg.post(entity_path + "/operations/{operation_id}/executions",
+             [this](auto & req, auto & res) {
+               operation_handlers_->handle_create_execution(req, res);
+             })
+        .tag("Operations")
+        .summary(std::string("Start operation execution for ") + et.singular)
+        .description("Starts a new execution. Returns 200 for synchronous, 202 for asynchronous operations.")
+        .request_body("Operation parameters", SB::generic_object_schema())
+        .response(200, "Synchronous result", SB::generic_object_schema())
+        .response(202, "Asynchronous execution started", SB::ref("OperationExecution"))
+        .operation_id(std::string("execute") + capitalize(et.singular) + "Operation");
+
+    reg.get(entity_path + "/operations/{operation_id}/executions",
+            [this](auto & req, auto & res) {
+              operation_handlers_->handle_list_executions(req, res);
+            })
+        .tag("Operations")
+        .summary(std::string("List operation executions for ") + et.singular)
+        .description(std::string("Lists all executions of an operation on this ") + et.singular + ".")
+        .response(200, "Execution list", SB::ref("OperationExecutionList"))
+        .operation_id(std::string("list") + capitalize(et.singular) + "Executions");
+
+    reg.get(entity_path + "/operations/{operation_id}/executions/{execution_id}",
+            [this](auto & req, auto & res) {
+              operation_handlers_->handle_get_execution(req, res);
+            })
+        .tag("Operations")
+        .summary(std::string("Get execution status for ") + et.singular)
+        .description("Returns the current status and result of a specific execution.")
+        .response(200, "Execution status", SB::ref("OperationExecution"))
+        .operation_id(std::string("get") + capitalize(et.singular) + "Execution");
+
+    reg.put(entity_path + "/operations/{operation_id}/executions/{execution_id}",
+            [this](auto & req, auto & res) {
+              operation_handlers_->handle_update_execution(req, res);
+            })
+        .tag("Operations")
+        .summary(std::string("Update execution for ") + et.singular)
+        .description("Sends a control command to a running execution.")
+        .request_body("Execution control", SB::generic_object_schema())
+        .response(200, "Updated execution", SB::ref("OperationExecution"))
+        .operation_id(std::string("update") + capitalize(et.singular) + "Execution");
+
+    reg.del(entity_path + "/operations/{operation_id}/executions/{execution_id}",
+            [this](auto & req, auto & res) {
+              operation_handlers_->handle_cancel_execution(req, res);
+            })
+        .tag("Operations")
+        .summary(std::string("Cancel execution for ") + et.singular)
+        .description("Cancels a running execution.")
+        .response(204, "Execution cancelled")
+        .operation_id(std::string("cancel") + capitalize(et.singular) + "Execution");
+
+    // --- Configurations ---
+    reg.get(entity_path + "/configurations",
+            [this](auto & req, auto & res) {
+              config_handlers_->handle_list_configurations(req, res);
+            })
+        .tag("Configuration")
+        .summary(std::string("List configurations for ") + et.singular)
+        .description(std::string("Lists all ROS 2 node parameters for this ") + et.singular + ".")
+        .response(200, "Configuration list", SB::ref("ConfigurationParamList"))
+        .operation_id(std::string("list") + capitalize(et.singular) + "Configurations");
+
+    reg.get(entity_path + "/configurations/{config_id}",
+            [this](auto & req, auto & res) {
+              config_handlers_->handle_get_configuration(req, res);
+            })
+        .tag("Configuration")
+        .summary(std::string("Get specific configuration for ") + et.singular)
+        .description(std::string("Returns a specific ROS 2 node parameter for this ") + et.singular + ".")
+        .response(200, "Configuration parameter", SB::ref("ConfigurationParam"))
+        .operation_id(std::string("get") + capitalize(et.singular) + "Configuration");
+
+    reg.put(entity_path + "/configurations/{config_id}",
+            [this](auto & req, auto & res) {
+              config_handlers_->handle_set_configuration(req, res);
+            })
+        .tag("Configuration")
+        .summary(std::string("Set configuration for ") + et.singular)
+        .description(std::string("Sets a ROS 2 node parameter value for this ") + et.singular + ".")
+        .request_body("Configuration value", SB::ref("ConfigurationParam"))
+        .response(200, "Updated configuration", SB::ref("ConfigurationParam"))
+        .operation_id(std::string("set") + capitalize(et.singular) + "Configuration");
+
+    reg.del(entity_path + "/configurations/{config_id}",
+            [this](auto & req, auto & res) {
+              config_handlers_->handle_delete_configuration(req, res);
+            })
+        .tag("Configuration")
+        .summary(std::string("Delete configuration for ") + et.singular)
+        .description(std::string("Resets a configuration parameter to its default for this ") + et.singular + ".")
+        .response(204, "Configuration deleted")
+        .operation_id(std::string("delete") + capitalize(et.singular) + "Configuration");
+
+    reg.del(entity_path + "/configurations",
+            [this](auto & req, auto & res) {
+              config_handlers_->handle_delete_all_configurations(req, res);
+            })
+        .tag("Configuration")
+        .summary(std::string("Delete all configurations for ") + et.singular)
+        .description(std::string("Resets all configuration parameters for this ") + et.singular + ".")
+        .response(204, "All configurations deleted")
+        .operation_id(std::string("deleteAll") + capitalize(et.singular) + "Configurations");
+
+    // --- Faults ---
+    reg.get(entity_path + "/faults",
+            [this](auto & req, auto & res) {
+              fault_handlers_->handle_list_faults(req, res);
+            })
+        .tag("Faults")
+        .summary(std::string("List faults for ") + et.singular)
+        .description(std::string("Returns all active faults reported by this ") + et.singular + ".")
+        .response(200, "Fault list", SB::ref("FaultList"))
+        .operation_id(std::string("list") + capitalize(et.singular) + "Faults");
+
+    reg.get(entity_path + "/faults/{fault_code}",
+            [this](auto & req, auto & res) {
+              fault_handlers_->handle_get_fault(req, res);
+            })
+        .tag("Faults")
+        .summary(std::string("Get specific fault for ") + et.singular)
+        .description("Returns fault details including SOVD status, environment data, and rosbag snapshots.")
+        .response(200, "Fault detail", SB::ref("FaultDetail"))
+        .operation_id(std::string("get") + capitalize(et.singular) + "Fault");
+
+    reg.del(entity_path + "/faults/{fault_code}",
+            [this](auto & req, auto & res) {
+              fault_handlers_->handle_clear_fault(req, res);
+            })
+        .tag("Faults")
+        .summary(std::string("Clear fault for ") + et.singular)
+        .description(std::string("Clears a specific fault for this ") + et.singular + ".")
+        .response(204, "Fault cleared")
+        .operation_id(std::string("clear") + capitalize(et.singular) + "Fault");
+
+    reg.del(entity_path + "/faults",
+            [this](auto & req, auto & res) {
+              fault_handlers_->handle_clear_all_faults(req, res);
+            })
+        .tag("Faults")
+        .summary(std::string("Clear all faults for ") + et.singular)
+        .description(std::string("Clears all faults for this ") + et.singular + ".")
+        .response(204, "All faults cleared")
+        .operation_id(std::string("clearAll") + capitalize(et.singular) + "Faults");
+
+    // --- Logs ---
+    reg.get(entity_path + "/logs",
+            [this](auto & req, auto & res) {
+              log_handlers_->handle_get_logs(req, res);
+            })
+        .tag("Logs")
+        .summary(std::string("Query log entries for ") + et.singular)
+        .description(std::string("Queries application log entries for this ") + et.singular + ".")
+        .response(200, "Log entries", SB::ref("LogEntryList"))
+        .operation_id(std::string("list") + capitalize(et.singular) + "Logs");
+
+    reg.get(entity_path + "/logs/configuration",
+            [this](auto & req, auto & res) {
+              log_handlers_->handle_get_logs_configuration(req, res);
+            })
+        .tag("Logs")
+        .summary(std::string("Get log configuration for ") + et.singular)
+        .description(std::string("Returns the log filter configuration for this ") + et.singular + ".")
+        .response(200, "Log configuration", SB::ref("LogConfiguration"))
+        .operation_id(std::string("get") + capitalize(et.singular) + "LogConfiguration");
+
+    reg.put(entity_path + "/logs/configuration",
+            [this](auto & req, auto & res) {
+              log_handlers_->handle_put_logs_configuration(req, res);
+            })
+        .tag("Logs")
+        .summary(std::string("Update log configuration for ") + et.singular)
+        .description(std::string("Updates the log severity filter and max entries for this ") + et.singular + ".")
+        .request_body("Log configuration", SB::ref("LogConfiguration"))
+        .response(204, "Configuration updated")
+        .operation_id(std::string("set") + capitalize(et.singular) + "LogConfiguration");
+
+    // --- Bulk Data ---
+    reg.get(entity_path + "/bulk-data",
+            [this](auto & req, auto & res) {
+              bulkdata_handlers_->handle_list_categories(req, res);
+            })
+        .tag("Bulk Data")
+        .summary(std::string("List bulk-data categories for ") + et.singular)
+        .description(std::string("Lists bulk-data categories (e.g., rosbag snapshots) for this ") + et.singular + ".")
+        .response(200, "Category list", SB::ref("BulkDataCategoryList"))
+        .operation_id(std::string("list") + capitalize(et.singular) + "BulkDataCategories");
+
+    reg.get(entity_path + "/bulk-data/{category_id}",
+            [this](auto & req, auto & res) {
+              bulkdata_handlers_->handle_list_descriptors(req, res);
+            })
+        .tag("Bulk Data")
+        .summary(std::string("List bulk-data descriptors for ") + et.singular)
+        .description(std::string("Lists downloadable files in a bulk-data category for this ") + et.singular + ".")
+        .response(200, "Descriptor list", SB::ref("BulkDataDescriptorList"))
+        .operation_id(std::string("list") + capitalize(et.singular) + "BulkDataDescriptors");
+
+    reg.get(entity_path + "/bulk-data/{category_id}/{file_id}",
+            [this](auto & req, auto & res) {
+              bulkdata_handlers_->handle_download(req, res);
+            })
+        .tag("Bulk Data")
+        .summary(std::string("Download bulk-data file for ") + et.singular)
+        .description("Downloads a bulk-data file (binary content).")
+        .response(200, "File content", SB::binary_schema())
+        .operation_id(std::string("download") + capitalize(et.singular) + "BulkData");
+
+    // Upload: only for apps and components (405 for areas and functions)
+    std::string et_type_str = et.type;
+    if (et_type_str == "apps" || et_type_str == "components") {
+      reg.post(entity_path + "/bulk-data/{category_id}",
+               [this](auto & req, auto & res) {
+                 bulkdata_handlers_->handle_upload(req, res);
+               })
+          .tag("Bulk Data")
+          .summary(std::string("Upload bulk-data for ") + et.singular)
+          .description(std::string("Uploads a file to a bulk-data category for this ") + et.singular + ".")
+          .request_body("File to upload", SB::binary_schema(), "multipart/form-data")
+          .response(201, "File uploaded", SB::ref("BulkDataDescriptor"))
+          .operation_id(std::string("upload") + capitalize(et.singular) + "BulkData");
+
+      reg.del(entity_path + "/bulk-data/{category_id}/{file_id}",
+              [this](auto & req, auto & res) {
+                bulkdata_handlers_->handle_delete(req, res);
+              })
+          .tag("Bulk Data")
+          .summary(std::string("Delete bulk-data file for ") + et.singular)
+          .description(std::string("Deletes a bulk-data file for this ") + et.singular + ".")
+          .response(204, "File deleted")
+          .operation_id(std::string("delete") + capitalize(et.singular) + "BulkData");
+    } else {
+      reg.post(entity_path + "/bulk-data/{category_id}",
+               [this](auto & /*req*/, auto & res) {
+                 handlers::HandlerContext::send_error(res, 405, ERR_INVALID_REQUEST,
+                                                      "Bulk data upload is only supported for components and apps");
+               })
+          .tag("Bulk Data")
+          .summary(std::string("Upload bulk-data for ") + et.singular + " (not supported)")
+          .description("Bulk data upload is not supported for this entity type.")
+          .response(405, "Method not allowed")
+          .hidden();  // Always returns 405 - exclude from OpenAPI spec and generated clients
+
+      reg.del(entity_path + "/bulk-data/{category_id}/{file_id}",
+              [this](auto & /*req*/, auto & res) {
+                handlers::HandlerContext::send_error(res, 405, ERR_INVALID_REQUEST,
+                                                     "Bulk data deletion is only supported for components and apps");
+              })
+          .tag("Bulk Data")
+          .summary(std::string("Delete bulk-data file for ") + et.singular + " (not supported)")
+          .description("Bulk data deletion is not supported for this entity type.")
+          .response(405, "Method not allowed")
+          .hidden();  // Always returns 405 - exclude from OpenAPI spec and generated clients
+    }
+
+    // --- Triggers (ALL entity types - x-medkit extension beyond SOVD) ---
+    {
+      auto trigger_501 = [](auto & /*req*/, auto & res) {
+        handlers::HandlerContext::send_error(res, 501, ERR_NOT_IMPLEMENTED, "Triggers not available");
+      };
+
+      // SSE events stream - registered before CRUD routes
+      reg.get(entity_path + "/triggers/{trigger_id}/events",
+              [this, trigger_501](auto & req, auto & res) {
+                if (!trigger_handlers_) {
+                  trigger_501(req, res);
+                  return;
+                }
+                trigger_handlers_->handle_events(req, res);
+              })
+          .tag("Triggers")
+          .summary(std::string("SSE events stream for trigger on ") + et.singular)
+          .description(std::string("Server-Sent Events stream for trigger notifications on this ") + et.singular + ".")
+          .operation_id(std::string("stream") + capitalize(et.singular) + "TriggerEvents");
+
+      reg.post(entity_path + "/triggers",
+               [this, trigger_501](auto & req, auto & res) {
+                 if (!trigger_handlers_) {
+                   trigger_501(req, res);
+                   return;
+                 }
+                 trigger_handlers_->handle_create(req, res);
+               })
+          .tag("Triggers")
+          .summary(std::string("Create trigger for ") + et.singular)
+          .description(std::string("Creates a new event trigger for this ") + et.singular + ".")
+          .request_body("Trigger configuration", SB::ref("Trigger"))
+          .response(201, "Trigger created", SB::ref("Trigger"))
+          .operation_id(std::string("create") + capitalize(et.singular) + "Trigger");
+
+      reg.get(entity_path + "/triggers",
+              [this, trigger_501](auto & req, auto & res) {
+                if (!trigger_handlers_) {
+                  trigger_501(req, res);
+                  return;
+                }
+                trigger_handlers_->handle_list(req, res);
+              })
+          .tag("Triggers")
+          .summary(std::string("List triggers for ") + et.singular)
+          .description(std::string("Lists all triggers configured for this ") + et.singular + ".")
+          .response(200, "Trigger list", SB::ref("TriggerList"))
+          .operation_id(std::string("list") + capitalize(et.singular) + "Triggers");
+
+      reg.get(entity_path + "/triggers/{trigger_id}",
+              [this, trigger_501](auto & req, auto & res) {
+                if (!trigger_handlers_) {
+                  trigger_501(req, res);
+                  return;
+                }
+                trigger_handlers_->handle_get(req, res);
+              })
+          .tag("Triggers")
+          .summary(std::string("Get trigger for ") + et.singular)
+          .description(std::string("Returns details of a specific trigger on this ") + et.singular + ".")
+          .response(200, "Trigger details", SB::ref("Trigger"))
+          .operation_id(std::string("get") + capitalize(et.singular) + "Trigger");
+
+      reg.put(entity_path + "/triggers/{trigger_id}",
+              [this, trigger_501](auto & req, auto & res) {
+                if (!trigger_handlers_) {
+                  trigger_501(req, res);
+                  return;
+                }
+                trigger_handlers_->handle_update(req, res);
+              })
+          .tag("Triggers")
+          .summary(std::string("Update trigger for ") + et.singular)
+          .description(std::string("Updates a trigger configuration on this ") + et.singular + ".")
+          .request_body("Trigger update", SB::ref("Trigger"))
+          .response(200, "Updated trigger", SB::ref("Trigger"))
+          .operation_id(std::string("update") + capitalize(et.singular) + "Trigger");
+
+      reg.del(entity_path + "/triggers/{trigger_id}",
+              [this, trigger_501](auto & req, auto & res) {
+                if (!trigger_handlers_) {
+                  trigger_501(req, res);
+                  return;
+                }
+                trigger_handlers_->handle_delete(req, res);
+              })
+          .tag("Triggers")
+          .summary(std::string("Delete trigger for ") + et.singular)
+          .description(std::string("Deletes a trigger from this ") + et.singular + ".")
+          .response(204, "Trigger deleted")
+          .operation_id(std::string("delete") + capitalize(et.singular) + "Trigger");
+    }
+
+    // --- Cyclic Subscriptions (apps, components, and functions) ---
+    if (et_type_str == "apps" || et_type_str == "components" || et_type_str == "functions") {
+      // SSE events stream - registered before CRUD routes
+      reg.get(entity_path + "/cyclic-subscriptions/{subscription_id}/events",
+              [this](auto & req, auto & res) {
+                cyclic_sub_handlers_->handle_events(req, res);
+              })
+          .tag("Subscriptions")
+          .summary(std::string("SSE events stream for cyclic subscription on ") + et.singular)
+          .description(std::string("Server-Sent Events stream for subscription data on this ") + et.singular + ".")
+          .operation_id(std::string("stream") + capitalize(et.singular) + "SubscriptionEvents");
+
+      reg.post(entity_path + "/cyclic-subscriptions",
+               [this](auto & req, auto & res) {
+                 cyclic_sub_handlers_->handle_create(req, res);
+               })
+          .tag("Subscriptions")
+          .summary(std::string("Create cyclic subscription for ") + et.singular)
+          .description(std::string("Creates a new cyclic data subscription for this ") + et.singular + ".")
+          .request_body("Subscription configuration", SB::ref("CyclicSubscription"))
+          .response(201, "Subscription created", SB::ref("CyclicSubscription"))
+          .operation_id(std::string("create") + capitalize(et.singular) + "Subscription");
+
+      reg.get(entity_path + "/cyclic-subscriptions",
+              [this](auto & req, auto & res) {
+                cyclic_sub_handlers_->handle_list(req, res);
+              })
+          .tag("Subscriptions")
+          .summary(std::string("List cyclic subscriptions for ") + et.singular)
+          .description(std::string("Lists all cyclic subscriptions for this ") + et.singular + ".")
+          .response(200, "Subscription list", SB::ref("CyclicSubscriptionList"))
+          .operation_id(std::string("list") + capitalize(et.singular) + "Subscriptions");
+
+      reg.get(entity_path + "/cyclic-subscriptions/{subscription_id}",
+              [this](auto & req, auto & res) {
+                cyclic_sub_handlers_->handle_get(req, res);
+              })
+          .tag("Subscriptions")
+          .summary(std::string("Get cyclic subscription for ") + et.singular)
+          .description(std::string("Returns details of a specific subscription on this ") + et.singular + ".")
+          .response(200, "Subscription details", SB::ref("CyclicSubscription"))
+          .operation_id(std::string("get") + capitalize(et.singular) + "Subscription");
+
+      reg.put(entity_path + "/cyclic-subscriptions/{subscription_id}",
+              [this](auto & req, auto & res) {
+                cyclic_sub_handlers_->handle_update(req, res);
+              })
+          .tag("Subscriptions")
+          .summary(std::string("Update cyclic subscription for ") + et.singular)
+          .description(std::string("Updates a subscription configuration on this ") + et.singular + ".")
+          .request_body("Subscription update", SB::ref("CyclicSubscription"))
+          .response(200, "Updated subscription", SB::ref("CyclicSubscription"))
+          .operation_id(std::string("update") + capitalize(et.singular) + "Subscription");
+
+      reg.del(entity_path + "/cyclic-subscriptions/{subscription_id}",
+              [this](auto & req, auto & res) {
                 cyclic_sub_handlers_->handle_delete(req, res);
-              });
-  srv->Delete((api_path("/components") + R"(/([^/]+)/cyclic-subscriptions/([^/]+)$)"),
-              [this](const httplib::Request & req, httplib::Response & res) {
-                cyclic_sub_handlers_->handle_delete(req, res);
-              });
+              })
+          .tag("Subscriptions")
+          .summary(std::string("Delete cyclic subscription for ") + et.singular)
+          .description(std::string("Deletes a cyclic subscription from this ") + et.singular + ".")
+          .response(204, "Subscription deleted")
+          .operation_id(std::string("delete") + capitalize(et.singular) + "Subscription");
+    }
 
-  // === Software Updates (server-level endpoints, REQ_INTEROP_082-085, 091-094) ===
-  if (update_handlers_) {
-    srv->Get(api_path("/updates"), [this](const httplib::Request & req, httplib::Response & res) {
-      update_handlers_->handle_list_updates(req, res);
-    });
-    srv->Post(api_path("/updates"), [this](const httplib::Request & req, httplib::Response & res) {
-      update_handlers_->handle_register_update(req, res);
-    });
-    // Specific routes before generic /{id}
-    srv->Get((api_path("/updates") + R"(/([^/]+)/status$)"),
-             [this](const httplib::Request & req, httplib::Response & res) {
-               update_handlers_->handle_get_status(req, res);
-             });
-    srv->Put((api_path("/updates") + R"(/([^/]+)/prepare$)"),
-             [this](const httplib::Request & req, httplib::Response & res) {
-               update_handlers_->handle_prepare(req, res);
-             });
-    srv->Put((api_path("/updates") + R"(/([^/]+)/execute$)"),
-             [this](const httplib::Request & req, httplib::Response & res) {
-               update_handlers_->handle_execute(req, res);
-             });
-    srv->Put((api_path("/updates") + R"(/([^/]+)/automated$)"),
-             [this](const httplib::Request & req, httplib::Response & res) {
-               update_handlers_->handle_automated(req, res);
-             });
-    // Generic /{id} routes last
-    srv->Get((api_path("/updates") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
-      update_handlers_->handle_get_update(req, res);
-    });
-    srv->Delete((api_path("/updates") + R"(/([^/]+)$)"), [this](const httplib::Request & req, httplib::Response & res) {
-      update_handlers_->handle_delete_update(req, res);
-    });
+    // --- Locking (components and apps only, per SOVD spec) ---
+    if (et_type_str == "components" || et_type_str == "apps") {
+      reg.post(entity_path + "/locks",
+               [this](auto & req, auto & res) {
+                 lock_handlers_->handle_acquire_lock(req, res);
+               })
+          .tag("Locking")
+          .summary(std::string("Acquire lock on ") + et.singular)
+          .description(std::string("Acquires an exclusive lock on this ") + et.singular + ".")
+          .request_body("Lock parameters", SB::ref("Lock"))
+          .response(201, "Lock acquired", SB::ref("Lock"))
+          .operation_id(std::string("acquire") + capitalize(et.singular) + "Lock");
+
+      reg.get(entity_path + "/locks",
+              [this](auto & req, auto & res) {
+                lock_handlers_->handle_list_locks(req, res);
+              })
+          .tag("Locking")
+          .summary(std::string("List locks on ") + et.singular)
+          .description(std::string("Lists all active locks on this ") + et.singular + ".")
+          .response(200, "Lock list", SB::ref("LockList"))
+          .operation_id(std::string("list") + capitalize(et.singular) + "Locks");
+
+      reg.get(entity_path + "/locks/{lock_id}",
+              [this](auto & req, auto & res) {
+                lock_handlers_->handle_get_lock(req, res);
+              })
+          .tag("Locking")
+          .summary(std::string("Get lock details for ") + et.singular)
+          .description(std::string("Returns details of a specific lock on this ") + et.singular + ".")
+          .response(200, "Lock details", SB::ref("Lock"))
+          .operation_id(std::string("get") + capitalize(et.singular) + "Lock");
+
+      reg.put(entity_path + "/locks/{lock_id}",
+              [this](auto & req, auto & res) {
+                lock_handlers_->handle_extend_lock(req, res);
+              })
+          .tag("Locking")
+          .summary(std::string("Extend lock on ") + et.singular)
+          .description(std::string("Extends the expiration of a lock on this ") + et.singular + ".")
+          .request_body("Lock extension", SB::ref("Lock"))
+          .response(200, "Lock extended", SB::ref("Lock"))
+          .operation_id(std::string("extend") + capitalize(et.singular) + "Lock");
+
+      reg.del(entity_path + "/locks/{lock_id}",
+              [this](auto & req, auto & res) {
+                lock_handlers_->handle_release_lock(req, res);
+              })
+          .tag("Locking")
+          .summary(std::string("Release lock on ") + et.singular)
+          .description(std::string("Releases a lock on this ") + et.singular + ".")
+          .response(204, "Lock released")
+          .operation_id(std::string("release") + capitalize(et.singular) + "Lock");
+    }
+
+    // --- Scripts (apps and components only) ---
+    if (script_handlers_ && (et_type_str == "apps" || et_type_str == "components")) {
+      reg.post(entity_path + "/scripts",
+               [this](auto & req, auto & res) {
+                 script_handlers_->handle_upload_script(req, res);
+               })
+          .tag("Scripts")
+          .summary(std::string("Upload diagnostic script for ") + et.singular)
+          .description(std::string("Uploads a diagnostic script for this ") + et.singular + ".")
+          .request_body("Script file", SB::binary_schema(), "multipart/form-data")
+          .response(201, "Script uploaded", SB::ref("ScriptMetadata"))
+          .operation_id(std::string("upload") + capitalize(et.singular) + "Script");
+
+      reg.get(entity_path + "/scripts",
+              [this](auto & req, auto & res) {
+                script_handlers_->handle_list_scripts(req, res);
+              })
+          .tag("Scripts")
+          .summary(std::string("List scripts for ") + et.singular)
+          .description(std::string("Lists all diagnostic scripts for this ") + et.singular + ".")
+          .response(200, "Script list", SB::ref("ScriptMetadataList"))
+          .operation_id(std::string("list") + capitalize(et.singular) + "Scripts");
+
+      reg.get(entity_path + "/scripts/{script_id}",
+              [this](auto & req, auto & res) {
+                script_handlers_->handle_get_script(req, res);
+              })
+          .tag("Scripts")
+          .summary(std::string("Get script metadata for ") + et.singular)
+          .description(std::string("Returns metadata of a specific script for this ") + et.singular + ".")
+          .response(200, "Script metadata", SB::ref("ScriptMetadata"))
+          .operation_id(std::string("get") + capitalize(et.singular) + "Script");
+
+      reg.del(entity_path + "/scripts/{script_id}",
+              [this](auto & req, auto & res) {
+                script_handlers_->handle_delete_script(req, res);
+              })
+          .tag("Scripts")
+          .summary(std::string("Delete script for ") + et.singular)
+          .description(std::string("Deletes a diagnostic script from this ") + et.singular + ".")
+          .response(204, "Script deleted")
+          .operation_id(std::string("delete") + capitalize(et.singular) + "Script");
+
+      reg.post(entity_path + "/scripts/{script_id}/executions",
+               [this](auto & req, auto & res) {
+                 script_handlers_->handle_start_execution(req, res);
+               })
+          .tag("Scripts")
+          .summary(std::string("Start script execution for ") + et.singular)
+          .description(std::string("Starts execution of a diagnostic script on this ") + et.singular + ".")
+          .request_body("Execution parameters", SB::generic_object_schema())
+          .response(202, "Execution started", SB::ref("ScriptExecution"))
+          .operation_id(std::string("start") + capitalize(et.singular) + "ScriptExecution");
+
+      reg.get(entity_path + "/scripts/{script_id}/executions/{execution_id}",
+              [this](auto & req, auto & res) {
+                script_handlers_->handle_get_execution(req, res);
+              })
+          .tag("Scripts")
+          .summary(std::string("Get execution status for ") + et.singular)
+          .description("Returns the current status of a script execution.")
+          .response(200, "Execution status", SB::ref("ScriptExecution"))
+          .operation_id(std::string("get") + capitalize(et.singular) + "ScriptExecution");
+
+      reg.put(entity_path + "/scripts/{script_id}/executions/{execution_id}",
+              [this](auto & req, auto & res) {
+                script_handlers_->handle_control_execution(req, res);
+              })
+          .tag("Scripts")
+          .summary(std::string("Terminate script execution for ") + et.singular)
+          .description("Sends a control command (e.g., terminate) to a running script execution.")
+          .request_body("Execution control", SB::generic_object_schema())
+          .response(200, "Execution updated", SB::ref("ScriptExecution"))
+          .operation_id(std::string("control") + capitalize(et.singular) + "ScriptExecution");
+
+      reg.del(entity_path + "/scripts/{script_id}/executions/{execution_id}",
+              [this](auto & req, auto & res) {
+                script_handlers_->handle_delete_execution(req, res);
+              })
+          .tag("Scripts")
+          .summary(std::string("Remove completed execution for ") + et.singular)
+          .description("Removes a completed script execution record.")
+          .response(204, "Execution removed")
+          .operation_id(std::string("remove") + capitalize(et.singular) + "ScriptExecution");
+    }
+
+    // --- Discovery relationship endpoints (entity-type-specific) ---
+    if (et_type_str == "areas") {
+      reg.get(entity_path + "/components",
+              [this](auto & req, auto & res) {
+                discovery_handlers_->handle_area_components(req, res);
+              })
+          .tag("Discovery")
+          .summary("List components in area")
+          .description("Lists components belonging to this area.")
+          .response(200, "Component list", SB::ref("EntityList"))
+          .operation_id("listAreaComponents");
+
+      reg.get(entity_path + "/subareas",
+              [this](auto & req, auto & res) {
+                discovery_handlers_->handle_get_subareas(req, res);
+              })
+          .tag("Discovery")
+          .summary("List subareas")
+          .description("Lists subareas within this area.")
+          .response(200, "Subarea list", SB::ref("EntityList"))
+          .operation_id("listSubareas");
+
+      reg.get(entity_path + "/contains",
+              [this](auto & req, auto & res) {
+                discovery_handlers_->handle_get_contains(req, res);
+              })
+          .tag("Discovery")
+          .summary("List entities contained in area")
+          .description("Lists all entities contained in this area.")
+          .response(200, "Contained entities", SB::ref("EntityList"))
+          .operation_id("listAreaContains");
+    }
+
+    if (et_type_str == "components") {
+      reg.get(entity_path + "/subcomponents",
+              [this](auto & req, auto & res) {
+                discovery_handlers_->handle_get_subcomponents(req, res);
+              })
+          .tag("Discovery")
+          .summary("List subcomponents")
+          .description("Lists subcomponents of this component.")
+          .response(200, "Subcomponent list", SB::ref("EntityList"))
+          .operation_id("listSubcomponents");
+
+      reg.get(entity_path + "/hosts",
+              [this](auto & req, auto & res) {
+                discovery_handlers_->handle_get_hosts(req, res);
+              })
+          .tag("Discovery")
+          .summary("List component hosts")
+          .description("Lists apps hosted by this component.")
+          .response(200, "Host list", SB::ref("EntityList"))
+          .operation_id("listComponentHosts");
+
+      reg.get(entity_path + "/depends-on",
+              [this](auto & req, auto & res) {
+                discovery_handlers_->handle_component_depends_on(req, res);
+              })
+          .tag("Discovery")
+          .summary("List component dependencies")
+          .description("Lists components this component depends on.")
+          .response(200, "Dependency list", SB::ref("EntityList"))
+          .operation_id("listComponentDependencies");
+    }
+
+    if (et_type_str == "apps") {
+      reg.get(entity_path + "/is-located-on",
+              [this](auto & req, auto & res) {
+                discovery_handlers_->handle_app_is_located_on(req, res);
+              })
+          .tag("Discovery")
+          .summary("Get app host component")
+          .description("Returns the component hosting this app.")
+          .response(200, "Host component", SB::ref("EntityDetail"))
+          .operation_id("getAppHost");
+
+      reg.get(entity_path + "/depends-on",
+              [this](auto & req, auto & res) {
+                discovery_handlers_->handle_app_depends_on(req, res);
+              })
+          .tag("Discovery")
+          .summary("List app dependencies")
+          .description("Lists apps this app depends on.")
+          .response(200, "Dependency list", SB::ref("EntityList"))
+          .operation_id("listAppDependencies");
+    }
+
+    if (et_type_str == "functions") {
+      reg.get(entity_path + "/hosts",
+              [this](auto & req, auto & res) {
+                discovery_handlers_->handle_function_hosts(req, res);
+              })
+          .tag("Discovery")
+          .summary("List function hosts")
+          .description("Lists components hosting this function.")
+          .response(200, "Host list", SB::ref("EntityList"))
+          .operation_id("listFunctionHosts");
+    }
+
+    // Single entity detail (capabilities) - must be LAST for this entity type
+    reg.get(entity_path, et.detail_handler)
+        .tag("Discovery")
+        .summary(std::string("Get ") + et.singular + " details")
+        .description(std::string("Returns ") + et.singular + " details with capabilities and resource collection URIs.")
+        .response(200, "Entity details with capabilities", SB::ref("EntityDetail"))
+        .operation_id(std::string("get") + capitalize(et.singular));
   }
 
-  // Authentication endpoints (REQ_INTEROP_086, REQ_INTEROP_087)
-  // POST /auth/authorize - Authenticate and get tokens (client_credentials grant)
-  srv->Post(api_path("/auth/authorize"), [this](const httplib::Request & req, httplib::Response & res) {
-    auth_handlers_->handle_auth_authorize(req, res);
-  });
+  // === Nested entities - subareas bulk-data ===
+  reg.get("/areas/{area_id}/subareas/{subarea_id}/bulk-data",
+          [this](auto & req, auto & res) {
+            bulkdata_handlers_->handle_list_categories(req, res);
+          })
+      .tag("Bulk Data")
+      .summary("List bulk-data categories for subarea")
+      .description("Lists bulk-data categories for a subarea.")
+      .response(200, "Category list", SB::ref("BulkDataCategoryList"))
+      .operation_id("listSubareaBulkDataCategories");
 
-  // POST /auth/token - Refresh access token
-  srv->Post(api_path("/auth/token"), [this](const httplib::Request & req, httplib::Response & res) {
-    auth_handlers_->handle_auth_token(req, res);
-  });
+  reg.get("/areas/{area_id}/subareas/{subarea_id}/bulk-data/{category_id}",
+          [this](auto & req, auto & res) {
+            bulkdata_handlers_->handle_list_descriptors(req, res);
+          })
+      .tag("Bulk Data")
+      .summary("List bulk-data descriptors for subarea")
+      .description("Lists bulk-data descriptors for a subarea.")
+      .response(200, "Descriptor list", SB::ref("BulkDataDescriptorList"))
+      .operation_id("listSubareaBulkDataDescriptors");
 
-  // POST /auth/revoke - Revoke a refresh token
-  srv->Post(api_path("/auth/revoke"), [this](const httplib::Request & req, httplib::Response & res) {
-    auth_handlers_->handle_auth_revoke(req, res);
-  });
+  reg.get("/areas/{area_id}/subareas/{subarea_id}/bulk-data/{category_id}/{file_id}",
+          [this](auto & req, auto & res) {
+            bulkdata_handlers_->handle_download(req, res);
+          })
+      .tag("Bulk Data")
+      .summary("Download bulk-data file for subarea")
+      .description("Downloads a bulk-data file for a subarea.")
+      .response(200, "File content", SB::binary_schema())
+      .operation_id("downloadSubareaBulkData");
+
+  // === Nested entities - subcomponents bulk-data ===
+  reg.get("/components/{component_id}/subcomponents/{subcomponent_id}/bulk-data",
+          [this](auto & req, auto & res) {
+            bulkdata_handlers_->handle_list_categories(req, res);
+          })
+      .tag("Bulk Data")
+      .summary("List bulk-data categories for subcomponent")
+      .description("Lists bulk-data categories for a subcomponent.")
+      .response(200, "Category list", SB::ref("BulkDataCategoryList"))
+      .operation_id("listSubcomponentBulkDataCategories");
+
+  reg.get("/components/{component_id}/subcomponents/{subcomponent_id}/bulk-data/{category_id}",
+          [this](auto & req, auto & res) {
+            bulkdata_handlers_->handle_list_descriptors(req, res);
+          })
+      .tag("Bulk Data")
+      .summary("List bulk-data descriptors for subcomponent")
+      .description("Lists bulk-data descriptors for a subcomponent.")
+      .response(200, "Descriptor list", SB::ref("BulkDataDescriptorList"))
+      .operation_id("listSubcomponentBulkDataDescriptors");
+
+  reg.get("/components/{component_id}/subcomponents/{subcomponent_id}/bulk-data/{category_id}/{file_id}",
+          [this](auto & req, auto & res) {
+            bulkdata_handlers_->handle_download(req, res);
+          })
+      .tag("Bulk Data")
+      .summary("Download bulk-data file for subcomponent")
+      .description("Downloads a bulk-data file for a subcomponent.")
+      .response(200, "File content", SB::binary_schema())
+      .operation_id("downloadSubcomponentBulkData");
+
+  // === Global faults ===
+  // SSE stream - must be before /faults to avoid regex conflict
+  reg.get("/faults/stream",
+          [this](auto & req, auto & res) {
+            sse_fault_handler_->handle_stream(req, res);
+          })
+      .tag("Faults")
+      .summary("Stream fault events (SSE)")
+      .description("Server-Sent Events stream for real-time fault notifications.")
+      .operation_id("streamFaults");
+
+  reg.get("/faults",
+          [this](auto & req, auto & res) {
+            fault_handlers_->handle_list_all_faults(req, res);
+          })
+      .tag("Faults")
+      .summary("List all faults globally")
+      .description("Retrieve all faults across the system.")
+      .response(200, "All faults", SB::ref("FaultList"))
+      .operation_id("listAllFaults");
+
+  reg.del("/faults",
+          [this](auto & req, auto & res) {
+            fault_handlers_->handle_clear_all_faults_global(req, res);
+          })
+      .tag("Faults")
+      .summary("Clear all faults globally")
+      .description("Clears all faults across the entire system.")
+      .response(204, "All faults cleared")
+      .operation_id("clearAllFaults");
+
+  // === Software Updates ===
+  // Always register for OpenAPI documentation. Lambdas guard against null update_handlers_.
+  auto update_501 = [](auto & /*req*/, auto & res) {
+    handlers::HandlerContext::send_error(res, 501, ERR_NOT_IMPLEMENTED, "Software updates not available");
+  };
+
+  reg.get("/updates", update_handlers_ ? HandlerFn([this](auto & req, auto & res) {
+            update_handlers_->handle_list_updates(req, res);
+          })
+                                       : HandlerFn(update_501))
+      .tag("Updates")
+      .summary("List software updates")
+      .description("Lists all registered software updates.")
+      .response(200, "Update list", SB::ref("UpdateList"))
+      .operation_id("listUpdates");
+
+  reg.post("/updates", update_handlers_ ? HandlerFn([this](auto & req, auto & res) {
+             update_handlers_->handle_register_update(req, res);
+           })
+                                        : HandlerFn(update_501))
+      .tag("Updates")
+      .summary("Register a software update")
+      .description("Registers a new software update descriptor.")
+      .request_body("Update descriptor", SB::generic_object_schema())
+      .response(201, "Update registered", SB::generic_object_schema())
+      .operation_id("registerUpdate");
+
+  reg.get("/updates/{update_id}/status", update_handlers_ ? HandlerFn([this](auto & req, auto & res) {
+            update_handlers_->handle_get_status(req, res);
+          })
+                                                          : HandlerFn(update_501))
+      .tag("Updates")
+      .summary("Get update status")
+      .description("Returns the current status and progress of an update.")
+      .response(200, "Update status", SB::ref("UpdateStatus"))
+      .operation_id("getUpdateStatus");
+
+  reg.put("/updates/{update_id}/prepare", update_handlers_ ? HandlerFn([this](auto & req, auto & res) {
+            update_handlers_->handle_prepare(req, res);
+          })
+                                                           : HandlerFn(update_501))
+      .tag("Updates")
+      .summary("Prepare update for execution")
+      .description("Prepares an update for execution (downloads, validates).")
+      .request_body("Prepare parameters", SB::generic_object_schema())
+      .response(200, "Update prepared", SB::ref("UpdateStatus"))
+      .operation_id("prepareUpdate");
+
+  reg.put("/updates/{update_id}/execute", update_handlers_ ? HandlerFn([this](auto & req, auto & res) {
+            update_handlers_->handle_execute(req, res);
+          })
+                                                           : HandlerFn(update_501))
+      .tag("Updates")
+      .summary("Execute update")
+      .description("Starts executing a prepared update.")
+      .request_body("Execute parameters", SB::generic_object_schema())
+      .response(200, "Update executing", SB::ref("UpdateStatus"))
+      .operation_id("executeUpdate");
+
+  reg.put("/updates/{update_id}/automated", update_handlers_ ? HandlerFn([this](auto & req, auto & res) {
+            update_handlers_->handle_automated(req, res);
+          })
+                                                             : HandlerFn(update_501))
+      .tag("Updates")
+      .summary("Run automated update")
+      .description("Runs a fully automated update (prepare + execute).")
+      .request_body("Automated parameters", SB::generic_object_schema())
+      .response(200, "Automated update started", SB::ref("UpdateStatus"))
+      .operation_id("automateUpdate");
+
+  reg.get("/updates/{update_id}", update_handlers_ ? HandlerFn([this](auto & req, auto & res) {
+            update_handlers_->handle_get_update(req, res);
+          })
+                                                   : HandlerFn(update_501))
+      .tag("Updates")
+      .summary("Get update details")
+      .description("Returns details of a specific update.")
+      .response(200, "Update details", SB::generic_object_schema())
+      .operation_id("getUpdate");
+
+  reg.del("/updates/{update_id}", update_handlers_ ? HandlerFn([this](auto & req, auto & res) {
+            update_handlers_->handle_delete_update(req, res);
+          })
+                                                   : HandlerFn(update_501))
+      .tag("Updates")
+      .summary("Delete update")
+      .description("Removes an update registration.")
+      .response(204, "Update deleted")
+      .operation_id("deleteUpdate");
+
+  // === Authentication ===
+  reg.post("/auth/authorize",
+           [this](auto & req, auto & res) {
+             auth_handlers_->handle_auth_authorize(req, res);
+           })
+      .tag("Authentication")
+      .summary("Authorize client")
+      .description("Authenticate and obtain authorization tokens.")
+      .request_body("Client credentials", SB::ref("AuthCredentials"))
+      .response(200, "Authorization tokens", SB::ref("AuthTokenResponse"))
+      .operation_id("authorize");
+
+  reg.post("/auth/token",
+           [this](auto & req, auto & res) {
+             auth_handlers_->handle_auth_token(req, res);
+           })
+      .tag("Authentication")
+      .summary("Obtain access token")
+      .description("Exchange credentials or refresh token for a JWT access token.")
+      .request_body("Token request credentials", SB::ref("AuthCredentials"))
+      .response(200, "Access token", SB::ref("AuthTokenResponse"))
+      .operation_id("getToken");
+
+  reg.post("/auth/revoke",
+           [this](auto & req, auto & res) {
+             auth_handlers_->handle_auth_revoke(req, res);
+           })
+      .tag("Authentication")
+      .summary("Revoke token")
+      .description("Revoke an access or refresh token.")
+      .request_body("Token to revoke", SB::generic_object_schema())
+      .response(200, "Token revoked", SB::generic_object_schema())
+      .operation_id("revokeToken");
+
+  // Register all routes with cpp-httplib
+  route_registry_->register_all(*srv, API_BASE_PATH);
 }
 
 void RESTServer::start() {

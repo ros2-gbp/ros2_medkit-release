@@ -42,8 +42,8 @@ project = "ros2_medkit"
 project_copyright = f"{datetime.now().year}, selfpatch"
 author = "selfpatch Team"
 
-version = "0.3.0"
-release = "0.3.0"
+version = "0.4.0"
+release = "0.4.0"
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -111,18 +111,15 @@ needs_types = [
     ),
 ]
 
-needs_links = {
-    "links": {
-        "incoming": "is linked by",
-        "outgoing": "links to",
-    },
-    "verifies": {
+needs_extra_links = [
+    {
+        "option": "verifies",
         "incoming": "is verified by",
         "outgoing": "verifies",
         "copy": False,
         "allow_dead_links": False,
     },
-}
+]
 
 # -- Options for HTML output -------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
@@ -160,4 +157,6 @@ linkcheck_ignore = [
     # avoid 395+ GitHub requests (rate-limiting) and anchor mismatches
     # on branches where files differ from main.
     r"https://github\.com/selfpatch/ros2_medkit/blob/.+#L\d+",
+    # GitHub issue links may 404 in linkcheck without auth token
+    r"https://github\.com/selfpatch/ros2_medkit/issues/\d+",
 ]

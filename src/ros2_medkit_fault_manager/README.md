@@ -44,7 +44,7 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 - **Occurrence tracking**: Counts total reports and tracks all reporting sources
 - **Severity escalation**: Fault severity is updated if a higher severity is reported
 - **Persistent storage**: SQLite backend ensures faults survive node restarts
-- **Debounce filtering** (optional): AUTOSAR DEM-style counter-based fault confirmation
+- **Debounce filtering** (optional): AUTOSAR DEM-style counter-based fault confirmation with per-entity threshold overrides
 - **Snapshot capture**: Captures topic data when faults are confirmed for debugging (snapshots are deleted when fault is cleared)
 - **Fault correlation** (optional): Root cause analysis with symptom muting and auto-clear
 
@@ -58,6 +58,7 @@ ros2 service call /fault_manager/clear_fault ros2_medkit_msgs/srv/ClearFault \
 | `healing_enabled` | bool | `false` | Enable automatic healing via PASSED events |
 | `healing_threshold` | int | `3` | Counter value at which faults are healed |
 | `auto_confirm_after_sec` | double | `0.0` | Auto-confirm PREFAILED faults after timeout (0 = disabled) |
+| `entity_thresholds.config_file` | string | `""` | Path to YAML file with per-entity debounce threshold overrides |
 
 ### Snapshot Parameters
 
@@ -331,6 +332,27 @@ When clearing a root cause fault, `auto_cleared_codes` lists symptoms that were 
 4. Motor faults are muted (not published as events, but stored)
 5. Dashboard shows only `ESTOP_001` (root cause)
 6. When E-Stop is cleared → Motor faults are auto-cleared
+
+## Namespaced Deployment
+
+The fault manager can run in a custom ROS 2 namespace. The gateway resolves service and topic
+names automatically via the `fault_manager.namespace` parameter:
+
+```yaml
+# gateway_params.yaml
+fault_manager:
+  namespace: "robot1"          # -> /robot1/fault_manager/list_faults
+  service_timeout_sec: 5.0
+```
+
+Launch the fault manager in a namespace:
+
+```bash
+ros2 launch ros2_medkit_fault_manager fault_manager.launch.py \
+  namespace:=robot1
+```
+
+Leading slashes are optional - `"robot1"` and `"/robot1"` are equivalent.
 
 ## Building
 
