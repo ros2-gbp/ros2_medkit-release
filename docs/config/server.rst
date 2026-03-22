@@ -123,7 +123,7 @@ Cross-Origin Resource Sharing (CORS) settings for browser-based clients.
      - ``86400``
      - Preflight response cache duration (24 hours).
 
-Example for development with sovd_web_ui:
+Example for development with ros2_medkit_web_ui:
 
 .. code-block:: yaml
 
@@ -148,12 +148,87 @@ Data Access Settings
      - Description
    * - ``max_parallel_topic_samples``
      - int
-     - ``10``
+     - ``20``
      - Max concurrent topic samples. Higher values use more resources. Range: 1-50.
    * - ``topic_sample_timeout_sec``
      - float
-     - ``1.0``
+     - ``2.0``
      - Timeout for sampling topics with active publishers. Range: 0.1-30.0.
+
+.. note::
+
+   The defaults listed above match the recommended gateway configuration in
+   ``src/ros2_medkit_gateway/config/gateway_params.yaml``. If these parameters are
+   not provided at all, the ``DataAccessManager`` fallback defaults are
+   ``max_parallel_topic_samples = 10`` and ``topic_sample_timeout_sec = 1.0``.
+
+Fault Manager Integration
+-------------------------
+
+Configure how the gateway connects to the fault manager services and event topic.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 20 35
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``fault_manager.namespace``
+     - string
+     - ``""``
+     - Optional namespace prefix for fault manager service and event topic resolution.
+       Examples: ``""`` -> ``/fault_manager/list_faults``, ``"robot1"`` -> ``/robot1/fault_manager/list_faults``.
+   * - ``fault_manager.service_timeout_sec``
+     - float
+     - ``5.0``
+     - Timeout for fault manager service calls such as ``list_faults`` and ``get_snapshots``.
+
+When ``fault_manager.namespace`` is set, the gateway also subscribes to the matching
+fault event topic (for example ``/robot1/fault_manager/events`` instead of the default
+``/fault_manager/events``).
+
+Example:
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       fault_manager:
+         namespace: "robot1"
+         service_timeout_sec: 5.0
+
+Logging Configuration
+---------------------
+
+Configure the in-memory log buffer that collects ``/rosout`` messages.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 10 15 50
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``logs.buffer_size``
+     - int
+     - ``200``
+     - Maximum log entries retained per node. Valid range: 1-100000
+       (values outside this range are clamped with a warning).
+
+Example:
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       logs:
+         buffer_size: 500
+
+A ``LogProvider`` plugin can replace the default ``/rosout`` backend.
+See :doc:`/tutorials/plugin-system` for details.
 
 Performance Tuning
 ------------------
@@ -219,7 +294,7 @@ Example:
 
 .. note::
 
-   The gateway uses native rclcpp APIs for all ROS 2 interactions—no ROS 2 CLI
+   The gateway uses native rclcpp APIs for all ROS 2 interactions - no ROS 2 CLI
    dependencies. Topic discovery, sampling, publishing, service calls, and
    action operations are implemented in pure C++ using ros2_medkit_serialization.
 
@@ -239,11 +314,15 @@ Configure limits for SSE-based streaming (fault events and cyclic subscriptions)
    * - ``sse.max_clients``
      - int
      - ``10``
-     - Maximum number of concurrent SSE connections (fault stream + cyclic subscription streams combined).
+     - Maximum number of concurrent SSE connections (fault stream, cyclic subscription streams, and trigger event streams combined).
    * - ``sse.max_subscriptions``
      - int
      - ``100``
      - Maximum number of active cyclic subscriptions across all entities. Returns HTTP 503 when this limit is reached.
+   * - ``sse.max_duration_sec``
+     - int
+     - ``3600``
+     - Maximum allowed subscription duration in seconds. Requests exceeding this are rejected with HTTP 400.
 
 Example:
 
@@ -254,6 +333,192 @@ Example:
        sse:
          max_clients: 10
          max_subscriptions: 100
+         max_duration_sec: 3600
+
+Triggers
+--------
+
+Configure condition-based push notifications for resource changes.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 10 25 35
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``triggers.enabled``
+     - bool
+     - ``true``
+     - Enable/disable the trigger subsystem. When disabled, trigger endpoints
+       return HTTP 501.
+   * - ``triggers.max_triggers``
+     - int
+     - ``1000``
+     - Maximum number of concurrent triggers across all entities. Returns
+       HTTP 503 when this limit is reached.
+   * - ``triggers.on_restart_behavior``
+     - string
+     - ``"reset"``
+     - Behavior on gateway restart for persistent triggers. ``"reset"`` clears
+       all triggers on restart. ``"restore"`` reloads persistent triggers from
+       the storage database.
+   * - ``triggers.storage.path``
+     - string
+     - ``""``
+     - Path to SQLite database for persistent trigger storage. When empty
+       (default), triggers are stored in-memory only and lost on restart.
+
+Example:
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       triggers:
+         enabled: true
+         max_triggers: 1000
+         on_restart_behavior: "restore"
+         storage:
+           path: "/var/lib/ros2_medkit/triggers.db"
+
+Rate Limiting
+-------------
+
+Token-bucket-based rate limiting for API requests. Disabled by default.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 15 40
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``rate_limiting.enabled``
+     - bool
+     - ``false``
+     - Enable rate limiting.
+   * - ``rate_limiting.global_requests_per_minute``
+     - int
+     - ``600``
+     - Maximum RPM across all clients combined.
+   * - ``rate_limiting.client_requests_per_minute``
+     - int
+     - ``60``
+     - Maximum RPM per client IP.
+   * - ``rate_limiting.endpoint_limits``
+     - string[]
+     - ``[]``
+     - Per-endpoint overrides as ``"pattern:rpm"`` strings.
+       Pattern uses ``*`` as single-segment wildcard
+       (e.g., ``"/api/v1/*/operations/*:10"``).
+   * - ``rate_limiting.client_cleanup_interval_seconds``
+     - int
+     - ``300``
+     - How often to scan and remove idle client tracking entries (seconds).
+   * - ``rate_limiting.client_max_idle_seconds``
+     - int
+     - ``600``
+     - Remove client entries idle longer than this (seconds).
+
+Example:
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       rate_limiting:
+         enabled: true
+         global_requests_per_minute: 600
+         client_requests_per_minute: 60
+         endpoint_limits: ["/api/v1/*/operations/*:10"]
+
+See :doc:`/api/rest` for rate limiting response headers and 429 behavior.
+
+Authentication
+--------------
+
+JWT-based authentication with Role-Based Access Control (RBAC). Disabled by
+default for local development.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 25 30
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``auth.enabled``
+     - bool
+     - ``false``
+     - Enable/disable JWT authentication.
+   * - ``auth.jwt_secret``
+     - string
+     - ``""``
+     - JWT signing secret. For HS256: the shared secret string. For RS256: path to the private key file (PEM format).
+   * - ``auth.jwt_public_key``
+     - string
+     - ``""``
+     - Path to public key file for RS256. Required for RS256, optional for HS256.
+   * - ``auth.jwt_algorithm``
+     - string
+     - ``"HS256"``
+     - JWT signing algorithm: ``"HS256"`` (symmetric) or ``"RS256"`` (asymmetric).
+   * - ``auth.token_expiry_seconds``
+     - int
+     - ``3600``
+     - Access token validity period in seconds (1 hour).
+   * - ``auth.refresh_token_expiry_seconds``
+     - int
+     - ``86400``
+     - Refresh token validity period in seconds (24 hours). Must be >= ``token_expiry_seconds``.
+   * - ``auth.require_auth_for``
+     - string
+     - ``"write"``
+     - When to require authentication: ``"none"`` (auth endpoints still available), ``"write"`` (POST/PUT/DELETE only), or ``"all"`` (every request).
+   * - ``auth.issuer``
+     - string
+     - ``"ros2_medkit_gateway"``
+     - JWT issuer claim (``iss`` field in tokens).
+   * - ``auth.clients``
+     - string[]
+     - ``[]``
+     - Pre-configured clients as ``"client_id:client_secret:role"`` strings.
+
+.. note::
+
+   RBAC roles and their permissions:
+
+   - **viewer** - Read-only access (GET on areas, components, data, faults)
+   - **operator** - Viewer + trigger operations, acknowledge faults, publish data
+   - **configurator** - Operator + modify/reset configurations
+   - **admin** - Full access including auth management
+
+.. danger::
+
+   The example below uses **placeholder secrets for illustration only**.
+   In production, generate secrets with ``openssl rand -base64 32`` and
+   never commit them to configuration files. Use environment variable
+   substitution or a secrets manager.
+
+Example:
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       auth:
+         enabled: true
+         jwt_secret: "CHANGE-ME-use-openssl-rand-base64-32"
+         jwt_algorithm: "HS256"
+         require_auth_for: "write"
+         token_expiry_seconds: 3600
+         clients: ["admin:REPLACE_WITH_STRONG_SECRET:admin", "viewer:REPLACE_WITH_STRONG_SECRET:viewer"]
+
+See :doc:`/tutorials/authentication` for a complete setup tutorial.
 
 Plugin Framework
 ----------------
@@ -364,6 +629,170 @@ Complete Example
        sse:
          max_clients: 10
          max_subscriptions: 100
+         max_duration_sec: 3600
+
+       triggers:
+         enabled: true
+         max_triggers: 1000
+         on_restart_behavior: "reset"
+
+       logs:
+         buffer_size: 200
+
+       plugins: ["my_ota_plugin"]
+       plugins.my_ota_plugin.path: "/opt/ros2_medkit/lib/libmy_ota_plugin.so"
+
+       updates:
+         enabled: true
+
+       auth:
+         enabled: true
+         jwt_secret: "CHANGE-ME-use-openssl-rand-base64-32"
+         jwt_algorithm: "HS256"
+         require_auth_for: "write"
+         clients: ["admin:REPLACE_WITH_STRONG_SECRET:admin"]
+
+       rate_limiting:
+         enabled: false
+
+       scripts:
+         scripts_dir: "/var/ros2_medkit/scripts"
+         allow_uploads: true
+         max_concurrent_executions: 5
+
+API Documentation
+-----------------
+
+Configure the self-describing OpenAPI capability description endpoint.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 15 45
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``docs.enabled``
+     - bool
+     - ``true``
+     - Enable/disable ``/docs`` capability description endpoints. When disabled,
+       all ``/docs`` endpoints return HTTP 501.
+
+**Build option:** ``ENABLE_SWAGGER_UI``
+
+Set ``-DENABLE_SWAGGER_UI=ON`` during CMake configure to embed Swagger UI assets
+in the gateway binary. This provides an interactive API browser at
+``/api/v1/swagger-ui``. Requires network access to download assets from unpkg.com
+during configure. Disabled by default.
+
+Example:
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       docs:
+         enabled: true
+
+Scripts
+-------
+
+Diagnostic scripts: upload, manage, and execute scripts on entities. Set
+``scripts.scripts_dir`` to a directory path to enable the feature. When left
+empty, all script endpoints return HTTP 501.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 35 10 15 40
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``scripts.scripts_dir``
+     - string
+     - ``""``
+     - Directory for storing uploaded scripts. Empty string disables the feature.
+   * - ``scripts.allow_uploads``
+     - bool
+     - ``true``
+     - Allow uploading scripts via HTTP. Set to ``false`` for hardened deployments that only use manifest-defined scripts.
+   * - ``scripts.max_file_size_mb``
+     - int
+     - ``10``
+     - Maximum uploaded script file size in megabytes.
+   * - ``scripts.max_concurrent_executions``
+     - int
+     - ``5``
+     - Maximum number of scripts executing concurrently.
+   * - ``scripts.default_timeout_sec``
+     - int
+     - ``300``
+     - Default timeout per execution in seconds (5 minutes).
+   * - ``scripts.max_execution_history``
+     - int
+     - ``100``
+     - Maximum number of completed executions to keep in memory. Oldest completed entries are evicted when this limit is exceeded.
+
+Example:
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       scripts:
+         scripts_dir: "/var/ros2_medkit/scripts"
+         allow_uploads: true
+         max_file_size_mb: 10
+         max_concurrent_executions: 5
+         default_timeout_sec: 300
+
+Locking
+-------
+
+SOVD resource locking (ISO 17978-3, Section 7.17). Clients acquire locks on
+components and apps to prevent concurrent modification.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 15 15 30
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``locking.enabled``
+     - bool
+     - ``true``
+     - Enable the LockManager and lock endpoints
+   * - ``locking.default_max_expiration``
+     - int
+     - ``3600``
+     - Maximum lock TTL in seconds
+   * - ``locking.cleanup_interval``
+     - int
+     - ``30``
+     - Seconds between expired lock cleanup sweeps
+   * - ``locking.defaults.components.lock_required_scopes``
+     - [string]
+     - ``[""]``
+     - Collections requiring a lock on components (empty = no requirement)
+   * - ``locking.defaults.components.breakable``
+     - bool
+     - ``true``
+     - Whether component locks can be broken
+   * - ``locking.defaults.apps.lock_required_scopes``
+     - [string]
+     - ``[""]``
+     - Collections requiring a lock on apps (empty = no requirement)
+   * - ``locking.defaults.apps.breakable``
+     - bool
+     - ``true``
+     - Whether app locks can be broken
+
+Per-entity overrides are configured in the manifest ``lock:`` section.
+See :doc:`manifest-schema` and :doc:`/api/locking`.
 
 See Also
 --------

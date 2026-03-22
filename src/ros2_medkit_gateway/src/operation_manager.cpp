@@ -20,6 +20,7 @@
 #include <set>
 #include <sstream>
 
+#include "ros2_medkit_gateway/resource_change_notifier.hpp"
 #include "ros2_medkit_serialization/json_serializer.hpp"
 #include "ros2_medkit_serialization/message_cleanup.hpp"
 #include "ros2_medkit_serialization/serialization_error.hpp"
@@ -42,6 +43,10 @@ OperationManager::OperationManager(rclcpp::Node * node, DiscoveryManager * disco
   , service_call_timeout_sec_(
         static_cast<int>(node->declare_parameter<int64_t>("service_call_timeout_sec", kDefaultServiceCallTimeoutSec))) {
   RCLCPP_INFO(node_->get_logger(), "OperationManager initialized with native serialization");
+}
+
+void OperationManager::set_notifier(ResourceChangeNotifier * notifier) {
+  notifier_ = notifier;
 }
 
 bool OperationManager::is_valid_message_type(const std::string & type) {
@@ -366,12 +371,13 @@ OperationManager::ActionClientSet & OperationManager::get_or_create_action_clien
 }
 
 void OperationManager::track_goal(const std::string & goal_id, const std::string & action_path,
-                                  const std::string & action_type) {
+                                  const std::string & action_type, const std::string & entity_id) {
   std::lock_guard<std::mutex> lock(goals_mutex_);
   ActionGoalInfo info;
   info.goal_id = goal_id;
   info.action_path = action_path;
   info.action_type = action_type;
+  info.entity_id = entity_id;
   info.status = ActionGoalStatus::ACCEPTED;
   info.created_at = std::chrono::system_clock::now();
   info.last_update = info.created_at;
@@ -379,7 +385,8 @@ void OperationManager::track_goal(const std::string & goal_id, const std::string
 }
 
 ActionSendGoalResult OperationManager::send_action_goal(const std::string & action_path,
-                                                        const std::string & action_type, const json & goal) {
+                                                        const std::string & action_type, const json & goal,
+                                                        const std::string & entity_id) {
   ActionSendGoalResult result;
   result.success = false;
   result.goal_accepted = false;
@@ -455,7 +462,7 @@ ActionSendGoalResult OperationManager::send_action_goal(const std::string & acti
 
     if (result.goal_accepted) {
       result.goal_id = uuid_bytes_to_hex(uuid_bytes);
-      track_goal(result.goal_id, action_path, action_type);
+      track_goal(result.goal_id, action_path, action_type, entity_id);
       subscribe_to_action_status(action_path);
       update_goal_status(result.goal_id, ActionGoalStatus::EXECUTING);
       RCLCPP_INFO(node_->get_logger(), "Action goal accepted with ID: %s", result.goal_id.c_str());
@@ -475,7 +482,7 @@ ActionSendGoalResult OperationManager::send_action_goal(const std::string & acti
 ActionSendGoalResult OperationManager::send_component_action_goal(const std::string & component_ns,
                                                                   const std::string & operation_name,
                                                                   const std::optional<std::string> & action_type,
-                                                                  const json & goal) {
+                                                                  const json & goal, const std::string & entity_id) {
   ActionSendGoalResult result;
 
   // Determine action type - use provided or look up from discovery
@@ -516,7 +523,7 @@ ActionSendGoalResult OperationManager::send_component_action_goal(const std::str
     return result;
   }
 
-  return send_action_goal(action_path, resolved_type, goal);
+  return send_action_goal(action_path, resolved_type, goal, entity_id);
 }
 
 ActionCancelResult OperationManager::cancel_action_goal(const std::string & action_path, const std::string & goal_id) {
@@ -886,6 +893,14 @@ void OperationManager::on_action_status(const std::string & action_path,
                     action_status_to_string(it->second.status).c_str(), action_status_to_string(new_status).c_str());
         it->second.status = new_status;
         it->second.last_update = std::chrono::system_clock::now();
+
+        if (notifier_) {
+          nlohmann::json goal_json;
+          goal_json["goal_id"] = goal_id;
+          goal_json["action_path"] = it->second.action_path;
+          goal_json["status"] = action_status_to_string(new_status);
+          notifier_->notify("operations", it->second.entity_id, goal_id, goal_json);
+        }
       }
     }
   }

@@ -1,4 +1,4 @@
-# Copyright 2025 mfaferek93
+# Copyright 2025-2026 mfaferek93, bburda
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,6 +19,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+find_package(ros2_medkit_cmake REQUIRED)
+include(ROS2MedkitCcache)
+include(ROS2MedkitLinting)
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
 endif()
@@ -33,8 +37,6 @@ endif()
 
 find_package(ament_cmake REQUIRED)
 
-# Multi-distro compatibility (Humble / Jazzy / Rolling)
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
 include(ROS2MedkitCompat)
 
 find_package(rclcpp REQUIRED)
@@ -85,9 +87,10 @@ if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)
 
   set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
-  set(ament_cmake_clang_tidy_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-tidy")
-  list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_uncrustify ament_cmake_cpplint)
+  list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_uncrustify ament_cmake_cpplint ament_cmake_clang_tidy)
   ament_lint_auto_find_test_dependencies()
+
+  ros2_medkit_clang_tidy()
 
   # Unit tests
   ament_add_gtest(test_local_filter test/test_local_filter.cpp)

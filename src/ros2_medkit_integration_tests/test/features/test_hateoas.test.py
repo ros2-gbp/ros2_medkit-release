@@ -16,13 +16,15 @@
 """Feature tests for HATEOAS compliance (hrefs, capability URIs, links).
 
 Validates that list responses include href fields, entity details include
-capability URIs, subareas/subcomponents/contains/hosts/depends-on endpoints
-return proper link structures, and x-medkit extensions are present.
+capability URIs, subareas/subcomponents/contains/hosts/depends-on/is-located-on
+endpoints return proper link structures, and x-medkit extensions are present.
 
 """
 
+import os
 import unittest
 
+from ament_index_python.packages import get_package_share_directory
 import launch_testing
 import launch_testing.actions
 import requests
@@ -38,9 +40,19 @@ from ros2_medkit_test_utils.launch_helpers import (
 
 
 def generate_test_description():
+    pkg_share = get_package_share_directory('ros2_medkit_gateway')
+    manifest_path = os.path.join(
+        pkg_share, 'config', 'examples', 'demo_nodes_manifest.yaml'
+    )
+
     return create_test_launch(
         demo_nodes=SENSOR_NODES + ACTUATOR_NODES + SERVICE_NODES,
         fault_manager=False,
+        gateway_params={
+            'discovery.mode': 'hybrid',
+            'discovery.manifest_path': manifest_path,
+            'discovery.manifest_strict_validation': False,
+        },
     )
 
 
@@ -172,6 +184,52 @@ class TestHateoas(GatewayTestCase):
         self.assertEqual(data['data'], f'{base}/data')
         self.assertEqual(data['operations'], f'{base}/operations')
         self.assertEqual(data['configurations'], f'{base}/configurations')
+
+    def test_area_detail_has_capability_uris(self):
+        """GET /areas/{id} returns capability URIs including logs and bulk-data.
+
+        ros2_medkit extension: areas support resource collections beyond
+        SOVD spec (which only defines them for apps/components).
+
+        @verifies REQ_INTEROP_003
+        """
+        areas = self.get_json('/areas')['items']
+        self.assertGreater(len(areas), 0)
+
+        area_id = areas[0]['id']
+        data = self.get_json(f'/areas/{area_id}')
+
+        base = f'/api/v1/areas/{area_id}'
+        self.assertIn('data', data, 'Area should have data URI')
+        self.assertEqual(data['data'], f'{base}/data')
+        self.assertIn('logs', data, 'Area should have logs URI')
+        self.assertEqual(data['logs'], f'{base}/logs')
+        self.assertIn('bulk-data', data, 'Area should have bulk-data URI')
+        self.assertEqual(data['bulk-data'], f'{base}/bulk-data')
+
+    def test_function_detail_has_capability_uris(self):
+        """GET /functions/{id} returns capability URIs including logs and bulk-data.
+
+        Requires hybrid discovery mode with a manifest that defines functions.
+
+        @verifies REQ_INTEROP_003
+        """
+        functions = self.get_json('/functions')['items']
+        self.assertGreater(
+            len(functions), 0,
+            'Expected at least one function from manifest'
+        )
+
+        func_id = functions[0]['id']
+        data = self.get_json(f'/functions/{func_id}')
+
+        base = f'/api/v1/functions/{func_id}'
+        self.assertIn('data', data, 'Function should have data URI')
+        self.assertEqual(data['data'], f'{base}/data')
+        self.assertIn('logs', data, 'Function should have logs URI')
+        self.assertEqual(data['logs'], f'{base}/logs')
+        self.assertIn('bulk-data', data, 'Function should have bulk-data URI')
+        self.assertEqual(data['bulk-data'], f'{base}/bulk-data')
 
     # ------------------------------------------------------------------
     # Subareas and subcomponents (test_75-76)
@@ -356,6 +414,47 @@ class TestHateoas(GatewayTestCase):
         self.assertEqual(data['message'], 'App not found')
         self.assertIn('parameters', data)
         self.assertIn('app_id', data['parameters'])
+        self.assertEqual(data['parameters'].get('app_id'), 'nonexistent_app')
+
+    def test_is_located_on_apps_has_href(self):
+        """GET /apps/{id}/is-located-on returns 0-or-1 component hrefs."""
+        # @verifies REQ_INTEROP_105
+        response = requests.get(
+            f'{self.BASE_URL}/apps/temp_sensor/is-located-on',
+            timeout=10
+        )
+        self.assertEqual(response.status_code, 200)
+
+        data = response.json()
+        self.assertIn('items', data)
+        self.assertIn('_links', data)
+        self.assertEqual(data['_links']['self'], '/api/v1/apps/temp_sensor/is-located-on')
+        self.assertEqual(data['_links']['app'], '/api/v1/apps/temp_sensor')
+        self.assertLessEqual(len(data['items']), 1)
+
+        if data['items']:
+            host = data['items'][0]
+            self.assertIn('id', host, "Host component should have 'id'")
+            self.assertIn('name', host, "Host component should have 'name'")
+            self.assertIn('href', host, "Host component should have 'href'")
+            self.assertTrue(
+                host['href'].startswith('/api/v1/components/'),
+                f"href should start with /api/v1/components/, got: {host['href']}"
+            )
+
+    def test_is_located_on_apps_nonexistent(self):
+        """GET /apps/{id}/is-located-on returns 404 for unknown app."""
+        # @verifies REQ_INTEROP_105
+        response = requests.get(
+            f'{self.BASE_URL}/apps/nonexistent_app/is-located-on',
+            timeout=10
+        )
+        self.assertEqual(response.status_code, 404)
+
+        data = response.json()
+        self.assertIn('error_code', data)
+        self.assertEqual(data['message'], 'App not found')
+        self.assertIn('parameters', data)
         self.assertEqual(data['parameters'].get('app_id'), 'nonexistent_app')
 
     # ------------------------------------------------------------------

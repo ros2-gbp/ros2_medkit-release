@@ -15,12 +15,20 @@
 #include <gtest/gtest.h>
 #include <httplib.h>  // NOLINT(build/include_order)
 
+#include <arpa/inet.h>
 #include <chrono>
+#include <cstdio>
+#include <fstream>
 #include <memory>
+#include <netinet/in.h>
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <string>
+#include <sys/socket.h>
 #include <thread>
+#include <unistd.h>
 
+#include "ros2_medkit_gateway/discovery/models/function.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/http_utils.hpp"
 
@@ -28,6 +36,33 @@ using namespace std::chrono_literals;
 
 // API version prefix - must match rest_server.cpp
 static constexpr const char * API_BASE_PATH = "/api/v1";
+
+/// Reserve a free TCP port by binding to port 0, reading the assigned port, then closing the socket.
+/// The port is briefly available for the next caller; works reliably on Linux with SO_REUSEADDR.
+static int reserve_free_port() {
+  int sock = socket(AF_INET, SOCK_STREAM, 0);
+  if (sock < 0) {
+    return 0;
+  }
+  int opt = 1;
+  setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+  if (bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+    close(sock);
+    return 0;
+  }
+  socklen_t len = sizeof(addr);
+  if (getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
+    close(sock);
+    return 0;
+  }
+  int port = ntohs(addr.sin_port);
+  close(sock);
+  return port;
+}
 
 class TestGatewayNode : public ::testing::Test {
  protected:
@@ -40,7 +75,17 @@ class TestGatewayNode : public ::testing::Test {
   }
 
   void SetUp() override {
-    node_ = std::make_shared<ros2_medkit_gateway::GatewayNode>();
+    // Reserve a free port for this test to avoid cross-test port collisions
+    int free_port = reserve_free_port();
+    ASSERT_NE(free_port, 0) << "Failed to reserve a free port for test";
+
+    create_node_with_overrides({rclcpp::Parameter("server.port", free_port)});
+  }
+
+  void create_node_with_overrides(const std::vector<rclcpp::Parameter> & overrides) {
+    rclcpp::NodeOptions options;
+    options.parameter_overrides(overrides);
+    node_ = std::make_shared<ros2_medkit_gateway::GatewayNode>(options);
 
     // Get server configuration from node parameters
     server_host_ = node_->get_parameter("server.host").as_string();
@@ -51,6 +96,9 @@ class TestGatewayNode : public ::testing::Test {
   }
 
   void TearDown() override {
+    for (const auto & path : temp_files_) {
+      std::remove(path.c_str());
+    }
     node_.reset();
   }
 
@@ -75,9 +123,95 @@ class TestGatewayNode : public ::testing::Test {
     return httplib::Client(server_host_, server_port_);
   }
 
+  bool wait_for_subscriber_count(const std::string & topic_name, size_t expected_count,
+                                 std::chrono::milliseconds timeout = 2s) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (node_->count_subscribers(topic_name) == expected_count) {
+        return true;
+      }
+      std::this_thread::sleep_for(20ms);
+    }
+    return node_->count_subscribers(topic_name) == expected_count;
+  }
+
+  std::string write_temp_manifest(const std::string & contents) {
+    char path_template[] = "/tmp/ros2_medkit_gateway_manifest_XXXXXX";
+    int fd = mkstemp(path_template);
+    EXPECT_GE(fd, 0);
+    if (fd >= 0) {
+      close(fd);
+    }
+
+    std::ofstream out(path_template);
+    out << contents;
+    out.close();
+    temp_files_.emplace_back(path_template);
+    return path_template;
+  }
+
+  void load_function_fixture(const std::string & function_id) {
+    const std::string manifest =
+        "manifest_version: \"1.0\"\n"
+        "functions:\n"
+        "  - id: \"" +
+        function_id +
+        "\"\n"
+        "    name: \"Function Test\"\n";
+
+    ros2_medkit_gateway::DiscoveryConfig config;
+    config.mode = ros2_medkit_gateway::DiscoveryMode::MANIFEST_ONLY;
+    config.manifest_path = write_temp_manifest(manifest);
+    config.manifest_strict_validation = false;
+
+    ASSERT_TRUE(node_->get_discovery_manager()->initialize(config));
+
+    ros2_medkit_gateway::Function func;
+    func.id = function_id;
+    func.name = "Function Test";
+    auto & cache = const_cast<ros2_medkit_gateway::ThreadSafeEntityCache &>(node_->get_thread_safe_cache());
+    cache.update_functions({func});
+  }
+
+  void load_app_location_fixture() {
+    const std::string manifest = R"(
+manifest_version: "1.0"
+areas:
+  - id: "vehicle"
+    name: "Vehicle"
+components:
+  - id: "main_ecu"
+    name: "Main ECU"
+    area: "vehicle"
+    namespace: "/vehicle"
+apps:
+  - id: "planner"
+    name: "Planner"
+    is_located_on: "main_ecu"
+  - id: "standalone"
+    name: "Standalone"
+)";
+
+    ros2_medkit_gateway::DiscoveryConfig config;
+    config.mode = ros2_medkit_gateway::DiscoveryMode::MANIFEST_ONLY;
+    config.manifest_path = write_temp_manifest(manifest);
+    config.manifest_strict_validation = false;
+
+    ASSERT_TRUE(node_->get_discovery_manager()->initialize(config));
+
+    auto areas = node_->get_discovery_manager()->discover_areas();
+    auto components = node_->get_discovery_manager()->discover_components();
+    auto apps = node_->get_discovery_manager()->discover_apps();
+    auto functions = node_->get_discovery_manager()->discover_functions();
+
+    auto & cache = const_cast<ros2_medkit_gateway::ThreadSafeEntityCache &>(node_->get_thread_safe_cache());
+    cache.update_all(areas, components, apps, functions);
+  }
+
   std::shared_ptr<ros2_medkit_gateway::GatewayNode> node_;
   std::string server_host_;
   int server_port_;
+  std::vector<std::string> temp_files_;
 };
 
 TEST_F(TestGatewayNode, test_health_endpoint) {
@@ -115,6 +249,21 @@ TEST_F(TestGatewayNode, test_root_endpoint) {
   EXPECT_TRUE(json_response["capabilities"]["data_access"]);
 }
 
+TEST_F(TestGatewayNode, test_fault_manager_namespace_configures_event_subscribers) {
+  node_.reset();
+
+  int free_port = reserve_free_port();
+  ASSERT_NE(free_port, 0) << "Failed to reserve a free port for test";
+
+  create_node_with_overrides({
+      rclcpp::Parameter("server.port", free_port),
+      rclcpp::Parameter("fault_manager.namespace", "robot5"),
+  });
+
+  ASSERT_TRUE(wait_for_subscriber_count("/robot5/fault_manager/events", 2u));
+  EXPECT_EQ(node_->count_subscribers("/fault_manager/events"), 0u);
+}
+
 TEST_F(TestGatewayNode, test_version_info_endpoint) {
   // @verifies REQ_INTEROP_001
   auto client = create_client();
@@ -126,13 +275,13 @@ TEST_F(TestGatewayNode, test_version_info_endpoint) {
   EXPECT_EQ(res->get_header_value("Content-Type"), "application/json");
 
   auto json_response = nlohmann::json::parse(res->body);
-  // Check for sovd_info array
-  EXPECT_TRUE(json_response.contains("sovd_info"));
-  EXPECT_TRUE(json_response["sovd_info"].is_array());
-  EXPECT_GE(json_response["sovd_info"].size(), 1);
+  // Check for items array (SOVD-standard wrapper key)
+  EXPECT_TRUE(json_response.contains("items"));
+  EXPECT_TRUE(json_response["items"].is_array());
+  EXPECT_GE(json_response["items"].size(), 1);
 
-  // Check first sovd_info entry
-  const auto & info = json_response["sovd_info"][0];
+  // Check first items entry
+  const auto & info = json_response["items"][0];
   EXPECT_TRUE(info.contains("version"));
   EXPECT_TRUE(info.contains("base_uri"));
   EXPECT_TRUE(info.contains("vendor_info"));
@@ -675,6 +824,27 @@ TEST_F(TestGatewayNode, test_function_nonexistent) {
   EXPECT_EQ(res->status, 404);
 }
 
+TEST_F(TestGatewayNode, test_function_detail_includes_cyclic_subscriptions_capability) {
+  load_function_fixture("graph_func");
+  auto client = create_client();
+
+  auto res = client.Get((std::string(API_BASE_PATH) + "/functions/graph_func").c_str());
+
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+
+  auto body = nlohmann::json::parse(res->body);
+  ASSERT_TRUE(body.contains("cyclic-subscriptions"));
+  EXPECT_EQ(body["cyclic-subscriptions"], "/api/v1/functions/graph_func/cyclic-subscriptions");
+
+  ASSERT_TRUE(body.contains("capabilities"));
+  const auto & caps = body["capabilities"];
+  auto has_cyclic_subscriptions = std::any_of(caps.begin(), caps.end(), [](const auto & cap) {
+    return cap.contains("name") && cap["name"] == "cyclic-subscriptions";
+  });
+  EXPECT_TRUE(has_cyclic_subscriptions);
+}
+
 TEST_F(TestGatewayNode, test_function_hosts_nonexistent) {
   auto client = create_client();
 
@@ -695,6 +865,24 @@ TEST_F(TestGatewayNode, test_invalid_app_id_bad_request) {
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
+}
+
+// @verifies REQ_INTEROP_105
+TEST_F(TestGatewayNode, test_app_is_located_on_endpoint) {
+  load_app_location_fixture();
+
+  auto client = create_client();
+  auto res = client.Get((std::string(API_BASE_PATH) + "/apps/planner/is-located-on").c_str());
+
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+
+  auto json_response = nlohmann::json::parse(res->body);
+  ASSERT_TRUE(json_response.contains("items"));
+  ASSERT_EQ(json_response["items"].size(), 1);
+  EXPECT_EQ(json_response["items"][0]["id"], "main_ecu");
+  EXPECT_EQ(json_response["_links"]["self"], "/api/v1/apps/planner/is-located-on");
+  EXPECT_EQ(json_response["_links"]["app"], "/api/v1/apps/planner");
 }
 
 TEST_F(TestGatewayNode, test_invalid_function_id_bad_request) {

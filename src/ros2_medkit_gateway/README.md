@@ -12,6 +12,7 @@ The ROS 2 Medkit Gateway exposes ROS 2 system information and data through a RES
 - **REST API**: Standard HTTP/JSON interface
 - **Real-time updates**: Configurable cache refresh for up-to-date system state
 - **Bulk Data Management**: Upload, download, list, and delete bulk data files (calibration, firmware, etc.)
+- **Resource Locking**: SOVD-compliant entity locking with scoped access control, lock breaking, and automatic expiry
 
 ## Endpoints
 
@@ -32,6 +33,7 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 - `GET /api/v1/components/{component_id}/hosts` - List apps hosted on a component
 - `GET /api/v1/components/{component_id}/depends-on` - List component dependencies
 - `GET /api/v1/areas/{area_id}/components` - List components within a specific area
+- `GET /api/v1/apps/{app_id}/is-located-on` - Get the component hosting this app
 
 ### Component Data Endpoints
 
@@ -63,6 +65,58 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 - `GET /api/v1/{entity}/{id}/bulk-data/{category}/{item_id}` - Download a bulk-data file
 - `POST /api/v1/{entity}/{id}/bulk-data/{category}` - Upload bulk data (components/apps only)
 - `DELETE /api/v1/{entity}/{id}/bulk-data/{category}/{item_id}` - Delete bulk data (components/apps only)
+
+### Logging Endpoints
+
+- `GET /api/v1/components/{component_id}/logs` - Query recent log entries for a component (all its nodes, prefix match)
+- `GET /api/v1/apps/{app_id}/logs` - Query recent log entries for a specific app node (exact match)
+- `GET /api/v1/components/{component_id}/logs/configuration` - Get log configuration for a component
+- `GET /api/v1/apps/{app_id}/logs/configuration` - Get log configuration for an app
+- `PUT /api/v1/components/{component_id}/logs/configuration` - Update log configuration for a component
+- `PUT /api/v1/apps/{app_id}/logs/configuration` - Update log configuration for an app
+
+### Locking Endpoints
+
+- `POST /api/v1/{components|apps}/{id}/locks` - Acquire a lock on an entity
+- `GET /api/v1/{components|apps}/{id}/locks` - List active locks on an entity
+- `GET /api/v1/{components|apps}/{id}/locks/{lock_id}` - Get lock details
+- `PUT /api/v1/{components|apps}/{id}/locks/{lock_id}` - Extend lock expiration
+- `DELETE /api/v1/{components|apps}/{id}/locks/{lock_id}` - Release a lock
+
+### Trigger Endpoints
+
+- `POST /api/v1/{entity}/{id}/triggers` - Create a trigger with conditions
+- `GET /api/v1/{entity}/{id}/triggers` - List active triggers
+- `GET /api/v1/{entity}/{id}/triggers/{trigger_id}` - Get trigger details
+- `PUT /api/v1/{entity}/{id}/triggers/{trigger_id}` - Update trigger conditions
+- `DELETE /api/v1/{entity}/{id}/triggers/{trigger_id}` - Delete a trigger
+- `GET /api/v1/{entity}/{id}/triggers/{trigger_id}/events` - SSE stream of trigger events
+
+### Scripts Endpoints
+
+- `GET /api/v1/{entity}/{id}/scripts` - List available diagnostic scripts
+- `POST /api/v1/{entity}/{id}/scripts` - Upload a new script
+- `GET /api/v1/{entity}/{id}/scripts/{script_id}` - Get script details
+- `DELETE /api/v1/{entity}/{id}/scripts/{script_id}` - Delete a script
+- `POST /api/v1/{entity}/{id}/scripts/{script_id}/executions` - Start script execution
+- `GET /api/v1/{entity}/{id}/scripts/{script_id}/executions/{eid}` - Get execution status and output
+- `PUT /api/v1/{entity}/{id}/scripts/{script_id}/executions/{eid}` - Send stdin or control signals
+- `DELETE /api/v1/{entity}/{id}/scripts/{script_id}/executions/{eid}` - Cancel execution
+
+### API Documentation (OpenAPI)
+
+- `GET /api/v1/docs` - Full OpenAPI 3.1.0 specification
+- `GET /api/v1/{entity_type}/{id}/docs` - Entity-scoped OpenAPI spec
+- `GET /api/v1/swagger-ui` - Interactive Swagger UI (requires build with `-DENABLE_SWAGGER_UI=ON`)
+
+### Vendor Extension Endpoints
+
+- `GET /api/v1/{entity}/{id}/x-medkit-topic-beacon` - Topic beacon metadata
+- `GET /api/v1/{entity}/{id}/x-medkit-param-beacon` - Parameter beacon metadata
+- `GET /api/v1/{entity}/{id}/x-medkit-procfs` - Process info (procfs plugin)
+- `GET /api/v1/{entity}/{id}/x-medkit-systemd` - Systemd unit status
+- `GET /api/v1/{entity}/{id}/x-medkit-container` - Container runtime info
+- `GET /api/v1/{entity}/{id}/x-medkit-graph` - ROS 2 graph details
 
 ### API Reference
 
@@ -966,6 +1020,92 @@ ros2 bag info fault_MOTOR_OVERHEAT_1735830000/
 | Query via REST | Yes (structured JSON) | Download only |
 | Default | Enabled | Disabled |
 
+### Logging Endpoints
+
+The gateway collects `/rosout` messages and exposes them via REST. Each node's log entries are stored in a per-node ring buffer (default: 200 entries, configurable via `logs.buffer_size` in `gateway_params.yaml`).
+
+**Query parameters for GET /logs:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `severity` | string | Minimum severity filter: `debug`, `info`, `warning`, `error`, `fatal` |
+| `context`  | string | Substring filter applied to the logger name |
+
+#### GET /api/v1/components/{component_id}/logs
+
+Returns recent log entries for all nodes under the component's namespace (prefix match). Results are capped at `max_entries` (default: 100, configurable per entity via `PUT /logs/configuration`).
+
+```bash
+curl http://localhost:8080/api/v1/components/temp_sensor/logs
+curl "http://localhost:8080/api/v1/components/temp_sensor/logs?severity=warning"
+```
+
+**Response:**
+
+```json
+{
+  "items": [
+    {
+      "id": "log_42",
+      "timestamp": "2026-03-03T12:00:00.000000000Z",
+      "severity": "warning",
+      "message": "Temperature exceeded threshold",
+      "context": {
+        "node": "powertrain/engine/temp_sensor",
+        "function": "publish_temperature",
+        "file": "temp_sensor_node.cpp",
+        "line": 87
+      }
+    }
+  ]
+}
+```
+
+#### GET /api/v1/apps/{app_id}/logs
+
+Same as above but for a single app node (exact logger name match).
+
+```bash
+curl http://localhost:8080/api/v1/apps/temp_sensor/logs
+curl "http://localhost:8080/api/v1/apps/temp_sensor/logs?severity=error&context=engine"
+```
+
+#### GET /api/v1/{entity}/{id}/logs/configuration
+
+Returns the current log configuration for the entity.
+
+```bash
+curl http://localhost:8080/api/v1/components/temp_sensor/logs/configuration
+```
+
+**Response:**
+
+```json
+{
+  "severity_filter": "debug",
+  "max_entries": 100
+}
+```
+
+#### PUT /api/v1/{entity}/{id}/logs/configuration
+
+Updates the log configuration. Both fields are optional; omitted fields are unchanged.
+
+```bash
+curl -X PUT http://localhost:8080/api/v1/components/temp_sensor/logs/configuration \
+  -H "Content-Type: application/json" \
+  -d '{"severity_filter": "warning", "max_entries": 50}'
+```
+
+**Request body:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `severity_filter` | string | Minimum severity stored/returned: `debug`, `info`, `warning`, `error`, `fatal` |
+| `max_entries` | integer > 0 | Maximum entries returned by GET /logs for this entity |
+
+**Response:** `204 No Content`.
+
 ## Quick Start
 
 ### Build
@@ -1021,8 +1161,15 @@ The gateway can be configured via parameters in `config/gateway_params.yaml` or 
 | ---------------------------- | ------ | ----------- | -------------------------------------------------------------------------------------- |
 | `server.host`                | string | `127.0.0.1` | Host to bind the REST server (`127.0.0.1` for localhost, `0.0.0.0` for all interfaces) |
 | `server.port`                | int    | `8080`      | Port for the REST API (range: 1024-65535)                                              |
-| `refresh_interval_ms`        | int    | `2000`      | Cache refresh interval in milliseconds (range: 100-60000)                              |
-| `max_parallel_topic_samples` | int    | `10`        | Max concurrent topic samples when fetching data (range: 1-50)                          |
+| `refresh_interval_ms`        | int    | `10000`     | Cache refresh interval in milliseconds (range: 100-60000)                              |
+| `max_parallel_topic_samples` | int    | `20`        | Max concurrent topic samples when fetching data (range: 1-50)                          |
+| `topic_sample_timeout_sec`   | float  | `2.0`       | Timeout for sampling topics with active publishers (range: 0.1-30.0)                   |
+| `fault_manager.namespace`    | string | `""`        | Optional namespace prefix for fault manager services and events (for example `robot1`)  |
+| `fault_manager.service_timeout_sec`  | float  | `5.0`       | Timeout for fault manager service calls such as `list_faults` and `get_snapshots`      |
+
+These defaults reflect the recommended values from `config/gateway_params.yaml`.
+If the gateway is run without those parameters, the `DataAccessManager` fallback
+defaults are `max_parallel_topic_samples=10` and `topic_sample_timeout_sec=1.0`.
 
 #### SSE (Server-Sent Events) Configuration
 
@@ -1262,7 +1409,7 @@ ros2 launch ros2_medkit_gateway gateway_https.launch.py min_tls_version:=1.3
 | `server_host`         | `127.0.0.1`                | Host to bind HTTPS server                        |
 | `server_port`         | `8443`                     | Port for HTTPS API                               |
 | `min_tls_version`     | `1.2`                      | Minimum TLS version (`1.2` or `1.3`)             |
-| `refresh_interval_ms` | `2000`                     | Cache refresh interval in milliseconds           |
+| `refresh_interval_ms` | `10000`                    | Cache refresh interval in milliseconds           |
 
 **Usage with curl (self-signed certs):**
 ```bash
