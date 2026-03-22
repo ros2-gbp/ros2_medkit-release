@@ -1,4 +1,4 @@
-// Copyright 2025 bburda
+// Copyright 2025-2026 bburda
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,11 +14,18 @@
 
 #include "ros2_medkit_gateway/http/handlers/health_handlers.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 #include "ros2_medkit_gateway/auth/auth_models.hpp"
+#include "ros2_medkit_gateway/discovery/discovery_enums.hpp"
+#include "ros2_medkit_gateway/discovery/discovery_manager.hpp"
+#include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/error_codes.hpp"
 #include "ros2_medkit_gateway/http/http_utils.hpp"
+#include "ros2_medkit_gateway/version.hpp"
+
+#include "../../openapi/route_registry.hpp"
 
 using json = nlohmann::json;
 
@@ -31,6 +38,31 @@ void HealthHandlers::handle_health(const httplib::Request & req, httplib::Respon
   try {
     json response = {{"status", "healthy"}, {"timestamp", std::chrono::system_clock::now().time_since_epoch().count()}};
 
+    // Add discovery info
+    auto * dm = ctx_.node() ? ctx_.node()->get_discovery_manager() : nullptr;
+    if (dm) {
+      json discovery_info = {{"mode", discovery_mode_to_string(dm->get_mode())}, {"strategy", dm->get_strategy_name()}};
+
+      auto report = dm->get_merge_report();
+      if (report) {
+        discovery_info["pipeline"] = report->to_json();
+      }
+
+      auto linking = dm->get_linking_result();
+      if (linking) {
+        json linking_info;
+        linking_info["linked_count"] = linking->node_to_app.size();
+        linking_info["orphan_count"] = linking->orphan_nodes.size();
+        linking_info["binding_conflicts"] = linking->binding_conflicts;
+        if (!linking->warnings.empty()) {
+          linking_info["warnings"] = linking->warnings;
+        }
+        discovery_info["linking"] = linking_info;
+      }
+
+      response["discovery"] = std::move(discovery_info);
+    }
+
     HandlerContext::send_json(res, response);
   } catch (const std::exception & e) {
     HandlerContext::send_error(res, 500, ERR_INTERNAL_ERROR, "Internal server error");
@@ -42,128 +74,36 @@ void HealthHandlers::handle_root(const httplib::Request & req, httplib::Response
   (void)req;  // Unused parameter
 
   try {
-    json endpoints = json::array({
-        // Health & Discovery
-        "GET /api/v1/health",
-        "GET /api/v1/version-info",
-        // Areas
-        "GET /api/v1/areas",
-        "GET /api/v1/areas/{area_id}",
-        "GET /api/v1/areas/{area_id}/subareas",
-        "GET /api/v1/areas/{area_id}/components",
-        "GET /api/v1/areas/{area_id}/contains",
-        "GET /api/v1/areas/{area_id}/data",
-        "GET /api/v1/areas/{area_id}/data/{data_id}",
-        "PUT /api/v1/areas/{area_id}/data/{data_id}",
-        "GET /api/v1/areas/{area_id}/operations",
-        "GET /api/v1/areas/{area_id}/operations/{operation_id}",
-        "POST /api/v1/areas/{area_id}/operations/{operation_id}/executions",
-        "GET /api/v1/areas/{area_id}/operations/{operation_id}/executions",
-        "GET /api/v1/areas/{area_id}/operations/{operation_id}/executions/{execution_id}",
-        "PUT /api/v1/areas/{area_id}/operations/{operation_id}/executions/{execution_id}",
-        "DELETE /api/v1/areas/{area_id}/operations/{operation_id}/executions/{execution_id}",
-        "GET /api/v1/areas/{area_id}/configurations",
-        "GET /api/v1/areas/{area_id}/configurations/{param_name}",
-        "PUT /api/v1/areas/{area_id}/configurations/{param_name}",
-        "DELETE /api/v1/areas/{area_id}/configurations/{param_name}",
-        "DELETE /api/v1/areas/{area_id}/configurations",
-        "GET /api/v1/areas/{area_id}/faults",
-        "GET /api/v1/areas/{area_id}/faults/{fault_code}",
-        "DELETE /api/v1/areas/{area_id}/faults/{fault_code}",
-        "DELETE /api/v1/areas/{area_id}/faults",
-        "GET /api/v1/areas/{area_id}/faults/{fault_code}/snapshots",
-        // Components
-        "GET /api/v1/components",
-        "GET /api/v1/components/{component_id}",
-        "GET /api/v1/components/{component_id}/subcomponents",
-        "GET /api/v1/components/{component_id}/hosts",
-        "GET /api/v1/components/{component_id}/depends-on",
-        "GET /api/v1/components/{component_id}/data",
-        "GET /api/v1/components/{component_id}/data/{data_id}",
-        "PUT /api/v1/components/{component_id}/data/{data_id}",
-        "GET /api/v1/components/{component_id}/operations",
-        "GET /api/v1/components/{component_id}/operations/{operation_id}",
-        "POST /api/v1/components/{component_id}/operations/{operation_id}/executions",
-        "GET /api/v1/components/{component_id}/operations/{operation_id}/executions",
-        "GET /api/v1/components/{component_id}/operations/{operation_id}/executions/{execution_id}",
-        "PUT /api/v1/components/{component_id}/operations/{operation_id}/executions/{execution_id}",
-        "DELETE /api/v1/components/{component_id}/operations/{operation_id}/executions/{execution_id}",
-        "GET /api/v1/components/{component_id}/configurations",
-        "GET /api/v1/components/{component_id}/configurations/{param_name}",
-        "PUT /api/v1/components/{component_id}/configurations/{param_name}",
-        "DELETE /api/v1/components/{component_id}/configurations/{param_name}",
-        "DELETE /api/v1/components/{component_id}/configurations",
-        "GET /api/v1/components/{component_id}/faults",
-        "GET /api/v1/components/{component_id}/faults/{fault_code}",
-        "DELETE /api/v1/components/{component_id}/faults/{fault_code}",
-        "DELETE /api/v1/components/{component_id}/faults",
-        "GET /api/v1/components/{component_id}/faults/{fault_code}/snapshots",
-        // Apps
-        "GET /api/v1/apps",
-        "GET /api/v1/apps/{app_id}",
-        "GET /api/v1/apps/{app_id}/depends-on",
-        "GET /api/v1/apps/{app_id}/data",
-        "GET /api/v1/apps/{app_id}/data/{data_id}",
-        "PUT /api/v1/apps/{app_id}/data/{data_id}",
-        "GET /api/v1/apps/{app_id}/data-categories",
-        "GET /api/v1/apps/{app_id}/data-groups",
-        "GET /api/v1/apps/{app_id}/operations",
-        "GET /api/v1/apps/{app_id}/operations/{operation_id}",
-        "POST /api/v1/apps/{app_id}/operations/{operation_id}/executions",
-        "GET /api/v1/apps/{app_id}/operations/{operation_id}/executions",
-        "GET /api/v1/apps/{app_id}/operations/{operation_id}/executions/{execution_id}",
-        "PUT /api/v1/apps/{app_id}/operations/{operation_id}/executions/{execution_id}",
-        "DELETE /api/v1/apps/{app_id}/operations/{operation_id}/executions/{execution_id}",
-        "GET /api/v1/apps/{app_id}/configurations",
-        "GET /api/v1/apps/{app_id}/configurations/{param_name}",
-        "PUT /api/v1/apps/{app_id}/configurations/{param_name}",
-        "DELETE /api/v1/apps/{app_id}/configurations/{param_name}",
-        "DELETE /api/v1/apps/{app_id}/configurations",
-        "GET /api/v1/apps/{app_id}/faults",
-        "GET /api/v1/apps/{app_id}/faults/{fault_code}",
-        "DELETE /api/v1/apps/{app_id}/faults/{fault_code}",
-        "DELETE /api/v1/apps/{app_id}/faults",
-        "GET /api/v1/apps/{app_id}/faults/{fault_code}/snapshots",
-        // Functions
-        "GET /api/v1/functions",
-        "GET /api/v1/functions/{function_id}",
-        "GET /api/v1/functions/{function_id}/hosts",
-        "GET /api/v1/functions/{function_id}/data",
-        "GET /api/v1/functions/{function_id}/data/{data_id}",
-        "PUT /api/v1/functions/{function_id}/data/{data_id}",
-        "GET /api/v1/functions/{function_id}/operations",
-        "GET /api/v1/functions/{function_id}/operations/{operation_id}",
-        "POST /api/v1/functions/{function_id}/operations/{operation_id}/executions",
-        "GET /api/v1/functions/{function_id}/operations/{operation_id}/executions",
-        "GET /api/v1/functions/{function_id}/operations/{operation_id}/executions/{execution_id}",
-        "PUT /api/v1/functions/{function_id}/operations/{operation_id}/executions/{execution_id}",
-        "DELETE /api/v1/functions/{function_id}/operations/{operation_id}/executions/{execution_id}",
-        "GET /api/v1/functions/{function_id}/configurations",
-        "GET /api/v1/functions/{function_id}/configurations/{param_name}",
-        "PUT /api/v1/functions/{function_id}/configurations/{param_name}",
-        "DELETE /api/v1/functions/{function_id}/configurations/{param_name}",
-        "DELETE /api/v1/functions/{function_id}/configurations",
-        "GET /api/v1/functions/{function_id}/faults",
-        "GET /api/v1/functions/{function_id}/faults/{fault_code}",
-        "DELETE /api/v1/functions/{function_id}/faults/{fault_code}",
-        "DELETE /api/v1/functions/{function_id}/faults",
-        "GET /api/v1/functions/{function_id}/faults/{fault_code}/snapshots",
-        // Global Faults
-        "GET /api/v1/faults",
-        "GET /api/v1/faults/stream",
-        "GET /api/v1/faults/{fault_code}/snapshots",
-        "GET /api/v1/faults/{fault_code}/snapshots/bag",
-    });
+    // Generate endpoint list from route registry (single source of truth)
+    json endpoints = json::array();
+    if (route_registry_) {
+      auto ep_list = route_registry_->to_endpoint_list(API_BASE_PATH);
+      for (auto & ep : ep_list) {
+        endpoints.push_back(std::move(ep));
+      }
+    }
+
+    // Read docs.enabled parameter (defaults to true)
+    bool docs_enabled = true;
+    if (ctx_.node()) {
+      try {
+        docs_enabled = ctx_.node()->get_parameter("docs.enabled").as_bool();
+      } catch (...) {
+        // Parameter may not be declared - default to true
+      }
+    }
+
+    // Add docs endpoints (not in registry - registered directly with server)
+    if (docs_enabled) {
+      endpoints.push_back("GET " + std::string(API_BASE_PATH) + "/docs");
+      endpoints.push_back("GET " + std::string(API_BASE_PATH) + "/{entity-path}/docs");
+#ifdef ENABLE_SWAGGER_UI
+      endpoints.push_back("GET " + std::string(API_BASE_PATH) + "/swagger-ui");
+#endif
+    }
 
     const auto & auth_config = ctx_.auth_config();
     const auto & tls_config = ctx_.tls_config();
-
-    // Add auth endpoints if auth is enabled
-    if (auth_config.enabled) {
-      endpoints.push_back("POST /api/v1/auth/authorize");
-      endpoints.push_back("POST /api/v1/auth/token");
-      endpoints.push_back("POST /api/v1/auth/revoke");
-    }
 
     json capabilities = {
         {"discovery", true},
@@ -172,12 +112,22 @@ void HealthHandlers::handle_root(const httplib::Request & req, httplib::Response
         {"async_actions", true},
         {"configurations", true},
         {"faults", true},
+        {"logs", true},
+        {"bulk_data", true},
+        {"cyclic_subscriptions", true},
+        {"locking", ctx_.node() && ctx_.node()->get_lock_manager() != nullptr},
+        {"triggers", ctx_.node() && ctx_.node()->get_trigger_manager() != nullptr},
+        {"updates", ctx_.node() && ctx_.node()->get_update_manager() != nullptr},
         {"authentication", auth_config.enabled},
         {"tls", tls_config.enabled},
+        {"scripts", ctx_.node() && ctx_.node()->get_script_manager() != nullptr &&
+                        ctx_.node()->get_script_manager()->has_backend()},
+        {"vendor_extensions",
+         ctx_.node() && ctx_.node()->get_plugin_manager() && ctx_.node()->get_plugin_manager()->has_plugins()},
     };
 
     json response = {
-        {"name", "ROS 2 Medkit Gateway"}, {"version", "0.1.0"},           {"api_base", API_BASE_PATH},
+        {"name", "ROS 2 Medkit Gateway"}, {"version", kGatewayVersion},   {"api_base", API_BASE_PATH},
         {"endpoints", endpoints},         {"capabilities", capabilities},
     };
 
@@ -213,12 +163,12 @@ void HealthHandlers::handle_version_info(const httplib::Request & req, httplib::
   try {
     // SOVD 7.4.1 compliant response format
     json sovd_info_entry = {
-        {"version", "1.0.0"},                                             // SOVD standard version
-        {"base_uri", API_BASE_PATH},                                      // Version-specific base URI
-        {"vendor_info", {{"version", "0.1.0"}, {"name", "ros2_medkit"}}}  // Vendor-specific info
+        {"version", kSovdVersion},                                                // SOVD standard version
+        {"base_uri", API_BASE_PATH},                                              // Version-specific base URI
+        {"vendor_info", {{"version", kGatewayVersion}, {"name", "ros2_medkit"}}}  // Vendor-specific info
     };
 
-    json response = {{"sovd_info", json::array({sovd_info_entry})}};
+    json response = {{"items", json::array({sovd_info_entry})}};
 
     HandlerContext::send_json(res, response);
   } catch (const std::exception & e) {

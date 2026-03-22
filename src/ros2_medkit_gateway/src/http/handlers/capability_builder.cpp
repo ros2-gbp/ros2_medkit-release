@@ -41,6 +41,18 @@ std::string CapabilityBuilder::capability_to_name(Capability cap) {
       return "hosts";
     case Capability::DEPENDS_ON:
       return "depends-on";
+    case Capability::LOGS:
+      return "logs";
+    case Capability::BULK_DATA:
+      return "bulk-data";
+    case Capability::CYCLIC_SUBSCRIPTIONS:
+      return "cyclic-subscriptions";
+    case Capability::LOCKS:
+      return "locks";
+    case Capability::SCRIPTS:
+      return "scripts";
+    case Capability::TRIGGERS:
+      return "triggers";
     default:
       return "unknown";
   }

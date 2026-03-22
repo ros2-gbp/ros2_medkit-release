@@ -14,13 +14,18 @@
 
 #pragma once
 
+#include "ros2_medkit_gateway/http/error_codes.hpp"
+#include "ros2_medkit_gateway/lock_manager.hpp"
 #include "ros2_medkit_gateway/models/entity_types.hpp"
+#include "ros2_medkit_gateway/providers/introspection_provider.hpp"
 
+#include <functional>
 #include <httplib.h>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <string>
+#include <tl/expected.hpp>
 #include <unordered_map>
 #include <vector>
 
@@ -29,6 +34,12 @@ class Node;
 }
 
 namespace ros2_medkit_gateway {
+
+class ResourceSamplerRegistry;
+
+// Forward declarations for trigger-related types
+class ResourceChangeNotifier;
+class ConditionRegistry;
 
 /**
  * @brief Entity information exposed to plugins
@@ -66,6 +77,9 @@ class PluginContext {
 
   /// Look up an entity by ID. Returns nullopt if not found.
   virtual std::optional<PluginEntityInfo> get_entity(const std::string & id) const = 0;
+
+  /// Get all Apps belonging to a Component (for aggregation endpoints)
+  virtual std::vector<PluginEntityInfo> get_child_apps(const std::string & component_id) const = 0;
 
   // ---- Fault access ----
 
@@ -130,6 +144,84 @@ class PluginContext {
 
   /// Get plugin-registered capabilities for a specific entity
   virtual std::vector<std::string> get_entity_capabilities(const std::string & entity_id) const = 0;
+
+  // ---- Locking ----
+
+  /**
+   * @brief Check if a lock blocks access to a collection on an entity.
+   *
+   * @param entity_id Entity to check
+   * @param client_id Client requesting access
+   * @param collection Resource collection being accessed (e.g. "configurations")
+   * @return LockAccessResult with allowed/denied status and details
+   */
+  virtual LockAccessResult check_lock(const std::string & entity_id, const std::string & client_id,
+                                      const std::string & collection) const = 0;
+
+  /**
+   * @brief Acquire a lock on an entity.
+   *
+   * @param entity_id Entity to lock
+   * @param client_id Client acquiring the lock
+   * @param scopes Optional lock scopes (empty = all collections)
+   * @param expiration_seconds Lock TTL in seconds
+   * @return LockInfo on success, LockError on failure
+   */
+  virtual tl::expected<LockInfo, LockError> acquire_lock(const std::string & entity_id, const std::string & client_id,
+                                                         const std::vector<std::string> & scopes,
+                                                         int expiration_seconds) = 0;
+
+  /**
+   * @brief Release a lock on an entity.
+   *
+   * @param entity_id Entity to unlock
+   * @param client_id Client releasing the lock
+   * @return void on success, LockError on failure
+   */
+  virtual tl::expected<void, LockError> release_lock(const std::string & entity_id, const std::string & client_id) = 0;
+
+  // ---- Entity bulk access ----
+
+  /// Get a snapshot of all discovered entities (areas, components, apps, functions).
+  /// Returns an IntrospectionInput populated from the current entity cache.
+  virtual IntrospectionInput get_entity_snapshot() const {
+    return {};
+  }
+
+  // ---- All-faults access ----
+
+  /// List all faults across all entities. Returns JSON with "faults" array.
+  /// Empty object if fault manager is unavailable.
+  virtual nlohmann::json list_all_faults() const {
+    return nlohmann::json::object();
+  }
+
+  // ---- Resource sampler registration ----
+
+  /// Register a cyclic subscription sampler for a custom collection.
+  virtual void register_sampler(
+      const std::string & /*collection*/,
+      const std::function<tl::expected<nlohmann::json, std::string>(const std::string &, const std::string &)> &
+      /*fn*/) {
+  }
+
+  // ---- Trigger infrastructure access ----
+
+  /**
+   * @brief Get the ResourceChangeNotifier for publishing or subscribing to resource changes.
+   *
+   * Always returns a valid pointer - ResourceChangeNotifier is created unconditionally
+   * in GatewayNode regardless of trigger configuration.
+   */
+  virtual ResourceChangeNotifier * get_resource_change_notifier() = 0;
+
+  /**
+   * @brief Get the ConditionRegistry for registering custom trigger condition evaluators.
+   *
+   * Always returns a valid pointer - ConditionRegistry is created unconditionally
+   * in GatewayNode regardless of trigger configuration.
+   */
+  virtual ConditionRegistry * get_condition_registry() = 0;
 };
 
 // Forward declarations
@@ -137,6 +229,7 @@ class GatewayNode;
 class FaultManager;
 
 /// Factory for creating the concrete gateway plugin context
-std::unique_ptr<PluginContext> make_gateway_plugin_context(GatewayNode * node, FaultManager * fault_manager);
+std::unique_ptr<PluginContext> make_gateway_plugin_context(GatewayNode * node, FaultManager * fault_manager,
+                                                           ResourceSamplerRegistry * sampler_registry = nullptr);
 
 }  // namespace ros2_medkit_gateway
