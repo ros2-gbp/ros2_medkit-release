@@ -51,9 +51,9 @@ def generate_test_description():
     )
 
     gateway = create_gateway_node(extra_params={
-        'discovery_mode': 'hybrid',
-        'manifest_path': manifest_path,
-        'manifest_strict_validation': False,
+        'discovery.mode': 'hybrid',
+        'discovery.manifest_path': manifest_path,
+        'discovery.manifest_strict_validation': False,
         'unmanifested_nodes': 'warn',
     })
 
@@ -434,6 +434,17 @@ class TestScenarioDiscoveryHybrid(GatewayTestCase):
     def test_30_nonexistent_function(self):
         """404 for non-existent function."""
         self.assert_entity_not_found('functions', 'nonexistent')
+
+    def test_31_health_includes_discovery_diagnostics(self):
+        """GET /health in hybrid mode includes discovery pipeline info."""
+        data = self.get_json('/health')
+        self.assertIn('discovery', data)
+        self.assertEqual(data['discovery']['mode'], 'hybrid')
+        self.assertIn('pipeline', data['discovery'])
+        pipeline = data['discovery']['pipeline']
+        self.assertIn('layers', pipeline)
+        self.assertIn('total_entities', pipeline)
+        self.assertGreater(pipeline['total_entities'], 0)
 
 
 @launch_testing.post_shutdown_test()
