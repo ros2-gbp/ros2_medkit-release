@@ -1,0 +1,12 @@
+Source: ros-jazzy-ros2-medkit-param-beacon
+Section: misc
+Priority: optional
+Maintainer: bburda <bartoszburda93@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), libcpp-httplib-dev, libssl-dev, nlohmann-json3-dev, ros-jazzy-ament-cmake, ros-jazzy-ament-cmake-clang-format <!nocheck>, ros-jazzy-ament-cmake-gmock <!nocheck>, ros-jazzy-ament-lint-auto <!nocheck>, ros-jazzy-ament-lint-common <!nocheck>, ros-jazzy-rclcpp, ros-jazzy-ros2-medkit-beacon-common, ros-jazzy-ros2-medkit-cmake, ros-jazzy-ros2-medkit-gateway, ros-jazzy-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-ros2-medkit-param-beacon
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libcpp-httplib-dev, libssl-dev, nlohmann-json3-dev, ros-jazzy-rclcpp, ros-jazzy-ros2-medkit-beacon-common, ros-jazzy-ros2-medkit-gateway, ros-jazzy-ros-workspace
+Description: Parameter-based beacon discovery plugin for ros2_medkit gateway
