@@ -5,9 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Multi-distro compatibility (Humble / Jazzy / Rolling)
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+# Shared cmake modules (multi-distro compat, ccache, linting)
+find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
+include(ROS2MedkitCcache)
+include(ROS2MedkitLinting)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
@@ -20,6 +22,14 @@ if(ENABLE_COVERAGE)
   add_compile_options(--coverage -O0 -g)
   add_link_options(--coverage)
 endif()
+
+# Swagger UI embedding option
+option(ENABLE_SWAGGER_UI "Embed Swagger UI assets in gateway binary" OFF)
+
+# Extract version from package.xml so version.hpp stays in sync automatically
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/package.xml" _package_xml)
+string(REGEX MATCH "<version>([0-9]+\\.[0-9]+\\.[0-9]+)</version>" _ "${_package_xml}")
+set(GATEWAY_VERSION "${CMAKE_MATCH_1}")
 
 # Find dependencies
 find_package(ament_cmake REQUIRED)
@@ -35,6 +45,7 @@ find_package(ament_index_cpp REQUIRED)
 find_package(action_msgs REQUIRED)
 find_package(ros2_medkit_msgs REQUIRED)
 find_package(ros2_medkit_serialization REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 # GenericClient compat shim dependencies (needed explicitly for Humble,
 # transitively available on Iron+/Jazzy but harmless to declare unconditionally)
@@ -54,7 +65,8 @@ add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
 # tl::expected v1.3.1 (CC0) - https://github.com/TartanLlama/expected
 add_library(tl_expected_iface INTERFACE)
 target_include_directories(tl_expected_iface SYSTEM INTERFACE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/vendored/tl_expected/include
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/vendored/tl_expected/include>
+  $<INSTALL_INTERFACE:include/ros2_medkit_gateway/vendored>
 )
 add_library(tl::expected ALIAS tl_expected_iface)
 
@@ -78,7 +90,13 @@ add_library(gateway_lib STATIC
   src/operation_manager.cpp
   src/configuration_manager.cpp
   src/fault_manager.cpp
+  src/fault_manager_paths.cpp
+  src/log_manager.cpp
   src/subscription_manager.cpp
+  src/lock_manager.cpp
+  src/resource_change_notifier.cpp
+  src/resource_sampler.cpp
+  src/subscription_transport.cpp
   # Entity resource model
   src/models/entity_types.cpp
   src/models/entity_capabilities.cpp
@@ -89,6 +107,10 @@ add_library(gateway_lib STATIC
   src/discovery/discovery_manager.cpp
   src/discovery/runtime_discovery.cpp
   src/discovery/hybrid_discovery.cpp
+  src/discovery/merge_pipeline.cpp
+  src/discovery/layers/manifest_layer.cpp
+  src/discovery/layers/runtime_layer.cpp
+  src/discovery/layers/plugin_layer.cpp
   # Discovery models (with .cpp serialization)
   src/discovery/models/app.cpp
   src/discovery/models/function.cpp
@@ -113,10 +135,14 @@ add_library(gateway_lib STATIC
   src/http/handlers/operation_handlers.cpp
   src/http/handlers/config_handlers.cpp
   src/http/handlers/fault_handlers.cpp
+  src/http/handlers/log_handlers.cpp
+  src/http/handlers/lock_handlers.cpp
   src/http/handlers/bulkdata_handlers.cpp
   src/http/handlers/sse_fault_handler.cpp
   src/http/handlers/cyclic_subscription_handlers.cpp
+  src/http/handlers/sse_transport_provider.cpp
   src/http/handlers/auth_handlers.cpp
+  src/http/handlers/docs_handlers.cpp
   # Bulk data storage
   src/bulk_data_store.cpp
   # HTTP utilities
@@ -130,12 +156,34 @@ add_library(gateway_lib STATIC
   src/auth/auth_requirement_policy.cpp
   # Updates module
   src/updates/update_manager.cpp
+  # Scripts module
+  src/script_manager.cpp
+  src/default_script_provider.cpp
+  # HTTP handlers - scripts
+  src/http/handlers/script_handlers.cpp
   # HTTP handlers - updates
   src/http/handlers/update_handlers.cpp
   # Plugin framework
   src/plugins/plugin_context.cpp
   src/plugins/plugin_loader.cpp
   src/plugins/plugin_manager.cpp
+  # OpenAPI documentation module
+  src/openapi/schema_builder.cpp
+  src/openapi/path_builder.cpp
+  src/openapi/openapi_spec_builder.cpp
+  src/openapi/path_resolver.cpp
+  src/openapi/capability_generator.cpp
+  src/openapi/route_registry.cpp
+  # Trigger persistence
+  src/sqlite_trigger_store.cpp
+  # Trigger management
+  src/trigger_manager.cpp
+  # Trigger fault subscriber (ROS 2 topic -> notifier bridge)
+  src/trigger_fault_subscriber.cpp
+  # Trigger topic subscriber (data triggers -> ROS 2 subscriptions)
+  src/trigger_topic_subscriber.cpp
+  # Trigger HTTP handlers
+  src/http/handlers/trigger_handlers.cpp
 )
 
 medkit_target_dependencies(gateway_lib
@@ -159,12 +207,46 @@ target_link_libraries(gateway_lib
   OpenSSL::Crypto
   tl::expected
   jwt-cpp::jwt-cpp
+  SQLite::SQLite3
   ${CMAKE_DL_LIBS}
 )
+
+# Precompiled headers - heavy headers used across most translation units.
+# Speeds up full builds by ~30-40%. Disable with -DCMAKE_DISABLE_PRECOMPILE_HEADERS=ON.
+target_precompile_headers(gateway_lib PRIVATE
+  <string>
+  <vector>
+  <memory>
+  <optional>
+  <functional>
+  <unordered_map>
+  <algorithm>
+  <sstream>
+  <chrono>
+  <mutex>
+  <rclcpp/rclcpp.hpp>
+  <nlohmann/json.hpp>
+  <httplib.h>
+  <tl/expected.hpp>
+)
+set_target_properties(gateway_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Pass version from package.xml to version.hpp
+target_compile_definitions(gateway_lib PUBLIC GATEWAY_VERSION_STRING="${GATEWAY_VERSION}")
 
 # Gateway node executable
 add_executable(gateway_node src/main.cpp)
 target_link_libraries(gateway_node gateway_lib)
+# Export symbols to dlopen'd plugins (PluginContext::send_json, send_error, etc.)
+set_target_properties(gateway_node PROPERTIES ENABLE_EXPORTS ON)
+
+# Apply Swagger UI compile definition and embed assets
+if(ENABLE_SWAGGER_UI)
+  target_compile_definitions(gateway_lib PRIVATE ENABLE_SWAGGER_UI)
+  target_compile_definitions(gateway_node PRIVATE ENABLE_SWAGGER_UI)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/SwaggerUI.cmake)
+  target_compile_definitions(gateway_lib PRIVATE SWAGGER_UI_VERSION="${SWAGGER_UI_VERSION}")
+endif()
 
 # Apply coverage flags to main targets
 if(ENABLE_COVERAGE)
@@ -192,14 +274,8 @@ install(PROGRAMS scripts/get_type_schema.py scripts/generate_dev_certs.sh
 if(BUILD_TESTING)
   # Linting and code quality checks
   find_package(ament_lint_auto REQUIRED)
-  find_package(ament_cmake_clang_tidy REQUIRED)
-
-  # Use custom clang-format and clang-tidy configs from repo root
+  # Use custom clang-format config from repo root
   set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
-  set(ament_cmake_clang_tidy_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-tidy")
-
-  # Limit clang-tidy to only report issues from our source files (not vendored deps)
-  set(ament_cmake_clang_tidy_HEADER_FILTER "^${CMAKE_CURRENT_SOURCE_DIR}/(include|src|test)/")
 
   # Exclude linters that don't work well with vendored dependencies:
   # - uncrustify/cpplint: conflicts with clang-format
@@ -244,17 +320,15 @@ if(BUILD_TESTING)
     CONFIG_FILE "${ament_cmake_clang_format_CONFIG_FILE}"
   )
 
-  # Configure clang-tidy manually with increased timeout (1500s instead of default 300s)
-  # This is needed because the project has many files and clang-tidy analysis takes time
-  ament_clang_tidy(
-    "${CMAKE_CURRENT_BINARY_DIR}"
-    CONFIG_FILE "${ament_cmake_clang_tidy_CONFIG_FILE}"
-    HEADER_FILTER "${ament_cmake_clang_tidy_HEADER_FILTER}"
-    TIMEOUT 1500
+  ros2_medkit_clang_tidy(
+    HEADER_FILTER "^${CMAKE_CURRENT_SOURCE_DIR}/(include|src|test)/"
+    TIMEOUT 3000
   )
 
   # Add GTest
   find_package(ament_cmake_gtest REQUIRED)
+  find_package(rclcpp_action REQUIRED)
+  find_package(example_interfaces REQUIRED)
 
   ament_add_gtest(test_gateway_node test/test_gateway_node.cpp)
   target_link_libraries(test_gateway_node gateway_lib)
@@ -296,6 +370,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_discovery_models test/test_discovery_models.cpp)
   target_link_libraries(test_discovery_models gateway_lib)
 
+  # Add discovery handlers tests
+  ament_add_gtest(test_discovery_handlers test/test_discovery_handlers.cpp)
+  target_link_libraries(test_discovery_handlers gateway_lib)
+  set_tests_properties(test_discovery_handlers PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=71")
+
   # Add manifest parser tests
   ament_add_gtest(test_manifest_parser test/test_manifest_parser.cpp)
   target_link_libraries(test_manifest_parser gateway_lib)
@@ -311,6 +390,10 @@ if(BUILD_TESTING)
   # Add runtime linker tests
   ament_add_gtest(test_runtime_linker test/test_runtime_linker.cpp)
   target_link_libraries(test_runtime_linker gateway_lib)
+
+  # Add merge pipeline tests
+  ament_add_gtest(test_merge_pipeline test/test_merge_pipeline.cpp)
+  target_link_libraries(test_merge_pipeline gateway_lib)
 
   # Add capability builder tests
   ament_add_gtest(test_capability_builder test/test_capability_builder.cpp)
@@ -361,13 +444,38 @@ if(BUILD_TESTING)
   ament_add_gtest(test_subscription_manager test/test_subscription_manager.cpp)
   target_link_libraries(test_subscription_manager gateway_lib)
 
+  # Add resource sampler registry tests
+  ament_add_gtest(test_resource_sampler_registry test/test_resource_sampler_registry.cpp)
+  target_link_libraries(test_resource_sampler_registry gateway_lib)
+
+  # Add transport registry tests
+  ament_add_gtest(test_transport_registry test/test_transport_registry.cpp)
+  target_link_libraries(test_transport_registry gateway_lib)
+
   # Add cyclic subscription handler tests
   ament_add_gtest(test_cyclic_subscription_handlers test/test_cyclic_subscription_handlers.cpp)
   target_link_libraries(test_cyclic_subscription_handlers gateway_lib)
 
+  # Add SSE transport provider tests
+  ament_add_gtest(test_sse_transport_provider test/test_sse_transport_provider.cpp)
+  target_link_libraries(test_sse_transport_provider gateway_lib)
+
   # Add update manager tests
   ament_add_gtest(test_update_manager test/test_update_manager.cpp)
   target_link_libraries(test_update_manager gateway_lib)
+
+  # Add script manager tests
+  ament_add_gtest(test_script_manager test/test_script_manager.cpp)
+  target_link_libraries(test_script_manager gateway_lib)
+
+  # Add default script provider tests
+  ament_add_gtest(test_default_script_provider test/test_default_script_provider.cpp)
+  target_link_libraries(test_default_script_provider gateway_lib)
+
+  # Add script handler tests
+  ament_add_gtest(test_script_handlers test/test_script_handlers.cpp)
+  target_link_libraries(test_script_handlers gateway_lib)
+  set_tests_properties(test_script_handlers PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=69")
 
   # Add data handler tests
   ament_add_gtest(test_data_handlers test/test_data_handlers.cpp)
@@ -380,6 +488,12 @@ if(BUILD_TESTING)
   # Add health handler tests
   ament_add_gtest(test_health_handlers test/test_health_handlers.cpp)
   target_link_libraries(test_health_handlers gateway_lib)
+
+  # Add operation handler tests
+  ament_add_gtest(test_operation_handlers test/test_operation_handlers.cpp)
+  target_link_libraries(test_operation_handlers gateway_lib)
+  medkit_target_dependencies(test_operation_handlers rclcpp rclcpp_action std_srvs example_interfaces)
+  set_tests_properties(test_operation_handlers PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=72")
 
   # Demo update backend plugin (.so for integration tests)
   add_library(test_update_backend MODULE
@@ -431,6 +545,79 @@ if(BUILD_TESTING)
   ament_add_gtest(test_plugin_manager test/test_plugin_manager.cpp)
   target_link_libraries(test_plugin_manager gateway_lib)
 
+  # Log manager tests
+  # Dedicated ROS_DOMAIN_ID to prevent cross-talk with concurrent integration tests
+  ament_add_gtest(test_log_manager test/test_log_manager.cpp)
+  target_link_libraries(test_log_manager gateway_lib)
+  set_tests_properties(test_log_manager PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=66")
+
+  # Log handlers tests
+  ament_add_gtest(test_log_handlers test/test_log_handlers.cpp)
+  target_link_libraries(test_log_handlers gateway_lib)
+
+  # Route descriptions tests (OpenAPI doc builder)
+  ament_add_gtest(test_route_descriptions test/test_route_descriptions.cpp)
+  target_link_libraries(test_route_descriptions gateway_lib)
+
+  # Schema builder tests (OpenAPI schema generation)
+  ament_add_gtest(test_schema_builder test/test_schema_builder.cpp)
+  target_link_libraries(test_schema_builder gateway_lib)
+
+  # Path builder tests (OpenAPI path item generation)
+  ament_add_gtest(test_path_builder test/test_path_builder.cpp)
+  target_link_libraries(test_path_builder gateway_lib)
+
+  # OpenAPI spec builder tests (full document assembly)
+  ament_add_gtest(test_openapi_spec_builder test/test_openapi_spec_builder.cpp)
+  target_link_libraries(test_openapi_spec_builder gateway_lib)
+
+  # Path resolver tests (OpenAPI path classification)
+  ament_add_gtest(test_path_resolver test/test_path_resolver.cpp)
+  target_link_libraries(test_path_resolver gateway_lib)
+
+  # Capability generator tests (OpenAPI spec generation engine)
+  ament_add_gtest(test_capability_generator test/test_capability_generator.cpp)
+  target_link_libraries(test_capability_generator gateway_lib)
+  set_tests_properties(test_capability_generator PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=74")
+
+  # Route registry tests (OpenAPI route registration and path conversion)
+  ament_add_gtest(test_route_registry test/test_route_registry.cpp)
+  target_link_libraries(test_route_registry gateway_lib)
+
+  # Docs handlers tests (OpenAPI /docs endpoint handlers)
+  ament_add_gtest(test_docs_handlers test/test_docs_handlers.cpp)
+  target_link_libraries(test_docs_handlers gateway_lib)
+  set_tests_properties(test_docs_handlers PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=68")
+
+  # Lock manager tests
+  ament_add_gtest(test_lock_manager test/test_lock_manager.cpp)
+  target_link_libraries(test_lock_manager gateway_lib)
+
+  # Lock handlers tests
+  ament_add_gtest(test_lock_handlers test/test_lock_handlers.cpp)
+  target_link_libraries(test_lock_handlers gateway_lib)
+  set_tests_properties(test_lock_handlers PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=78")
+
+  # Condition evaluator tests (trigger condition interface + built-in evaluators)
+  ament_add_gtest(test_condition_evaluator test/test_condition_evaluator.cpp)
+  target_link_libraries(test_condition_evaluator gateway_lib)
+
+  # Resource change notifier tests (async notification hub for triggers)
+  ament_add_gtest(test_resource_change_notifier test/test_resource_change_notifier.cpp)
+  target_link_libraries(test_resource_change_notifier gateway_lib)
+
+  # Trigger store tests (SQLite persistence for triggers)
+  ament_add_gtest(test_trigger_store test/test_trigger_store.cpp)
+  target_link_libraries(test_trigger_store gateway_lib)
+
+  # Trigger manager tests (CRUD, condition eval, hierarchy matching)
+  ament_add_gtest(test_trigger_manager test/test_trigger_manager.cpp)
+  target_link_libraries(test_trigger_manager gateway_lib)
+
+  # Trigger handler tests (REST endpoints for triggers)
+  ament_add_gtest(test_trigger_handlers test/test_trigger_handlers.cpp)
+  target_link_libraries(test_trigger_handlers gateway_lib)
+
   # Apply coverage flags to test targets
   if(ENABLE_COVERAGE)
     set(_test_targets
@@ -444,6 +631,7 @@ if(BUILD_TESTING)
       test_tls_config
       test_fault_manager
       test_discovery_models
+      test_discovery_handlers
       test_manifest_parser
       test_manifest_validator
       test_capability_builder
@@ -456,13 +644,39 @@ if(BUILD_TESTING)
       test_bulk_data_store
       test_bulkdata_handlers
       test_subscription_manager
+      test_resource_sampler_registry
+      test_transport_registry
       test_cyclic_subscription_handlers
+      test_sse_transport_provider
       test_update_manager
+      test_script_manager
+      test_default_script_provider
+      test_script_handlers
       test_data_handlers
       test_auth_handlers
       test_health_handlers
+      test_operation_handlers
       test_plugin_loader
       test_plugin_manager
+      test_log_manager
+      test_log_handlers
+      test_merge_pipeline
+      test_runtime_linker
+      test_route_descriptions
+      test_schema_builder
+      test_path_builder
+      test_openapi_spec_builder
+      test_path_resolver
+      test_capability_generator
+      test_route_registry
+      test_docs_handlers
+      test_lock_manager
+      test_lock_handlers
+      test_condition_evaluator
+      test_resource_change_notifier
+      test_trigger_store
+      test_trigger_manager
+      test_trigger_handlers
     )
     foreach(_target ${_test_targets})
       target_compile_options(${_target} PRIVATE --coverage -O0 -g)
@@ -471,5 +685,10 @@ if(BUILD_TESTING)
   endif()
 
 endif()
+
+# Export include directories for downstream packages (plugins)
+install(DIRECTORY include/ DESTINATION include)
+install(DIRECTORY src/vendored/tl_expected/include/ DESTINATION include/ros2_medkit_gateway/vendored)
+ament_export_include_directories(include include/ros2_medkit_gateway/vendored)
 
 ament_package()

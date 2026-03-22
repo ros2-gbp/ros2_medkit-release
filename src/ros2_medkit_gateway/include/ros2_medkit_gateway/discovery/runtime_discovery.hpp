@@ -86,6 +86,9 @@ class RuntimeDiscoveryStrategy : public DiscoveryStrategy {
   /// @copydoc DiscoveryStrategy::discover_components
   std::vector<Component> discover_components() override;
 
+  /// Discover components using pre-discovered apps (avoids redundant graph introspection)
+  std::vector<Component> discover_components(const std::vector<App> & apps);
+
   /// @copydoc DiscoveryStrategy::discover_apps
   /// @note Returns nodes as Apps in runtime discovery
   std::vector<App> discover_apps() override;
@@ -104,25 +107,15 @@ class RuntimeDiscoveryStrategy : public DiscoveryStrategy {
   // =========================================================================
 
   /**
-   * @brief Discover node-based components (individual ROS 2 nodes)
-   *
-   * This returns the traditional component discovery where each node
-   * becomes a Component. Used internally when synthetic components
-   * are not enabled or for building Apps.
-   *
-   * @return Vector of node-based components
-   */
-  std::vector<Component> discover_node_components();
-
-  /**
    * @brief Discover synthetic components (grouped by namespace)
    *
-   * Creates aggregated Components that group multiple nodes by namespace.
-   * Only used when create_synthetic_components is enabled.
+   * Groups runtime apps by namespace into aggregated Component entities.
+   * Uses provided apps to avoid re-querying the ROS 2 graph.
    *
+   * @param apps Pre-discovered apps (from discover_apps())
    * @return Vector of synthetic components
    */
-  std::vector<Component> discover_synthetic_components();
+  std::vector<Component> discover_synthetic_components(const std::vector<App> & apps);
 
   /**
    * @brief Discover components from topic namespaces (topic-based discovery)
@@ -203,7 +196,7 @@ class RuntimeDiscoveryStrategy : public DiscoveryStrategy {
   static bool is_internal_service(const std::string & service_path);
 
   /// Derive component ID for a node based on grouping strategy
-  std::string derive_component_id(const Component & node);
+  std::string derive_component_id(const std::string & node_id, const std::string & area);
 
   /// Apply naming pattern for synthetic component ID
   std::string apply_component_name_pattern(const std::string & area);

@@ -1,4 +1,4 @@
-# Copyright 2025 mfaferek93
+# Copyright 2025-2026 mfaferek93, bburda
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,9 +19,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Multi-distro compatibility (Humble / Jazzy / Rolling)
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+# Shared cmake modules (multi-distro compat, ccache, linting)
+find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
+include(ROS2MedkitCcache)
+include(ROS2MedkitLinting)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
@@ -60,6 +62,7 @@ add_library(fault_manager_lib STATIC
   src/correlation/config_parser.cpp
   src/correlation/pattern_matcher.cpp
   src/correlation/correlation_engine.cpp
+  src/entity_threshold_resolver.cpp
 )
 
 target_include_directories(fault_manager_lib PUBLIC
@@ -118,29 +121,37 @@ if(BUILD_TESTING)
   find_package(launch_testing_ament_cmake REQUIRED)
 
   set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
-  set(ament_cmake_clang_tidy_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-tidy")
-  list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_uncrustify ament_cmake_cpplint)
+  list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_uncrustify ament_cmake_cpplint ament_cmake_clang_tidy)
   ament_lint_auto_find_test_dependencies()
 
+  ros2_medkit_clang_tidy()
+
   # Unit tests
+  # Each GTest target that instantiates ROS 2 nodes gets a dedicated ROS_DOMAIN_ID
+  # so it cannot interfere with launch_testing integration tests that run concurrently
+  # in the same CTest invocation and launch their own fault_manager_node subprocess.
   ament_add_gtest(test_fault_manager test/test_fault_manager.cpp)
   target_link_libraries(test_fault_manager fault_manager_lib)
   medkit_target_dependencies(test_fault_manager rclcpp ros2_medkit_msgs)
+  set_tests_properties(test_fault_manager PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=62")
 
   # SQLite storage tests
   ament_add_gtest(test_sqlite_storage test/test_sqlite_storage.cpp)
   target_link_libraries(test_sqlite_storage fault_manager_lib)
   medkit_target_dependencies(test_sqlite_storage rclcpp ros2_medkit_msgs)
+  set_tests_properties(test_sqlite_storage PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=63")
 
   # Snapshot capture tests
   ament_add_gtest(test_snapshot_capture test/test_snapshot_capture.cpp)
   target_link_libraries(test_snapshot_capture fault_manager_lib)
   medkit_target_dependencies(test_snapshot_capture rclcpp ros2_medkit_msgs)
+  set_tests_properties(test_snapshot_capture PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=64")
 
   # Rosbag capture tests
   ament_add_gtest(test_rosbag_capture test/test_rosbag_capture.cpp)
   target_link_libraries(test_rosbag_capture fault_manager_lib)
   medkit_target_dependencies(test_rosbag_capture rclcpp ros2_medkit_msgs)
+  set_tests_properties(test_rosbag_capture PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=65")
 
   # Correlation config parser tests
   ament_add_gtest(test_correlation_config_parser test/test_correlation_config_parser.cpp)
@@ -153,6 +164,12 @@ if(BUILD_TESTING)
   # Correlation engine tests
   ament_add_gtest(test_correlation_engine test/test_correlation_engine.cpp)
   target_link_libraries(test_correlation_engine fault_manager_lib)
+
+  # Entity threshold resolver tests
+  ament_add_gtest(test_entity_thresholds test/test_entity_thresholds.cpp)
+  target_link_libraries(test_entity_thresholds fault_manager_lib)
+  medkit_target_dependencies(test_entity_thresholds rclcpp ros2_medkit_msgs)
+  set_tests_properties(test_entity_thresholds PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=67")
 
   # Apply coverage flags to test targets
   if(ENABLE_COVERAGE)
@@ -170,6 +187,8 @@ if(BUILD_TESTING)
     target_link_options(test_pattern_matcher PRIVATE --coverage)
     target_compile_options(test_correlation_engine PRIVATE --coverage -O0 -g)
     target_link_options(test_correlation_engine PRIVATE --coverage)
+    target_compile_options(test_entity_thresholds PRIVATE --coverage -O0 -g)
+    target_link_options(test_entity_thresholds PRIVATE --coverage)
   endif()
 
   # Integration tests
@@ -182,12 +201,21 @@ if(BUILD_TESTING)
     TARGET test_integration
     TIMEOUT 60
   )
+  set_tests_properties(test_integration PROPERTIES LABELS "integration")
 
   add_launch_test(
     test/test_rosbag_integration.test.py
     TARGET test_rosbag_integration
     TIMEOUT 90
   )
+  set_tests_properties(test_rosbag_integration PROPERTIES LABELS "integration")
+
+  add_launch_test(
+    test/test_entity_thresholds_integration.test.py
+    TARGET test_entity_thresholds_integration
+    TIMEOUT 60
+  )
+  set_tests_properties(test_entity_thresholds_integration PROPERTIES LABELS "integration")
 endif()
 
 ament_package()
