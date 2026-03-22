@@ -1,0 +1,12 @@
+Source: ros-jazzy-ros2-medkit-serialization
+Section: misc
+Priority: optional
+Maintainer: bburda <bartoszburda93@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), nlohmann-json3-dev, ros-jazzy-ament-cmake, ros-jazzy-ament-cmake-clang-format <!nocheck>, ros-jazzy-ament-cmake-clang-tidy <!nocheck>, ros-jazzy-ament-cmake-gtest <!nocheck>, ros-jazzy-ament-lint-auto <!nocheck>, ros-jazzy-ament-lint-common <!nocheck>, ros-jazzy-geometry-msgs <!nocheck>, ros-jazzy-rclcpp, ros-jazzy-rcpputils, ros-jazzy-rcutils, ros-jazzy-ros2-medkit-cmake, ros-jazzy-rosidl-runtime-c, ros-jazzy-rosidl-runtime-cpp, ros-jazzy-rosidl-typesupport-introspection-c, ros-jazzy-rosidl-typesupport-introspection-cpp, ros-jazzy-sensor-msgs <!nocheck>, ros-jazzy-std-msgs <!nocheck>, ros-jazzy-std-srvs <!nocheck>, ros-jazzy-test-msgs <!nocheck>, ros-jazzy-yaml-cpp-vendor, ros-jazzy-ros-workspace
+Homepage: 
+Standards-Version: 3.9.2
+
+Package: ros-jazzy-ros2-medkit-serialization
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, nlohmann-json3-dev, ros-jazzy-rclcpp, ros-jazzy-rcpputils, ros-jazzy-rcutils, ros-jazzy-rosidl-runtime-c, ros-jazzy-rosidl-runtime-cpp, ros-jazzy-rosidl-typesupport-introspection-c, ros-jazzy-rosidl-typesupport-introspection-cpp, ros-jazzy-yaml-cpp-vendor, ros-jazzy-ros-workspace
+Description: Runtime JSON to ROS 2 message serialization library
