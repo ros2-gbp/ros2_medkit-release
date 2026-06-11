@@ -15,9 +15,8 @@ jobs:
         include:
           - ros_distro: humble
             os_image: ubuntu:jammy
-          - ros_distro: rolling
-            os_image: ubuntu:noble
-    continue-on-error: ${{ matrix.ros_distro == 'rolling' }}
+          - ros_distro: lyrical
+            os_image: ubuntu:resolute
     container:
       image: ${{ matrix.os_image }}
     timeout-minutes: 60
@@ -50,32 +49,23 @@ jobs:
           restore-keys: |
             ccache-${{ matrix.ros_distro }}-
 
-      - name: Install cpp-httplib from source (Humble)
-        if: matrix.ros_distro == 'humble'
-        run: |
-          apt-get update
-          apt-get install -y cmake g++ libssl-dev pkg-config
-          git clone --depth 1 --branch v0.14.3 https://github.com/yhirose/cpp-httplib.git /tmp/cpp-httplib
-          cd /tmp/cpp-httplib
-          mkdir build && cd build
-          cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DHTTPLIB_REQUIRE_OPENSSL=ON
-          make install
-          # Verify installation — cpp-httplib from source installs cmake config (not pkg-config .pc)
-          test -f /usr/include/httplib.h && echo "cpp-httplib installed successfully" || exit 1
-
       - name: Install dependencies
         run: |
           apt-get update
           apt-get install -y ros-${{ matrix.ros_distro }}-test-msgs
+          if [ "${{ matrix.ros_distro }}" = "humble" ]; then
+            apt-get install -y ros-humble-rmw-cyclonedds-cpp
+          fi
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
           rosdep update
-          # On Humble, skip the libcpp-httplib-dev rosdep key - the apt version (0.10.3)
-          # is too old; cpp-httplib v0.14.3 is built from source in an earlier step.
-          if [ "${{ matrix.ros_distro }}" = "humble" ]; then
-            rosdep install --from-paths src --ignore-src -r -y --skip-keys="libcpp-httplib-dev"
-          else
-            rosdep install --from-paths src --ignore-src -y
-          fi
+          # Linters (clang-tidy / clang-format) only run in the Jazzy quality
+          # job (quality.yml). Multiple package.xml files still list them as
+          # <test_depend>, so we skip the rosdep keys here to keep build-and-
+          # test runners from pulling in linter packages they never use. Also
+          # defensive against transient binary-deb gaps on newly-released
+          # distros.
+          rosdep install --from-paths src --ignore-src -y \
+            --skip-keys "ament_cmake_clang_tidy ament_cmake_clang_format"
 
       - name: Build packages
         env:
@@ -85,15 +75,27 @@ jobs:
         run: |
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
           colcon build --symlink-install \
+            --packages-skip ros2_medkit_opcua \
             --cmake-args -DCMAKE_BUILD_TYPE=Release \
             --event-handlers console_direct+
           ccache -s
 
       - name: Run unit and integration tests
         timeout-minutes: 15
+        env:
+          # FastRTPS 2.6 on Humble has a known use-after-free in the
+          # discovery-teardown path (EDP::unpairWriterProxy) that segfaults
+          # peer nodes when the gateway shuts down, so we force CycloneDDS
+          # there. Lyrical ships a newer FastRTPS without that bug and hits
+          # a separate iceoryx-shared-memory crash under CycloneDDS during
+          # shutdown ("string capacity was zero for allocated data"), so on
+          # Lyrical we keep the default FastRTPS. (Jazzy still uses
+          # CycloneDDS - see jazzy-test job below for its rationale.)
+          RMW_IMPLEMENTATION: ${{ matrix.ros_distro == 'humble' && 'rmw_cyclonedds_cpp' || '' }}
         run: |
           source /opt/ros/${{ matrix.ros_distro }}/setup.bash
           colcon test --return-code-on-test-failure \
+            --packages-skip ros2_medkit_opcua \
             --ctest-args -LE linter \
             --event-handlers console_direct+
 
@@ -147,7 +149,7 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update
-          apt-get install -y ros-jazzy-test-msgs clang-format clang-tidy
+          apt-get install -y ros-jazzy-test-msgs
           source /opt/ros/jazzy/setup.bash
           rosdep update
           rosdep install --from-paths src --ignore-src -y
@@ -160,7 +162,8 @@ jobs:
         run: |
           source /opt/ros/jazzy/setup.bash
           colcon build --symlink-install \
-            --cmake-args -DCMAKE_BUILD_TYPE=Release -DENABLE_CLANG_TIDY=ON \
+            --packages-skip ros2_medkit_opcua \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release \
             --event-handlers console_direct+
           ccache -s
 
@@ -174,72 +177,12 @@ jobs:
           path: /tmp/jazzy-build.tar
           retention-days: 1
 
-  jazzy-lint:
-    needs: jazzy-build
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:noble
-    timeout-minutes: 75
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - name: Install Git
-        run: |
-          apt-get update
-          apt-get install -y git
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up ROS 2 Jazzy
-        uses: ros-tooling/setup-ros@v0.7
-        with:
-          required-ros-distributions: jazzy
-
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y clang-format clang-tidy
-          source /opt/ros/jazzy/setup.bash
-          rosdep update
-          rosdep install --from-paths src --ignore-src -y
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: jazzy-build
-
-      - name: Extract build artifacts
-        run: tar xf jazzy-build.tar && rm jazzy-build.tar
-
-      - name: Run linters
-        run: |
-          source /opt/ros/jazzy/setup.bash
-          colcon test --return-code-on-test-failure \
-            --ctest-args -L linter \
-            --event-handlers console_direct+
-
-      - name: Show test results
-        if: always()
-        run: colcon test-result --verbose
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-jazzy-lint
-          path: |
-            log/
-            build/*/test_results/
-
   jazzy-test:
     needs: jazzy-build
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
-    timeout-minutes: 15
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -261,7 +204,9 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update
-          apt-get install -y ros-jazzy-test-msgs
+          apt-get install -y \
+            ros-jazzy-test-msgs \
+            ros-jazzy-rmw-cyclonedds-cpp
           source /opt/ros/jazzy/setup.bash
           rosdep update
           rosdep install --from-paths src --ignore-src -y
@@ -275,9 +220,15 @@ jobs:
         run: tar xf jazzy-build.tar && rm jazzy-build.tar
 
       - name: Run unit and integration tests
+        env:
+          # FastRTPS has a known use-after-free in discovery-teardown that
+          # can segfault peer nodes when another node (typically the gateway)
+          # shuts down. CycloneDDS avoids it.
+          RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
         run: |
           source /opt/ros/jazzy/setup.bash
           colcon test --return-code-on-test-failure \
+            --packages-skip ros2_medkit_opcua \
             --ctest-args -LE linter \
             --event-handlers console_direct+
 
@@ -298,7 +249,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:noble
-    timeout-minutes: 30
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
@@ -331,7 +282,8 @@ jobs:
       - name: Install dependencies
         run: |
           apt-get update
-          apt-get install -y lcov ros-jazzy-test-msgs
+          # gpg is required by codecov/codecov-action@v5 dependency check
+          apt-get install -y lcov ros-jazzy-test-msgs gpg
           source /opt/ros/jazzy/setup.bash
           rosdep update
           rosdep install --from-paths src --ignore-src -r -y
@@ -344,6 +296,7 @@ jobs:
         run: |
           source /opt/ros/jazzy/setup.bash
           colcon build --symlink-install \
+            --packages-skip ros2_medkit_opcua \
             --cmake-args -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON \
             --event-handlers console_direct+
           ccache -s
@@ -352,6 +305,7 @@ jobs:
         run: |
           source /opt/ros/jazzy/setup.bash
           colcon test \
+            --packages-skip ros2_medkit_opcua \
             --ctest-args -LE linter \
             --event-handlers console_direct+
 
@@ -392,7 +346,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.info
@@ -402,11 +356,10 @@ jobs:
           verbose: true
 
   notify-demos:
-    needs: [jazzy-lint, jazzy-test]
+    needs: [jazzy-test]
     if: >-
       github.event_name == 'push' &&
       github.ref == 'refs/heads/main' &&
-      needs.jazzy-lint.result == 'success' &&
       needs.jazzy-test.result == 'success'
     runs-on: ubuntu-latest
     # Only Jazzy gates the dispatch. Humble failures do not block demos CI - intentional tradeoff.

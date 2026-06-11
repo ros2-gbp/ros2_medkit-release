@@ -14,6 +14,8 @@
 
 #include "ros2_medkit_gateway/discovery/manifest/runtime_linker.hpp"
 
+#include "ros2_medkit_gateway/core/discovery/merge_types.hpp"
+
 #include <algorithm>
 
 namespace ros2_medkit_gateway {
@@ -179,6 +181,26 @@ LinkingResult RuntimeLinker::link(const std::vector<App> & manifest_apps, const 
       result.orphan_nodes.push_back(rt_app.bound_fqn.value());
     }
   }
+
+  // Suppress runtime-origin apps that duplicate linked manifest apps (#307).
+  // After merge_entities(), both manifest apps and runtime synthetic apps may
+  // appear in the merged input. Remove runtime apps whose bound_fqn matches
+  // a successfully linked manifest app to avoid duplicates.
+  std::set<std::string> linked_fqns;
+  for (const auto & [app_id, node_fqn] : result.app_to_node) {
+    linked_fqns.insert(node_fqn);
+  }
+
+  auto it = std::remove_if(result.linked_apps.begin(), result.linked_apps.end(), [&](const App & app) {
+    if (is_protected_source(app.source)) {
+      return false;
+    }
+    if (!app.bound_fqn.has_value()) {
+      return false;  // Keep apps without bound_fqn
+    }
+    return linked_fqns.count(app.bound_fqn.value()) > 0;  // Remove if FQN is linked
+  });
+  result.linked_apps.erase(it, result.linked_apps.end());
 
   // Log summary
   log_info("Runtime linking: " + result.summary());

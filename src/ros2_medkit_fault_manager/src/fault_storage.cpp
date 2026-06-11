@@ -290,8 +290,25 @@ size_t InMemoryFaultStorage::check_time_based_confirmation(const rclcpp::Time & 
   return confirmed_count;
 }
 
+void InMemoryFaultStorage::set_max_snapshots_per_fault(size_t max_count) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  max_snapshots_per_fault_ = max_count;
+}
+
 void InMemoryFaultStorage::store_snapshot(const SnapshotData & snapshot) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (max_snapshots_per_fault_ > 0) {
+    size_t count = 0;
+    for (const auto & s : snapshots_) {
+      if (s.fault_code == snapshot.fault_code) {
+        ++count;
+      }
+    }
+    if (count >= max_snapshots_per_fault_) {
+      // Silent rejection: storage layer has no logger. Callers should log if needed.
+      return;  // Reject new - keep first N inserted snapshots
+    }
+  }
   snapshots_.push_back(snapshot);
 }
 

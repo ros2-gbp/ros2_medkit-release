@@ -25,6 +25,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_srvs/srv/trigger.hpp>
 
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
+
 class CalibrationService : public rclcpp::Node {
  public:
   CalibrationService() : Node("calibration_service"), calibration_count_(0) {
@@ -34,6 +36,10 @@ class CalibrationService : public rclcpp::Node {
         std::bind(&CalibrationService::calibrate_callback, this, std::placeholders::_1, std::placeholders::_2));
 
     RCLCPP_INFO(this->get_logger(), "Calibration service started");
+  }
+
+  ~CalibrationService() {
+    calibration_srv_.reset();
   }
 
  private:
@@ -55,8 +61,7 @@ class CalibrationService : public rclcpp::Node {
 };
 
 int main(int argc, char * argv[]) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<CalibrationService>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<CalibrationService>();
+  });
 }
