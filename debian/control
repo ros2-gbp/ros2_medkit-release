@@ -1,0 +1,12 @@
+Source: ros-humble-ros2-medkit-sovd-service-interface
+Section: misc
+Priority: optional
+Maintainer: "bburda" <bartoszburda93@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), nlohmann-json3-dev, ros-humble-ament-cmake, ros-humble-ament-cmake-clang-format <!nocheck>, ros-humble-ament-cmake-gtest <!nocheck>, ros-humble-ament-lint-auto <!nocheck>, ros-humble-ament-lint-common <!nocheck>, ros-humble-rclcpp, ros-humble-ros2-medkit-cmake, ros-humble-ros2-medkit-gateway, ros-humble-ros2-medkit-msgs, ros-humble-ros-workspace
+Homepage: https://index.ros.org/p/ros2_medkit_sovd_service_interface/#humble
+Standards-Version: 3.9.2
+
+Package: ros-humble-ros2-medkit-sovd-service-interface
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, nlohmann-json3-dev, ros-humble-rclcpp, ros-humble-ros2-medkit-gateway, ros-humble-ros2-medkit-msgs, ros-humble-ros-workspace
+Description: SOVD Service Interface plugin - exposes medkit entity tree and fault data via ROS 2 services
