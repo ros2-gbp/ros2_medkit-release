@@ -41,17 +41,17 @@ Discovery Modes Comparison
      - ✅ Yes
      - ❌ No
    * - Custom areas
-     - ❌ No (derived from namespaces)
-     - ✅ Yes
-     - ✅ Yes
+     - No (Areas come from manifest only)
+     - Yes
+     - Yes
    * - Apps entity type
-     - ✅ Yes (ROS nodes → Apps)
-     - ✅ Yes
-     - ✅ Yes
+     - Yes (ROS nodes -> Apps)
+     - Yes
+     - Yes
    * - Functions entity type
-     - ❌ No
-     - ✅ Yes
-     - ✅ Yes
+     - Yes (from namespace segments)
+     - Yes
+     - Yes
    * - Offline detection
      - ❌ No
      - ✅ Yes
@@ -224,6 +224,9 @@ After merging, the **RuntimeLinker** binds manifest apps to running ROS 2 nodes:
 3. **Linking**: For each manifest app, checks ``ros_binding`` configuration
 4. **Binding**: If match found, copies runtime resources (topics, services, actions)
 5. **Status**: Apps with matched nodes are marked ``is_online: true``
+6. **Suppression**: Heuristic entities that duplicate manifest-covered namespaces
+   (components/areas) or linked app IDs (apps) are removed. Gap-fill apps in
+   uncovered namespaces survive.
 
 Merge Report
 ~~~~~~~~~~~~
@@ -271,6 +274,19 @@ Runtime Linking
    runtime-discovered entities, and plugin-contributed entities are merged per
    field-group before linking. See :doc:`/config/discovery-options` for merge
    pipeline configuration.
+
+.. note::
+
+   **Trigger entity resolution in hybrid mode**
+
+   In hybrid mode, fault and log triggers are delivered using the manifest entity
+   ID rather than the raw ROS node FQN. The runtime linker builds a node-to-app
+   mapping during the linking phase (step 4 above), and the fault manager and log
+   manager use this mapping to resolve incoming trigger events to the correct
+   manifest entity. This means fault codes, log subscriptions, and SSE events
+   reference stable manifest IDs (e.g., ``lidar-driver``) instead of the
+   ephemeral node FQN (e.g., ``/sensors/velodyne_driver``), even when nodes
+   restart and re-bind.
 
 ROS Binding Configuration
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -332,19 +348,25 @@ Example response:
 Entity Hierarchy
 ----------------
 
-The manifest defines a hierarchical structure:
+The manifest supports two hierarchy patterns depending on your robot's complexity.
+
+With Areas (Complex Robots)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For robots with multiple subsystems (e.g., autonomous vehicles, industrial platforms),
+use areas to group components by function or location:
 
 .. code-block:: text
 
    Areas (logical/physical groupings)
-   └── Components (hardware/virtual units)
-       └── Apps (software applications)
-           └── Data (topics)
-           └── Operations (services/actions)
-           └── Configurations (parameters)
+   +-- Components (hardware/virtual units)
+       +-- Apps (software applications)
+           +-- Data (topics)
+           +-- Operations (services/actions)
+           +-- Configurations (parameters)
 
    Functions (cross-cutting capabilities)
-   └── Apps (hosted by)
+   +-- Apps (hosted by)
 
 **Areas** group related components by function or location:
 
@@ -357,7 +379,7 @@ The manifest defines a hierarchical structure:
          - id: lidar-processing
            name: "LiDAR Processing"
 
-**Components** represent hardware or virtual units:
+**Components** are assigned to areas:
 
 .. code-block:: yaml
 
@@ -369,6 +391,60 @@ The manifest defines a hierarchical structure:
        subcomponents:
          - id: gpu-unit
            name: "GPU Processing Unit"
+
+Without Areas (Simple Robots)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For simple robots where the entire system is a single unit (e.g., TurtleBot3, small
+mobile platforms), you can omit areas entirely and use a flat component tree. The
+robot itself is the top-level component, with subcomponents for hardware modules:
+
+.. code-block:: text
+
+   Components (top-level)
+   +-- Subcomponents (hardware modules)
+       +-- Apps (software applications)
+
+   Functions (cross-cutting capabilities)
+   +-- Apps (hosted by)
+
+.. code-block:: yaml
+
+   # No areas section needed
+   components:
+     - id: turtlebot3
+       name: "TurtleBot3 Burger"
+       type: "mobile-robot"
+
+     - id: raspberry-pi
+       name: "Raspberry Pi 4"
+       type: "controller"
+       parent_component_id: turtlebot3
+
+   apps:
+     - id: nav2-controller
+       name: "Nav2 Controller"
+       is_located_on: raspberry-pi
+       ros_binding:
+         node_name: controller_server
+         namespace: /
+
+For runtime-only mode, Areas are never created from namespaces - they come
+from manifest only. See :ref:`manifest-flat-entity-tree` in the manifest
+schema reference and ``config/examples/flat_robot_manifest.yaml`` for a
+complete example.
+
+**When to use each pattern:**
+
+- **With areas**: Multiple subsystems, deep namespace hierarchy, large teams
+  working on separate domains (perception, navigation, control)
+- **Without areas**: Single robot with a handful of nodes, flat or shallow
+  namespace structure, quick prototypes
+
+Common Elements
+~~~~~~~~~~~~~~~
+
+Both patterns use **Apps** and **Functions** the same way.
 
 **Apps** are software applications (typically ROS 2 nodes):
 
@@ -408,17 +484,20 @@ this behavior:
    discovery:
      merge_pipeline:
        gap_fill:
-         allow_heuristic_areas: true        # Create areas from namespaces
-         allow_heuristic_components: true    # Create synthetic components
          allow_heuristic_apps: true          # Create apps from unbound nodes
          allow_heuristic_functions: false    # Don't create heuristic functions
          # namespace_blacklist: ["/rosout"]  # Exclude specific namespaces
          # namespace_whitelist: []           # If set, only allow these namespaces
 
+.. note::
+
+   Areas and Components are never created by runtime discovery. Areas come
+   from manifest only. Components come from ``HostInfoProvider`` or manifest.
+
 When all ``allow_heuristic_*`` options are ``false``, only manifest-declared
 entities appear. Runtime nodes are still discovered for linking, but no
-heuristic entities (areas, components, apps, functions) are created from
-unmatched namespaces or nodes.
+heuristic entities (apps, functions) are created from unmatched namespaces
+or nodes.
 
 See :doc:`/config/discovery-options` for the full merge pipeline reference.
 

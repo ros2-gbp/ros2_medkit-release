@@ -43,6 +43,11 @@ def generate_launch_description():
               f'{graph_provider_path} - plugin will not load')
         graph_provider_path = ''
 
+    declare_override_config_arg = DeclareLaunchArgument(
+        'config_file', default_value=default_config,
+        description='Path to YAML config file to override gateway parameters. Default config '
+                    'is the ros2_medkit_gateway/config/gateway_params.yaml.')
+
     declare_host_arg = DeclareLaunchArgument(
         'server_host', default_value='127.0.0.1',
         description='Host to bind REST server (127.0.0.1 or 0.0.0.0)')
@@ -52,8 +57,12 @@ def generate_launch_description():
         description='Port for REST API')
 
     declare_refresh_arg = DeclareLaunchArgument(
-        'refresh_interval_ms', default_value='2000',
-        description='Cache refresh interval in milliseconds')
+        'refresh_interval_ms', default_value='30000',
+        description=(
+            'Safety-backstop refresh interval in milliseconds. Primary '
+            'refresh is graph-event driven (~100 ms latency); this only '
+            'controls the periodic forced refresh. Must match the default '
+            'in config/gateway_params.yaml.'))
 
     # Build parameter overrides - only inject plugin path if found
     param_overrides = {
@@ -70,10 +79,11 @@ def generate_launch_description():
         executable='gateway_node',
         name='ros2_medkit_gateway',
         output='screen',
-        parameters=[default_config, param_overrides],
+        parameters=[default_config, LaunchConfiguration('config_file'), param_overrides],
         arguments=['--ros-args', '--log-level', 'info'])
 
     return LaunchDescription([
+        declare_override_config_arg,
         declare_host_arg,
         declare_port_arg,
         declare_refresh_arg,
