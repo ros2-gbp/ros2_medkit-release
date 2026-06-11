@@ -2,7 +2,7 @@ Installation
 ============
 
 This guide covers installation of ros2_medkit on Ubuntu 24.04 with ROS 2 Jazzy,
-Ubuntu 22.04 with ROS 2 Humble, or Ubuntu 24.04 with ROS 2 Rolling.
+Ubuntu 22.04 with ROS 2 Humble, or Ubuntu 26.04 with ROS 2 Lyrical.
 
 System Requirements
 -------------------
@@ -14,47 +14,32 @@ System Requirements
    * - Requirement
      - Version
    * - Operating System
-     - Ubuntu 24.04 LTS (Noble) or Ubuntu 22.04 LTS (Jammy)
+     - Ubuntu 26.04 LTS (Resolute), Ubuntu 24.04 LTS (Noble), or Ubuntu 22.04 LTS (Jammy)
    * - ROS 2 Distribution
-     - Jazzy, Humble, or Rolling
+     - Jazzy, Humble, or Lyrical
    * - C++ Compiler
      - GCC 11+ (C++17 support required)
    * - CMake
      - 3.22+
    * - Python
-     - 3.10+ (Humble) / 3.12+ (Jazzy / Rolling)
+     - 3.10+ (Humble) / 3.12+ (Jazzy) / 3.14+ (Lyrical)
 
 Prerequisites
 -------------
 
-**ROS 2 Jazzy, Humble, or Rolling** must be installed and sourced. Follow the official installation guide
+**ROS 2 Jazzy, Humble, or Lyrical** must be installed and sourced. Follow the official installation guide
 for your distribution:
 
 - Jazzy: https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html
 - Humble: https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html
-- Rolling: https://docs.ros.org/en/rolling/Installation/Ubuntu-Install-Debs.html
+- Lyrical: https://docs.ros.org/en/lyrical/Installation/Ubuntu-Install-Debs.html
 
 .. note::
 
-   On Ubuntu 22.04 (Humble), the ``libcpp-httplib-dev`` system package is either not
-   available or too old (0.10.x). ros2_medkit requires cpp-httplib >= 0.14 for the
-   ``httplib::StatusCode`` enum and ``std::string`` API overloads.
-
-   If ``libcpp-httplib-dev`` is installed, **remove it first** to avoid version conflicts:
-
-   .. code-block:: bash
-
-      sudo apt remove libcpp-httplib-dev
-
-   Then install cpp-httplib >= 0.14 from source:
-
-   .. code-block:: bash
-
-      sudo apt install cmake g++ libssl-dev
-      git clone --depth 1 --branch v0.14.3 https://github.com/yhirose/cpp-httplib.git /tmp/cpp-httplib
-      cd /tmp/cpp-httplib && mkdir build && cd build
-      cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DHTTPLIB_REQUIRE_OPENSSL=ON
-      sudo make install
+   On Ubuntu 22.04 (Humble), the system ``libcpp-httplib-dev`` package provides
+   cpp-httplib 0.10.x which is too old. ros2_medkit requires >= 0.14 but ships a
+   vendored copy as a fallback - no manual installation is needed. The build system
+   automatically uses the vendored header when the system package is insufficient.
 
 Installation from Source
 ------------------------
@@ -140,10 +125,32 @@ You should see output like:
 Docker Installation
 -------------------
 
-For containerized deployments, see the `selfpatch_demos <https://github.com/selfpatch/selfpatch_demos>`_ repository
-which includes Docker Compose examples with Nav2 and TurtleBot3.
+Pre-built Docker images are published to GitHub Container Registry for all supported
+ROS 2 distributions:
 
-See the :doc:`tutorials/docker` for detailed Docker usage instructions.
+.. code-block:: bash
+
+   # Jazzy (recommended)
+   docker run -p 8080:8080 ghcr.io/selfpatch/ros2_medkit-jazzy:latest
+
+   # Humble
+   docker run -p 8080:8080 ghcr.io/selfpatch/ros2_medkit-humble:latest
+
+   # Lyrical
+   docker run -p 8080:8080 ghcr.io/selfpatch/ros2_medkit-lyrical:latest
+
+The gateway will be available at http://localhost:8080/api/v1/health.
+
+To use a custom configuration, mount a params file:
+
+.. code-block:: bash
+
+   docker run -p 8080:8080 \
+     -v ./my_params.yaml:/etc/ros2_medkit/params.yaml \
+     ghcr.io/selfpatch/ros2_medkit-jazzy:latest
+
+See the :doc:`tutorials/docker` for detailed Docker usage instructions including
+Docker Compose examples and plugin configuration.
 
 Development Installation
 ------------------------
@@ -176,19 +183,11 @@ Troubleshooting
 
       gcc --version  # Should show 13.x or higher
 
-**Build fails on Humble with** ``httplib::StatusCode has not been declared``
+**Build fails on Humble with** ``Could not find cpp-httplib >= 0.14``
 
-   The system ``libcpp-httplib-dev`` package on Ubuntu 22.04 provides cpp-httplib 0.10.x,
-   which is too old. ros2_medkit requires cpp-httplib >= 0.14. Remove the system package
-   and install from source:
-
-   .. code-block:: bash
-
-      sudo apt remove libcpp-httplib-dev
-      git clone --depth 1 --branch v0.14.3 https://github.com/yhirose/cpp-httplib.git /tmp/cpp-httplib
-      cd /tmp/cpp-httplib && mkdir build && cd build
-      cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DHTTPLIB_REQUIRE_OPENSSL=ON
-      sudo make install
+   This should not happen with current builds - a vendored copy of cpp-httplib 0.14.3
+   is included as an automatic fallback. If you see this error, ensure ``ros2_medkit_cmake``
+   is built before the gateway (``colcon build`` handles this automatically).
 
 **Cannot find ros2_medkit packages after build**
 

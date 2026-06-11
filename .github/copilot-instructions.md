@@ -4,7 +4,7 @@
 
 **ros2_medkit** is a ROS 2 diagnostics gateway that exposes ROS 2 system information via a RESTful HTTP API aligned with the **SOVD (Service-Oriented Vehicle Diagnostics)** specification. It models robots as a diagnostic entity tree: **Area -> Component -> App**, with optional **Function** groupings.
 
-**Tech Stack**: C++17, ROS 2 Jazzy/Humble/Rolling, Ubuntu 24.04/22.04
+**Tech Stack**: C++17, ROS 2 Jazzy/Humble/Lyrical, Ubuntu 26.04/24.04/22.04
 
 ## Package Structure
 
@@ -25,19 +25,26 @@ Multi-package colcon workspace under `src/`:
 
 ## Architecture
 
+The package is organised in two named layers under `src/ros2_medkit_gateway/`:
+
+- **`include/.../core/`** + **`src/core/`** - middleware-neutral business logic. Compiles into the `gateway_core` STATIC library with no ROS dependencies. Hosts the HTTP routing, request handlers, JWT auth, fault model, peer aggregation, manifest parser, entity cache, and the neutral managers (lock, bulk-data, subscription, script, update, plugin).
+- The remainder of `src/` - ROS adapter layer. Compiles into `gateway_ros2` (links `gateway_core` publicly). Hosts `gateway_node` (rclcpp::Node), the ROS-coupled managers (data access, operation, configuration, fault facade, log, trigger), `runtime_discovery`, `native_topic_sampler`, and ROS-specific provider implementations.
+
 ```
-GatewayNode (src/ros2_medkit_gateway/src/gateway_node.cpp)
+GatewayNode (src/main.cpp + src/gateway_node.cpp)             [gateway_ros2]
 ├── DiscoveryManager      - Entity discovery (runtime / manifest / hybrid)
-│   └── EntityCache       - Thread-safe in-memory entity store
+│   └── EntityCache       - Thread-safe in-memory entity store         [core]
 ├── DataAccessManager     - Topic sampling and publishing
 ├── OperationManager      - Service calls and action goals
 ├── ConfigurationManager  - ROS 2 parameter CRUD
 ├── FaultManager          - Fault query/clear, SSE streams (delegates to fault_manager package)
 ├── LogManager            - /rosout ring buffer + plugin delegation
-├── PluginManager         - Dynamic plugin loading (.so), provider interfaces
-└── RESTServer            - cpp-httplib HTTP server (separate thread)
+├── PluginManager         - Dynamic plugin loading (.so), provider interfaces  [core]
+└── RESTServer            - cpp-httplib HTTP server (separate thread)          [core]
     └── HandlerContext    - Shared validation, entity lookup, error/JSON helpers
 ```
+
+The `gateway_core_purity` linter (greps for ROS includes under `core/`) and the `test_gateway_core_smoke` link-time test (compiles a TU against `gateway_core` alone) enforce the contract that the neutral layer carries no ROS coupling.
 
 ### Entity Model (SOVD-aligned)
 
@@ -67,14 +74,14 @@ Each entity type supports specific collections:
 - **C++17** with `-Wall -Wextra -Wpedantic -Wshadow -Wconversion`
 - **Formatting**: Google-based clang-format, 120 cols, 2-space indent, middle pointer alignment (`Type * ptr`)
 - **Headers**: `#pragma once`, Apache 2.0 copyright (year 2026 for new files)
-- **Namespace**: `ros2_medkit_gateway`
+- **Namespace**: `medkit::` for code under `core/`, `medkit::` (via the `ros2_medkit_gateway = medkit` alias in `include/ros2_medkit_gateway/compat.hpp`) for everything else. Existing code referencing `ros2_medkit_gateway::` keeps compiling via the alias during the migration.
 - **Error handling**: `tl::expected<T, std::string>` for fallible operations - NOT exceptions in handlers
 - **Thread safety**: Always get fresh `EntityCache` via `ctx_.node()->get_thread_safe_cache()` (in handlers)
 - **Header-only libs**: nlohmann::json, tl::expected, jwt-cpp, cpp-httplib
 
 ## Handler Pattern (follow for ALL new handlers)
 
-Handlers live in `src/http/handlers/`, one file per group. All handlers take `HandlerContext&` in constructor.
+Handlers live under `src/core/http/handlers/` (most groups - they are middleware-neutral) and `src/http/handlers/` (handlers that pull rclcpp transitively, currently `handler_context`, `fault_handlers`, `sse_fault_handler`, `cyclic_subscription_handlers`). One file per group. All handlers take `HandlerContext&` in constructor.
 
 ```cpp
 void ExampleHandlers::handle_request(const httplib::Request & req, httplib::Response & res) {
@@ -83,7 +90,7 @@ void ExampleHandlers::handle_request(const httplib::Request & req, httplib::Resp
 
   // 2. Validate entity (sends error response automatically if invalid)
   auto entity = ctx_.validate_entity_for_route(req, res, entity_id);
-  if (!entity) return;  // Error already sent
+  if (!entity) return;  // Response already sent (error or forwarded to peer)
 
   // 3. Check collection support (static method)
   if (auto err = HandlerContext::validate_collection_access(*entity, ResourceCollection::DATA)) {
@@ -110,7 +117,7 @@ void ExampleHandlers::handle_request(const httplib::Request & req, httplib::Resp
 
 | Method | Returns | Purpose |
 |--------|---------|---------|
-| `validate_entity_for_route(req, res, id)` | `optional<EntityInfo>` | Unified entity validation, sends error if invalid |
+| `validate_entity_for_route(req, res, id)` | `ValidateResult` (`tl::expected<EntityInfo, ValidationOutcome>`) | Unified entity validation; returns error or forward outcome on failure |
 | `validate_collection_access(entity, collection)` | `optional<string>` | Check SOVD capability support |
 | `send_error(res, status, code, msg, params)` | void | SOVD GenericError response |
 | `send_json(res, data)` | void | JSON success response |
@@ -148,7 +155,7 @@ Handler classes: `HealthHandlers`, `DiscoveryHandlers`, `DataHandlers`, `Operati
 
 ## Build System
 
-**Static library pattern**: `gateway_lib` bundles all source for shared use between executable and tests.
+**Static library pattern**: two layered targets - `gateway_core` (sources under `src/core/`, no ROS dependencies, links cpp-httplib + nlohmann/json + yaml-cpp + tl::expected + jwt-cpp + OpenSSL + SQLite + dl) and `gateway_ros2` (the remaining ROS-adapter sources, links `gateway_core` publicly via `medkit_target_dependencies()`). The `gateway_node` executable and existing test targets link `gateway_ros2` so they transitively get both layers. The link-only smoke test `test_gateway_core_smoke` deliberately links `gateway_core` plus GTest with no `ament_target_dependencies` to enforce the neutral contract.
 
 **CMake modules** in `cmake/`:
 - `ROS2MedkitCcache.cmake` - auto-detect ccache
@@ -211,9 +218,13 @@ Plugins provide custom backends via provider interfaces:
 
 | Provider | Interface | Purpose |
 |----------|-----------|---------|
-| `LogProvider` | `providers/log_provider.hpp` | Custom log backends |
-| `UpdateProvider` | `providers/update_provider.hpp` | Software update management |
-| `IntrospectionProvider` | `providers/introspection_provider.hpp` | Custom entity introspection |
+| `DataProvider` | `core/providers/data_provider.hpp` | Per-entity data resource backend |
+| `OperationProvider` | `core/providers/operation_provider.hpp` | Per-entity operation backend |
+| `FaultProvider` | `core/providers/fault_provider.hpp` | Per-entity fault backend |
+| `LogProvider` | `core/providers/log_provider.hpp` | Custom log backends |
+| `UpdateProvider` | `core/providers/update_provider.hpp` | Software update management |
+| `ScriptProvider` | `core/providers/script_provider.hpp` | Custom script execution backends |
+| `IntrospectionProvider` | `core/providers/introspection_provider.hpp` | Custom entity introspection |
 
 Plugins loaded as `.so` files with `extern "C"` factory. Provider interfaces return typed C++ structs (not JSON) - manager layer handles serialization. Plugin failures are caught and isolated.
 
@@ -242,7 +253,7 @@ When reviewing pull requests, apply these rules to the diff. Flag violations as 
 - **Flag** dereferencing a `tl::expected` or `std::optional` result without checking `if (!result)` first.
 - **Flag** error responses that don't use `HandlerContext::send_error()` or use string literals instead of constants from `error_codes.hpp`.
 - **Flag** custom vendor error codes that don't start with `x-medkit-` prefix.
-- **Flag** any code after `validate_entity_for_route()` that doesn't check for `nullopt` and return early - the error response is already sent by the validator.
+- **Flag** any code after `validate_entity_for_route()` that doesn't check for failure and return early - the response is already committed by the validator (either error sent or request forwarded to peer).
 
 ### Handler Pattern
 
@@ -263,8 +274,8 @@ When reviewing pull requests, apply these rules to the diff. Flag violations as 
 Every code change must include corresponding tests. A feature without tests is not complete.
 
 **Unit tests (C++ GTest)** - required for all new logic:
-- **Flag** new or modified files in `src/http/handlers/` without a corresponding `test/test_*_handlers.cpp` in the diff. Handler unit tests verify request validation, error responses, and edge cases without ROS 2 runtime.
-- **Flag** new or modified manager classes (`src/*.cpp`) without corresponding `test/test_*.cpp`. Manager tests verify business logic in isolation.
+- **Flag** new or modified files in `src/core/http/handlers/` or `src/http/handlers/` without a corresponding `test/test_*_handlers.cpp` in the diff. Handler unit tests verify request validation, error responses, and edge cases without ROS 2 runtime.
+- **Flag** new or modified manager classes (`src/core/managers/*.cpp` or `src/*.cpp`) without corresponding `test/test_*.cpp`. Manager tests verify business logic in isolation.
 - **Flag** new utility functions or static methods without unit tests covering their behavior.
 
 **Integration tests (Python launch_testing)** - required for all endpoint changes:
@@ -280,9 +291,10 @@ Every code change must include corresponding tests. A feature without tests is n
 
 ### Build & CMake
 
-- **Flag** new `.cpp` source files that aren't added to the `gateway_lib` STATIC library target in CMakeLists.txt.
-- **Flag** new test targets that don't link to `gateway_lib`.
-- **Flag** use of `ament_target_dependencies()` - use `medkit_target_dependencies()` instead (removed in Rolling).
+- **Flag** new `.cpp` source files under `src/core/` that aren't picked up by `gateway_core`'s `GLOB_RECURSE` source list, or new ROS-adapter `.cpp` files that aren't added to the `gateway_ros2` STATIC library target in CMakeLists.txt.
+- **Flag** any `#include <rclcpp/...>` or message-package include in a file under `core/` - the layer must stay middleware-neutral. The `gateway_core_purity` linter and `test_gateway_core_smoke` link test enforce this; do not paper over their failures.
+- **Flag** new test targets that don't link to `gateway_ros2` (the default), unless the test is intentionally a core-only smoke test linking `gateway_core` directly.
+- **Flag** use of `ament_target_dependencies()` - use `medkit_target_dependencies()` instead (deprecated in Kilted, removed in ament_cmake 2.8.5+ which Lyrical ships).
 - **Flag** direct `find_package(yaml-cpp)` or `find_package(httplib)` - use `medkit_find_yaml_cpp()` / `medkit_find_cpp_httplib()` for multi-distro compatibility.
 
 ### Documentation
