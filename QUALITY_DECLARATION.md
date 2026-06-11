@@ -33,7 +33,7 @@ All packages in the repository share the same version number.
 
 ### Version Stability [1.ii]
 
-The current version is **0.3.0**.
+The current version is **0.5.0**.
 The package follows semver; the pre-1.0 version reflects that the public API may still evolve
 based on early adopter feedback, not a lack of quality infrastructure.
 The 1.0.0 release is planned after the API has been validated through pilot deployments.
@@ -86,7 +86,7 @@ GitHub Copilot code review is used in addition to human review.
 
 All pull requests must pass CI before merging:
 
-- **Build & Test job:** Full build + unit/integration tests on Ubuntu Noble / ROS 2 Jazzy, Ubuntu Jammy / ROS 2 Humble, and Ubuntu Noble / ROS 2 Rolling (best-effort, allow-failure). Linter tests on Jazzy only
+- **Build & Test job:** Full build + unit/integration tests on Ubuntu Noble / ROS 2 Jazzy, Ubuntu Jammy / ROS 2 Humble, and Ubuntu Resolute / ROS 2 Lyrical. Linter tests on Jazzy only
 - **Coverage job:** Debug build with coverage. Reports are generated for all PRs as artifacts and uploaded to [Codecov](https://codecov.io/gh/selfpatch/ros2_medkit) on pushes to `main`
 - Linting enforced: `clang-format`, `clang-tidy` via `ament_lint_auto`
 
@@ -203,9 +203,9 @@ Linter tests are enforced in CI on every pull request.
 
 - **Ubuntu 24.04 (Noble)** with **ROS 2 Jazzy** (primary)
 - **Ubuntu 22.04 (Jammy)** with **ROS 2 Humble**
-- **Ubuntu 24.04 (Noble)** with **ROS 2 Rolling** (experimental, best-effort)
+- **Ubuntu 26.04 (Resolute)** with **ROS 2 Lyrical** (newest LTS, released May 2026)
 
-Jazzy and Humble are the Tier 1 platforms per [REP-2000](https://www.ros.org/reps/rep-2000.html) and are tested in CI. Rolling is tested as best-effort (allow-failure) for forward-compatibility.
+Jazzy and Humble are Tier 1 LTS platforms per [REP-2000](https://www.ros.org/reps/rep-2000.html); Lyrical is the newest LTS (May 2026) and is also tested in CI.
 
 ---
 
@@ -225,7 +225,7 @@ Security issues can be reported via GitHub Security Advisories on the
 
 | Requirement | Status | Notes |
 |---|---|---|
-| Version policy | Met | Semver, all packages at 0.3.0 |
+| Version policy | Met | Semver, all packages at 0.5.0 |
 | Stable version (>=1.0.0) | Caveat | Pre-1.0; API versioned, 1.0.0 planned post-pilot |
 | Change requests | Met | All changes via PR |
 | CI | Met | Build + test + coverage on every PR |
@@ -234,9 +234,9 @@ Security issues can be reported via GitHub Security Advisories on the
 | Feature tests | Met | 65 tests across unit + integration |
 | Coverage | Met | 75% line coverage |
 | Linting | Met | clang-format, clang-tidy, ament_lint |
-| Platform support | Met | Ubuntu Noble / ROS 2 Jazzy + Ubuntu Jammy / ROS 2 Humble + Rolling (best-effort) |
+| Platform support | Met | Ubuntu Noble / ROS 2 Jazzy + Ubuntu Jammy / ROS 2 Humble + Ubuntu Resolute / ROS 2 Lyrical |
 | Security policy | Met | REP-2006 compliant |
 
-**Caveat:** Version is 0.3.0 (pre-1.0.0, requirement 1.ii). The REST API is versioned (`/api/v1/`)
+**Caveat:** Version is 0.5.0 (pre-1.0.0, requirement 1.ii). The REST API is versioned (`/api/v1/`)
 and the package meets all other Level 3 requirements. The 1.0.0 release is planned after
 API validation through pilot deployments.

@@ -9,11 +9,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 include(ROS2MedkitCcache)
+include(ROS2MedkitSanitizers)
 include(ROS2MedkitLinting)
-
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic)
-endif()
+include(ROS2MedkitWarnings)
 
 # Code coverage option
 option(ENABLE_COVERAGE "Enable code coverage reporting" OFF)
@@ -40,6 +38,7 @@ find_package(nlohmann_json REQUIRED)
 add_library(${PROJECT_NAME}
   src/json_serializer.cpp
   src/type_cache.cpp
+  src/type_introspection.cpp
   src/service_action_types.cpp
   src/message_cleanup.cpp
   # Vendored dynmsg sources (C++ API only)
@@ -51,8 +50,19 @@ add_library(${PROJECT_NAME}
   src/vendored/dynmsg/yaml_utils.cpp
 )
 
+# Vendored dynmsg is third-party code - suppress our strict warnings
+set_source_files_properties(
+  src/vendored/dynmsg/typesupport.cpp
+  src/vendored/dynmsg/message_reading_cpp.cpp
+  src/vendored/dynmsg/msg_parser_cpp.cpp
+  src/vendored/dynmsg/string_utils.cpp
+  src/vendored/dynmsg/vector_utils.cpp
+  src/vendored/dynmsg/yaml_utils.cpp
+  PROPERTIES COMPILE_OPTIONS "-w"
+)
+
 # Enable PIC so this static library can be linked into shared objects
-# (e.g. test_gateway_plugin.so via gateway_lib.a)
+# (e.g. test_gateway_plugin.so via gateway_core.a / gateway_ros2.a)
 set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(${PROJECT_NAME} PUBLIC
@@ -126,24 +136,33 @@ if(BUILD_TESTING)
   )
   ament_lint_auto_find_test_dependencies()
 
-  # Configure clang-format manually for non-vendored files only
-  find_package(ament_cmake_clang_format REQUIRED)
-  set(_clang_format_config "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
-  ament_clang_format(
-    CONFIG_FILE "${_clang_format_config}"
-    "include/ros2_medkit_serialization/json_serializer.hpp"
-    "include/ros2_medkit_serialization/message_cleanup.hpp"
-    "include/ros2_medkit_serialization/serialization_error.hpp"
-    "include/ros2_medkit_serialization/service_action_types.hpp"
-    "include/ros2_medkit_serialization/type_cache.hpp"
-    "src/json_serializer.cpp"
-    "src/message_cleanup.cpp"
-    "src/service_action_types.cpp"
-    "src/type_cache.cpp"
-    "test/test_json_serializer.cpp"
-    "test/test_service_action_types.cpp"
-    "test/test_type_cache.cpp"
-  )
+  # Configure clang-format manually for non-vendored files only.
+  # ament_cmake_clang_format is intentionally only installed in the Jazzy
+  # quality job (ci.yml skips its rosdep key in the build-and-test job), so use
+  # QUIET + FOUND check instead of REQUIRED to gracefully degrade on the
+  # build-and-test runners without breaking the build.
+  find_package(ament_cmake_clang_format QUIET)
+  if(ament_cmake_clang_format_FOUND)
+    set(_clang_format_config "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
+    ament_clang_format(
+      CONFIG_FILE "${_clang_format_config}"
+      "include/ros2_medkit_serialization/json_serializer.hpp"
+      "include/ros2_medkit_serialization/message_cleanup.hpp"
+      "include/ros2_medkit_serialization/serialization_error.hpp"
+      "include/ros2_medkit_serialization/service_action_types.hpp"
+      "include/ros2_medkit_serialization/type_cache.hpp"
+      "include/ros2_medkit_serialization/type_introspection.hpp"
+      "src/json_serializer.cpp"
+      "src/message_cleanup.cpp"
+      "src/service_action_types.cpp"
+      "src/type_cache.cpp"
+      "src/type_introspection.cpp"
+      "test/test_json_serializer.cpp"
+      "test/test_service_action_types.cpp"
+      "test/test_type_cache.cpp"
+      "test/test_type_introspection.cpp"
+    )
+  endif()
 
   ros2_medkit_clang_tidy(
     HEADER_FILTER "^${CMAKE_CURRENT_SOURCE_DIR}/include/ros2_medkit_serialization/[^v].*"
@@ -163,6 +182,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_service_action_types ${PROJECT_NAME})
   medkit_target_dependencies(test_service_action_types std_srvs)
 
+  ament_add_gtest(test_type_introspection test/test_type_introspection.cpp)
+  target_link_libraries(test_type_introspection ${PROJECT_NAME})
+  medkit_target_dependencies(test_type_introspection std_msgs)
+
   # Apply coverage flags to test targets
   if(ENABLE_COVERAGE)
     target_compile_options(test_type_cache PRIVATE --coverage -O0 -g)
@@ -171,7 +194,10 @@ if(BUILD_TESTING)
     target_link_options(test_json_serializer PRIVATE --coverage)
     target_compile_options(test_service_action_types PRIVATE --coverage -O0 -g)
     target_link_options(test_service_action_types PRIVATE --coverage)
+    target_compile_options(test_type_introspection PRIVATE --coverage -O0 -g)
+    target_link_options(test_type_introspection PRIVATE --coverage)
   endif()
+  ros2_medkit_relax_vendor_warnings()
 endif()
 
 ament_package()

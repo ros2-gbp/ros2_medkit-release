@@ -24,13 +24,28 @@
 #include <set>
 #include <utility>
 
-#include "ros2_medkit_gateway/http/error_codes.hpp"
-#include "ros2_medkit_gateway/http/http_utils.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_context.hpp"
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
+#include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 
 namespace ros2_medkit_gateway {
 
 namespace {
+
+std::string format_timestamp_ns(int64_t ns) {
+  auto seconds = ns / 1'000'000'000;
+  auto nanos = ns % 1'000'000'000;
+  std::time_t time = static_cast<std::time_t>(seconds);
+  std::tm tm_buf{};
+  std::tm * tm = gmtime_r(&time, &tm_buf);
+  if (!tm) {
+    return "1970-01-01T00:00:00.000Z";
+  }
+  char buf[64];
+  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", tm);
+  char result[80];
+  std::snprintf(result, sizeof(result), "%s.%03dZ", buf, static_cast<int>(nanos / 1'000'000));
+  return result;
+}
 
 constexpr size_t kMaxCachedTopicMetrics = 512;
 
@@ -302,6 +317,30 @@ nlohmann::json build_graph_document_for_apps(const std::string & function_id,
 
 }  // namespace
 
+GraphProviderPlugin::~GraphProviderPlugin() noexcept {
+  // On Lyrical (originally observed on Rolling), destroying rclcpp resources
+  // (Subscription, Node) after rclcpp::shutdown() has invalidated the context
+  // can throw graph_listener::NodeNotFoundError. An exception escaping a
+  // destructor calls std::terminate(), so swallow it here.
+  try {
+    shutdown();
+  } catch (...) {
+  }
+}
+
+void GraphProviderPlugin::shutdown() {
+  if (shutdown_requested_.exchange(true)) {
+    return;
+  }
+  // ~rclcpp::Subscription can throw on Lyrical (and Rolling) when the rclcpp
+  // context was torn down before us; swallow so plugin_manager shutdown and
+  // the plugin destructor calling back into us do not abort the process.
+  try {
+    diagnostics_sub_.reset();
+  } catch (...) {
+  }
+}
+
 std::string GraphProviderPlugin::name() const {
   return "graph-provider";
 }
@@ -311,7 +350,7 @@ void GraphProviderPlugin::configure(const nlohmann::json & config) {
 }
 
 void GraphProviderPlugin::set_context(PluginContext & context) {
-  ctx_ = &context;
+  ctx_ = as_ros_plugin_context(context);
   ctx_->register_capability(SovdEntityType::FUNCTION, "x-medkit-graph");
 
   load_parameters();
@@ -329,45 +368,46 @@ void GraphProviderPlugin::set_context(PluginContext & context) {
   log_info("Registered x-medkit-graph cyclic subscription sampler");
 }
 
-void GraphProviderPlugin::register_routes(httplib::Server & server, const std::string & api_prefix) {
-  server.Get(api_prefix + R"(/functions/([^/]+)/x-medkit-graph)",
-             [this](const httplib::Request & req, httplib::Response & res) {
-               if (!ctx_) {
-                 PluginContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, "Graph provider context not initialized");
-                 return;
-               }
+std::vector<GatewayPlugin::PluginRoute> GraphProviderPlugin::get_routes() {
+  std::vector<GatewayPlugin::PluginRoute> routes;
+  routes.push_back(
+      {"GET", R"(functions/([^/]+)/x-medkit-graph)", [this](const PluginRequest & req, PluginResponse & res) {
+         if (!ctx_) {
+           res.send_error(503, ERR_SERVICE_UNAVAILABLE, "Graph provider context not initialized");
+           return;
+         }
 
-               const auto function_id = req.matches[1].str();
-               auto entity = ctx_->validate_entity_for_route(req, res, function_id);
-               if (!entity) {
-                 return;
-               }
+         const auto function_id = req.path_param(1);
+         auto entity = ctx_->validate_entity_for_route(req, res, function_id);
+         if (!entity) {
+           return;
+         }
 
-               // Check lock access for vendor extension collection
-               auto client_id = req.get_header_value("X-Client-Id");
-               auto lock_result = ctx_->check_lock(function_id, client_id, "x-medkit-graph");
-               if (!lock_result.allowed) {
-                 nlohmann::json params = {{"entity_id", function_id}, {"collection", "x-medkit-graph"}};
-                 if (!lock_result.denied_by_lock_id.empty()) {
-                   params["lock_id"] = lock_result.denied_by_lock_id;
-                 }
-                 if (lock_result.denied_code == "lock-required") {
-                   PluginContext::send_error(res, 409, ERR_INVALID_REQUEST, lock_result.denied_reason, params);
-                 } else {
-                   PluginContext::send_error(res, 409, ERR_LOCK_BROKEN, lock_result.denied_reason, params);
-                 }
-                 return;
-               }
+         // Check lock access for vendor extension collection
+         auto client_id = req.header("X-Client-Id");
+         auto lock_result = ctx_->check_lock(function_id, client_id, "x-medkit-graph");
+         if (!lock_result.allowed) {
+           nlohmann::json params = {{"entity_id", function_id}, {"collection", "x-medkit-graph"}};
+           if (!lock_result.denied_by_lock_id.empty()) {
+             params["lock_id"] = lock_result.denied_by_lock_id;
+           }
+           if (lock_result.denied_code == "lock-required") {
+             res.send_error(409, ERR_INVALID_REQUEST, lock_result.denied_reason, params);
+           } else {
+             res.send_error(409, ERR_LOCK_BROKEN, lock_result.denied_reason, params);
+           }
+           return;
+         }
 
-               auto payload = get_cached_or_built_graph(function_id);
-               if (!payload.has_value()) {
-                 PluginContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, "Graph snapshot not available",
-                                           {{"function_id", function_id}});
-                 return;
-               }
+         auto payload = get_cached_or_built_graph(function_id);
+         if (!payload.has_value()) {
+           res.send_error(503, ERR_SERVICE_UNAVAILABLE, "Graph snapshot not available", {{"function_id", function_id}});
+           return;
+         }
 
-               PluginContext::send_json(res, *payload);
-             });
+         res.send_json(*payload);
+       }});
+  return routes;
 }
 
 IntrospectionResult GraphProviderPlugin::introspect(const IntrospectionInput & input) {
@@ -410,6 +450,9 @@ void GraphProviderPlugin::subscribe_to_diagnostics() {
 }
 
 void GraphProviderPlugin::diagnostics_callback(const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr & msg) {
+  if (shutdown_requested_.load()) {
+    return;
+  }
   std::unordered_map<std::string, TopicMetrics> updates;
   for (const auto & status : msg->status) {
     if (is_filtered_topic_name(status.name)) {

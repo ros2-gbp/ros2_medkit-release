@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <mutex>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/laser_scan.hpp>
@@ -19,6 +20,8 @@
 
 #include "ros2_medkit_msgs/msg/fault.hpp"
 #include "ros2_medkit_msgs/srv/report_fault.hpp"
+
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
 
 /// Demo LIDAR sensor node that reports faults based on parameter validation.
 /// Used to demonstrate the fault management workflow:
@@ -81,21 +84,39 @@ class LidarSensor : public rclcpp::Node {
 
     // Initial fault check after short delay (allow fault_manager to start)
     initial_check_timer_ = this->create_wall_timer(std::chrono::seconds(3), [this]() {
-      check_and_report_faults();
-      initial_check_timer_->cancel();  // Only run once
+      std::lock_guard<std::mutex> lock(callback_mutex_);
+      if (!report_fault_client_) {
+        return;
+      }
+      check_and_report_faults_unlocked();
+      if (initial_check_timer_) {
+        initial_check_timer_->cancel();
+      }
     });
   }
 
   ~LidarSensor() {
+    param_callback_handle_.reset();
     scan_timer_->cancel();
     fault_check_timer_->cancel();
     if (initial_check_timer_) {
       initial_check_timer_->cancel();
     }
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    scan_timer_.reset();
+    fault_check_timer_.reset();
+    initial_check_timer_.reset();
+    calibrate_srv_.reset();
+    scan_pub_.reset();
+    report_fault_client_.reset();
   }
 
  private:
   rcl_interfaces::msg::SetParametersResult on_parameter_change(const std::vector<rclcpp::Parameter> & parameters) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!scan_pub_) {
+      return rcl_interfaces::msg::SetParametersResult();
+    }
     rcl_interfaces::msg::SetParametersResult result;
     result.successful = true;
 
@@ -115,6 +136,7 @@ class LidarSensor : public rclcpp::Node {
         }
         scan_frequency_ = new_freq;
         // Recreate timer with new frequency
+        scan_timer_->cancel();
         int period_ms = static_cast<int>(1000.0 / scan_frequency_);
         scan_timer_ =
             this->create_wall_timer(std::chrono::milliseconds(period_ms), std::bind(&LidarSensor::publish_scan, this));
@@ -126,7 +148,7 @@ class LidarSensor : public rclcpp::Node {
     }
 
     // Trigger fault check after parameter change
-    check_and_report_faults();
+    check_and_report_faults_unlocked();
 
     return result;
   }
@@ -148,6 +170,17 @@ class LidarSensor : public rclcpp::Node {
   }
 
   void check_and_report_faults() {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!report_fault_client_) {
+      return;
+    }
+    check_and_report_faults_unlocked();
+  }
+
+  void check_and_report_faults_unlocked() {
+    if (!report_fault_client_) {
+      return;
+    }
     if (!report_fault_client_->service_is_ready()) {
       RCLCPP_DEBUG(this->get_logger(), "Fault manager service not available, skipping fault check");
       return;
@@ -187,6 +220,10 @@ class LidarSensor : public rclcpp::Node {
   }
 
   void publish_scan() {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!scan_pub_) {
+      return;
+    }
     auto scan_msg = sensor_msgs::msg::LaserScan();
     scan_msg.header.stamp = this->now();
     scan_msg.header.frame_id = "lidar_link";
@@ -214,6 +251,8 @@ class LidarSensor : public rclcpp::Node {
     scan_pub_->publish(scan_msg);
   }
 
+  std::mutex callback_mutex_;
+
   // Publishers and services
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr scan_pub_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr calibrate_srv_;
@@ -239,8 +278,7 @@ class LidarSensor : public rclcpp::Node {
 };
 
 int main(int argc, char ** argv) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<LidarSensor>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<LidarSensor>();
+  });
 }

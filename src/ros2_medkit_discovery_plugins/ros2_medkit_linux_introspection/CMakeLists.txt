@@ -9,18 +9,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 include(ROS2MedkitCcache)
+include(ROS2MedkitSanitizers)
 include(ROS2MedkitLinting)
-
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
-endif()
+include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
 find_package(ros2_medkit_gateway REQUIRED)
 find_package(nlohmann_json REQUIRED)
-medkit_find_cpp_httplib()  # From ROS2MedkitCompat - handles Humble/Jazzy/Rolling differences
-find_package(OpenSSL REQUIRED)
-add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)  # Must match gateway's definition for ODR safety
 
 # --- Static utility library ---
 add_library(medkit_linux_utils STATIC
@@ -37,7 +32,7 @@ target_include_directories(medkit_linux_utils PUBLIC ${ros2_medkit_gateway_INCLU
 add_library(procfs_introspection MODULE
   src/procfs_plugin.cpp
 )
-target_link_libraries(procfs_introspection medkit_linux_utils cpp_httplib_target OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(procfs_introspection medkit_linux_utils)
 target_include_directories(procfs_introspection PRIVATE ${ros2_medkit_gateway_INCLUDE_DIRS})
 medkit_target_dependencies(procfs_introspection nlohmann_json)
 install(TARGETS procfs_introspection LIBRARY DESTINATION lib/${PROJECT_NAME})
@@ -50,7 +45,7 @@ if(SYSTEMD_FOUND)
   add_library(systemd_introspection MODULE
     src/systemd_plugin.cpp
   )
-  target_link_libraries(systemd_introspection medkit_linux_utils ${SYSTEMD_LIBRARIES} cpp_httplib_target OpenSSL::SSL OpenSSL::Crypto)
+  target_link_libraries(systemd_introspection medkit_linux_utils ${SYSTEMD_LIBRARIES})
   target_include_directories(systemd_introspection PRIVATE ${SYSTEMD_INCLUDE_DIRS} ${ros2_medkit_gateway_INCLUDE_DIRS})
   medkit_target_dependencies(systemd_introspection nlohmann_json)
   install(TARGETS systemd_introspection LIBRARY DESTINATION lib/${PROJECT_NAME})
@@ -62,7 +57,7 @@ endif()
 add_library(container_introspection MODULE
   src/container_plugin.cpp
 )
-target_link_libraries(container_introspection medkit_linux_utils cpp_httplib_target OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(container_introspection medkit_linux_utils)
 target_include_directories(container_introspection PRIVATE ${ros2_medkit_gateway_INCLUDE_DIRS})
 medkit_target_dependencies(container_introspection nlohmann_json)
 install(TARGETS container_introspection LIBRARY DESTINATION lib/${PROJECT_NAME})
@@ -84,12 +79,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_pid_cache medkit_linux_utils)
 
   ament_add_gtest(test_procfs_plugin test/test_procfs_plugin.cpp)
-  target_link_libraries(test_procfs_plugin medkit_linux_utils cpp_httplib_target)
+  target_link_libraries(test_procfs_plugin medkit_linux_utils)
   target_include_directories(test_procfs_plugin PRIVATE ${ros2_medkit_gateway_INCLUDE_DIRS})
   medkit_target_dependencies(test_procfs_plugin nlohmann_json)
 
   ament_add_gtest(test_container_plugin test/test_container_plugin.cpp)
-  target_link_libraries(test_container_plugin medkit_linux_utils cpp_httplib_target)
+  target_link_libraries(test_container_plugin medkit_linux_utils)
   target_include_directories(test_container_plugin PRIVATE ${ros2_medkit_gateway_INCLUDE_DIRS})
   medkit_target_dependencies(test_container_plugin nlohmann_json)
 
@@ -97,6 +92,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_systemd_plugin medkit_linux_utils)
   target_include_directories(test_systemd_plugin PRIVATE ${ros2_medkit_gateway_INCLUDE_DIRS})
   medkit_target_dependencies(test_systemd_plugin nlohmann_json)
+  ros2_medkit_relax_vendor_warnings()
 endif()
 
 ament_package()

@@ -15,16 +15,15 @@
 cmake_minimum_required(VERSION 3.8)
 project(ros2_medkit_topic_beacon)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
-endif()
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Shared cmake modules (multi-distro compat, ccache, linting)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
+include(ROS2MedkitCcache)
+include(ROS2MedkitSanitizers)
+include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
 find_package(ros2_medkit_beacon_common REQUIRED)
@@ -33,16 +32,10 @@ find_package(ros2_medkit_gateway REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
-find_package(OpenSSL REQUIRED)
-
-# cpp-httplib via multi-distro compatibility macro
-medkit_find_cpp_httplib()
-
-# Enable OpenSSL support for cpp-httplib
-add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
 
 # MODULE target: loaded via dlopen at runtime by PluginManager.
-# Symbols from gateway_lib are resolved from the host process at runtime.
+# Symbols from gateway_ros2 (and gateway_core transitively) are resolved
+# from the host process at runtime.
 # We only need headers at compile time (via medkit_target_dependencies).
 add_library(topic_beacon_plugin MODULE
   src/topic_beacon_plugin.cpp
@@ -62,8 +55,6 @@ medkit_target_dependencies(topic_beacon_plugin
 target_link_libraries(topic_beacon_plugin
   nlohmann_json::nlohmann_json
   ros2_medkit_beacon_common::beacon_common_lib
-  cpp_httplib_target
-  OpenSSL::SSL OpenSSL::Crypto
 )
 
 install(TARGETS topic_beacon_plugin
@@ -80,14 +71,22 @@ if(BUILD_TESTING)
   )
   ament_lint_auto_find_test_dependencies()
 
-  find_package(ament_cmake_clang_format REQUIRED)
-  file(GLOB_RECURSE _format_files
-    "include/*.hpp" "src/*.cpp" "test/*.cpp"
-  )
-  ament_clang_format(${_format_files}
-    CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+  # ci.yml skips the ament_cmake_clang_format rosdep key in the build-and-test
+  # job (linters only run in the Jazzy quality job), so QUIET + FOUND check
+  # avoids hard-failing when the package is not installed.
+  find_package(ament_cmake_clang_format QUIET)
+  if(ament_cmake_clang_format_FOUND)
+    file(GLOB_RECURSE _format_files
+      "include/*.hpp" "src/*.cpp" "test/*.cpp"
+    )
+    ament_clang_format(${_format_files}
+      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+  endif()
 
   find_package(ament_cmake_gtest REQUIRED)
+
+  include(ROS2MedkitTestDomain)
+  medkit_init_test_domains(START 110 END 119)
 
   # Include plugin source in test (plugin is MODULE/dlopen, test instantiates directly)
   ament_add_gtest(test_topic_beacon_plugin
@@ -100,11 +99,9 @@ if(BUILD_TESTING)
     ros2_medkit_msgs ros2_medkit_gateway ros2_medkit_beacon_common rclcpp diagnostic_msgs)
   target_link_libraries(test_topic_beacon_plugin
     nlohmann_json::nlohmann_json
-    ros2_medkit_beacon_common::beacon_common_lib
-    cpp_httplib_target
-    OpenSSL::SSL OpenSSL::Crypto)
-  set_tests_properties(test_topic_beacon_plugin PROPERTIES
-    ENVIRONMENT "ROS_DOMAIN_ID=69")
+    ros2_medkit_beacon_common::beacon_common_lib)
+  medkit_set_test_domain(test_topic_beacon_plugin)
+  ros2_medkit_relax_vendor_warnings()
 endif()
 
 ament_package()
