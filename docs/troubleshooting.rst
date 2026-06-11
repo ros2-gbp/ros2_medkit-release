@@ -197,11 +197,16 @@ Optimize with:
 
 **High CPU usage**
 
-Reduce cache refresh rate:
+Discovery is graph-event driven (polled every 100 ms), so a stable graph
+already incurs near-zero refresh overhead. On a graph with frequent node
+churn that does not need to be reflected immediately, raise the safety-backstop
+interval above the default ``30000`` to reduce the worst-case forced refresh
+rate:
 
 .. code-block:: yaml
 
-   refresh_interval_ms: 30000  # 30 seconds instead of default 10s
+   refresh_interval_ms: 60000  # Raise from default 30s if recovery from a
+                                # missed graph event can tolerate longer delay.
 
 FAQ
 ---
@@ -214,7 +219,7 @@ parameter changes) only happen when explicitly requested via the API.
 
 **Q: Can I use ros2_medkit with ROS 1?**
 
-No. ros2_medkit requires ROS 2 (Jazzy, Humble, or Rolling). For ROS 1 systems, consider using
+No. ros2_medkit requires ROS 2 (Jazzy, Humble, or Lyrical). For ROS 1 systems, consider using
 the ``ros1_bridge`` and running ros2_medkit on the ROS 2 side.
 
 **Q: Is ros2_medkit production-ready?**
@@ -254,7 +259,7 @@ ros2_medkit is currently suitable for development and testing. For production:
 **Q: Can I extend ros2_medkit with custom endpoints?**
 
 Yes. The gateway plugin framework allows you to add custom REST endpoints via
-``GatewayPlugin::register_routes()``. Create a shared library (``.so``) that
+``GatewayPlugin::get_routes()``. Create a shared library (``.so``) that
 implements the ``GatewayPlugin`` base class and configure it in ``gateway_params.yaml``.
 See :doc:`/config/server` for plugin configuration details.
 

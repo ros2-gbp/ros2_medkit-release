@@ -24,6 +24,7 @@
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include "ros2_medkit_gateway/core/plugins/plugin_http_types.hpp"
 #include "ros2_medkit_topic_beacon/topic_beacon_plugin.hpp"
 
 using ros2_medkit_beacon::BeaconHint;
@@ -34,6 +35,9 @@ using ros2_medkit_gateway::IntrospectionProvider;
 using ros2_medkit_gateway::PLUGIN_API_VERSION;
 using ros2_medkit_gateway::PluginContext;
 using ros2_medkit_gateway::PluginEntityInfo;
+using ros2_medkit_gateway::PluginRequest;
+using ros2_medkit_gateway::PluginResponse;
+using ros2_medkit_gateway::RosPluginContext;
 using ros2_medkit_gateway::SovdEntityType;
 
 // Extern "C" plugin exports (defined in topic_beacon_plugin.cpp, linked into test binary)
@@ -41,23 +45,36 @@ extern "C" int plugin_api_version();
 extern "C" GatewayPlugin * create_plugin();
 extern "C" IntrospectionProvider * get_introspection_provider(GatewayPlugin * plugin);
 
-// Stubs for PluginContext static methods (normally provided by gateway_lib).
-// The test binary doesn't link gateway_lib, so we provide minimal implementations.
+// Stubs for PluginRequest/PluginResponse (implemented in gateway_core, not linked into tests)
 namespace ros2_medkit_gateway {
-void PluginContext::send_json(httplib::Response & res, const nlohmann::json & data) {
-  res.set_content(data.dump(), "application/json");
+PluginRequest::PluginRequest(const void * impl) : impl_(impl) {
 }
-void PluginContext::send_error(httplib::Response & res, int status, const std::string & /*error_code*/,
-                               const std::string & message, const nlohmann::json & /*parameters*/) {
-  res.status = status;
-  nlohmann::json err = {{"error", message}};
-  res.set_content(err.dump(), "application/json");
+std::string PluginRequest::path_param(size_t /*index*/) const {
+  return {};
+}
+std::string PluginRequest::header(const std::string & /*name*/) const {
+  return {};
+}
+const std::string & PluginRequest::path() const {
+  static const std::string empty;
+  return empty;
+}
+const std::string & PluginRequest::body() const {
+  static const std::string empty;
+  return empty;
+}
+PluginResponse::PluginResponse(void * impl) : impl_(impl) {
+}
+void PluginResponse::send_json(const nlohmann::json & /*data*/) {
+}
+void PluginResponse::send_error(int /*status*/, const std::string & /*error_code*/, const std::string & /*message*/,
+                                const nlohmann::json & /*parameters*/) {
 }
 }  // namespace ros2_medkit_gateway
 
 // Minimal mock PluginContext for unit testing.
 // We only need node() and register_capability() to work.
-class MockPluginContext : public PluginContext {
+class MockPluginContext : public RosPluginContext {
  public:
   explicit MockPluginContext(rclcpp::Node * node) : node_(node) {
   }
@@ -78,8 +95,7 @@ class MockPluginContext : public PluginContext {
     return nlohmann::json::array();
   }
 
-  std::optional<PluginEntityInfo> validate_entity_for_route(const httplib::Request & /*req*/,
-                                                            httplib::Response & /*res*/,
+  std::optional<PluginEntityInfo> validate_entity_for_route(const PluginRequest & /*req*/, PluginResponse & /*res*/,
                                                             const std::string & /*entity_id*/) const override {
     return std::nullopt;
   }
@@ -350,4 +366,24 @@ TEST_F(TopicBeaconPluginTest, RateLimitingRejectsExcessMessages) {
   EXPECT_LT(accepted, static_cast<size_t>(num_messages)) << "Rate limiter should reject excess messages";
 
   rate_limited_plugin->shutdown();
+}
+
+TEST_F(TopicBeaconPluginTest, CallbackAfterShutdownDoesNotMutateStore) {
+  // Publish a message before shutdown to have baseline data
+  auto msg = make_hint("pre_shutdown_entity");
+  publisher_->publish(msg);
+  spin_for(std::chrono::milliseconds(200));
+
+  size_t store_size_before = plugin_->store().size();
+
+  // Shutdown the plugin
+  plugin_->shutdown();
+
+  // Publish another message - should be ignored by the callback
+  auto msg2 = make_hint("post_shutdown_entity");
+  publisher_->publish(msg2);
+  spin_for(std::chrono::milliseconds(200));
+
+  // Store should not have grown
+  EXPECT_EQ(plugin_->store().size(), store_size_before);
 }

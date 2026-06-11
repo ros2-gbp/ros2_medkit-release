@@ -17,8 +17,10 @@
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
 
+#include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
 #include "ros2_medkit_gateway/discovery/discovery_manager.hpp"
-#include "ros2_medkit_gateway/operation_manager.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_action_transport.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_service_transport.hpp"
 
 using namespace ros2_medkit_gateway;
 
@@ -33,22 +35,27 @@ class TestOperationManager : public ::testing::Test {
   }
 
   void SetUp() override {
-    // Use short timeout for tests to avoid long waits on nonexistent services
-    rclcpp::NodeOptions options;
-    options.parameter_overrides({rclcpp::Parameter("service_call_timeout_sec", static_cast<int64_t>(1))});
-    node_ = std::make_shared<rclcpp::Node>("test_operation_manager_node", options);
+    // Use short timeout for tests to avoid long waits on nonexistent services.
+    node_ = std::make_shared<rclcpp::Node>("test_operation_manager_node");
     discovery_manager_ = std::make_unique<DiscoveryManager>(node_.get());
-    operation_manager_ = std::make_unique<OperationManager>(node_.get(), discovery_manager_.get());
+    service_transport_ = std::make_shared<ros2::Ros2ServiceTransport>(node_.get());
+    action_transport_ = std::make_shared<ros2::Ros2ActionTransport>(node_.get());
+    operation_manager_ = std::make_unique<OperationManager>(service_transport_, action_transport_,
+                                                            discovery_manager_.get(), /*timeout=*/1);
   }
 
   void TearDown() override {
     operation_manager_.reset();
     discovery_manager_.reset();
+    service_transport_.reset();
+    action_transport_.reset();
     node_.reset();
   }
 
   std::shared_ptr<rclcpp::Node> node_;
   std::unique_ptr<DiscoveryManager> discovery_manager_;
+  std::shared_ptr<ros2::Ros2ServiceTransport> service_transport_;
+  std::shared_ptr<ros2::Ros2ActionTransport> action_transport_;
   std::unique_ptr<OperationManager> operation_manager_;
 };
 
@@ -245,6 +252,43 @@ TEST_F(TestOperationManager, test_cleanup_old_goals_with_zero_timeout) {
   // Cleanup with 0 timeout should clean all completed goals immediately
   EXPECT_NO_THROW(operation_manager_->cleanup_old_goals(std::chrono::seconds(0)));
   EXPECT_TRUE(operation_manager_->list_tracked_goals().empty());
+}
+
+TEST_F(TestOperationManager, test_cleanup_old_goals_evicts_stuck_non_terminal) {
+  // A goal stuck in ACCEPTED/EXECUTING past 2x max_age must be force-evicted
+  // to prevent unbounded tracked_goals_ growth when the action server crashes
+  // without publishing a terminal status.
+  ActionGoalInfo stuck;
+  stuck.goal_id = "stuck_goal_id_00000000000000000000";
+  stuck.action_path = "/test/stuck_action";
+  stuck.action_type = "example_interfaces/action/Fibonacci";
+  stuck.entity_id = "test_entity";
+  stuck.status = ActionGoalStatus::ACCEPTED;
+  // last_update is more than 2x max_age in the past.
+  const auto max_age = std::chrono::seconds(10);
+  const auto now = std::chrono::system_clock::now();
+  stuck.created_at = now - std::chrono::seconds(30);
+  stuck.last_update = now - std::chrono::seconds(25);  // > 2 * 10s
+  operation_manager_->inject_tracked_goal_for_testing(stuck);
+
+  // A fresh (non-terminal) goal must NOT be evicted by the same call.
+  ActionGoalInfo fresh;
+  fresh.goal_id = "fresh_goal_id_000000000000000000000";
+  fresh.action_path = "/test/fresh_action";
+  fresh.action_type = "example_interfaces/action/Fibonacci";
+  fresh.entity_id = "test_entity";
+  fresh.status = ActionGoalStatus::EXECUTING;
+  fresh.created_at = now;
+  fresh.last_update = now;
+  operation_manager_->inject_tracked_goal_for_testing(fresh);
+
+  ASSERT_EQ(operation_manager_->list_tracked_goals().size(), 2u);
+
+  operation_manager_->cleanup_old_goals(max_age);
+
+  auto remaining = operation_manager_->list_tracked_goals();
+  ASSERT_EQ(remaining.size(), 1u);
+  EXPECT_EQ(remaining[0].goal_id, fresh.goal_id);
 }
 
 TEST_F(TestOperationManager, test_update_goal_status_nonexistent) {
