@@ -106,6 +106,14 @@ def create_gateway_node(*, port=DEFAULT_PORT, extra_params=None, coverage=True):
         output='screen',
         parameters=[params],
         additional_env=get_coverage_env() if coverage else {},
+        # Default SIGINT->SIGTERM escalation is 5s and SIGTERM->SIGKILL is 5s.
+        # Under TSan/ASan the gateway shutdown sequence (mdns stop, REST server
+        # stop, transport teardown, plugin shutdown) easily exceeds 5s on slower
+        # CI runners, causing launch_testing to escalate to SIGKILL and the
+        # TestShutdown.test_exit_codes check to report -9. The process still
+        # shuts down cleanly given enough time, so widen both windows.
+        sigterm_timeout='30',
+        sigkill_timeout='15',
     )
 
 
@@ -181,7 +189,8 @@ def create_fault_manager_node(
 # Factory: demo nodes
 # ---------------------------------------------------------------------------
 
-def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True):
+def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True,
+                      extra_env=None):
     """Create demo node launch actions.
 
     Parameters
@@ -194,6 +203,10 @@ def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True):
         that trigger deterministic faults. If False, launch with defaults.
     coverage : bool
         If True, set GCOV_PREFIX env vars for code coverage collection.
+    extra_env : dict or None
+        Additional environment variables merged into each node's
+        ``additional_env``. Useful for setting ``ROS_DOMAIN_ID`` to
+        isolate nodes into a specific DDS domain.
 
     Returns
     -------
@@ -209,7 +222,9 @@ def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True):
     if nodes is None:
         nodes = ALL_DEMO_NODES
 
-    coverage_env = get_coverage_env() if coverage else {}
+    env = dict(get_coverage_env() if coverage else {})
+    if extra_env:
+        env.update(extra_env)
     actions = []
 
     for key in nodes:
@@ -221,7 +236,7 @@ def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True):
             name=ros_name,
             namespace=namespace,
             output='screen',
-            additional_env=coverage_env,
+            additional_env=env,
         )
 
         # Apply faulty parameters for lidar_sensor

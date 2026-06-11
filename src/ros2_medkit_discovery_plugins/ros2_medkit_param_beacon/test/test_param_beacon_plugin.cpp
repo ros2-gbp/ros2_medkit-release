@@ -24,6 +24,7 @@
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
 
+#include "ros2_medkit_gateway/core/plugins/plugin_http_types.hpp"
 #include "ros2_medkit_param_beacon/param_beacon_plugin.hpp"
 
 using ros2_medkit_beacon::BeaconHint;
@@ -34,6 +35,9 @@ using ros2_medkit_gateway::IntrospectionProvider;
 using ros2_medkit_gateway::PLUGIN_API_VERSION;
 using ros2_medkit_gateway::PluginContext;
 using ros2_medkit_gateway::PluginEntityInfo;
+using ros2_medkit_gateway::PluginRequest;
+using ros2_medkit_gateway::PluginResponse;
+using ros2_medkit_gateway::RosPluginContext;
 using ros2_medkit_gateway::SovdEntityType;
 using ros2_medkit_param_beacon::ParameterClientInterface;
 using ::testing::_;
@@ -44,16 +48,30 @@ extern "C" int plugin_api_version();
 extern "C" GatewayPlugin * create_plugin();
 extern "C" IntrospectionProvider * get_introspection_provider(GatewayPlugin * plugin);
 
-// Stubs for PluginContext static methods
+// Stubs for PluginRequest/PluginResponse (implemented in gateway_core, not linked into tests)
 namespace ros2_medkit_gateway {
-void PluginContext::send_json(httplib::Response & res, const nlohmann::json & data) {
-  res.set_content(data.dump(), "application/json");
+PluginRequest::PluginRequest(const void * impl) : impl_(impl) {
 }
-void PluginContext::send_error(httplib::Response & res, int status, const std::string &, const std::string & message,
-                               const nlohmann::json &) {
-  res.status = status;
-  nlohmann::json err = {{"error", message}};
-  res.set_content(err.dump(), "application/json");
+std::string PluginRequest::path_param(size_t /*index*/) const {
+  return {};
+}
+std::string PluginRequest::header(const std::string & /*name*/) const {
+  return {};
+}
+const std::string & PluginRequest::path() const {
+  static const std::string empty;
+  return empty;
+}
+const std::string & PluginRequest::body() const {
+  static const std::string empty;
+  return empty;
+}
+PluginResponse::PluginResponse(void * impl) : impl_(impl) {
+}
+void PluginResponse::send_json(const nlohmann::json & /*data*/) {
+}
+void PluginResponse::send_error(int /*status*/, const std::string & /*error_code*/, const std::string & /*message*/,
+                                const nlohmann::json & /*parameters*/) {
 }
 }  // namespace ros2_medkit_gateway
 
@@ -67,7 +85,7 @@ class MockParameterClient : public ParameterClientInterface {
   MOCK_METHOD(std::vector<rclcpp::Parameter>, get_parameters, (const std::vector<std::string> & names), (override));
 };
 
-class MockPluginContext : public PluginContext {
+class MockPluginContext : public RosPluginContext {
  public:
   explicit MockPluginContext(rclcpp::Node * node) : node_(node) {
   }
@@ -84,7 +102,7 @@ class MockPluginContext : public PluginContext {
   nlohmann::json list_entity_faults(const std::string &) const override {
     return nlohmann::json::array();
   }
-  std::optional<PluginEntityInfo> validate_entity_for_route(const httplib::Request &, httplib::Response &,
+  std::optional<PluginEntityInfo> validate_entity_for_route(const PluginRequest &, PluginResponse &,
                                                             const std::string &) const override {
     return std::nullopt;
   }
@@ -321,12 +339,17 @@ TEST_F(ParamBeaconPluginTest, BackoffOnTimeout) {
   input.apps.push_back(app);
   plugin_->introspect(input);
 
-  // Wait long enough for multiple poll cycles
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-  // Eventually the hint should appear after backoff recovery
-  auto stored = plugin_->store().get("backoff_test");
-  ASSERT_TRUE(stored.has_value());
+  // Poll until backoff recovery completes instead of fixed sleep
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  decltype(plugin_->store().get("backoff_test")) stored;
+  while (std::chrono::steady_clock::now() < deadline) {
+    stored = plugin_->store().get("backoff_test");
+    if (stored.has_value()) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ASSERT_TRUE(stored.has_value()) << "Backoff recovery did not complete within 5 seconds";
 }
 
 TEST_F(ParamBeaconPluginTest, MetadataSubParams) {
@@ -429,4 +452,18 @@ TEST_F(ParamBeaconPluginTest, ExceptionInPollNodeTriggersBackoff) {
   // Should not crash
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   EXPECT_EQ(plugin_->store().size(), 0u);
+}
+
+TEST_F(ParamBeaconPluginTest, PollCycleAfterShutdownIsNoop) {
+  setup_plugin();
+
+  // Let initial poll happen
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  plugin_->shutdown();
+
+  // Store should not grow after shutdown (poll_cycle exits early)
+  size_t store_size = plugin_->store().size();
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  EXPECT_EQ(plugin_->store().size(), store_size);
 }

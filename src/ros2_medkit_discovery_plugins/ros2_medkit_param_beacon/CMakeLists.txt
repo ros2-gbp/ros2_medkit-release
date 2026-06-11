@@ -15,29 +15,21 @@
 cmake_minimum_required(VERSION 3.8)
 project(ros2_medkit_param_beacon)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
-endif()
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Shared cmake modules (multi-distro compat, ccache, linting)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
+include(ROS2MedkitCcache)
+include(ROS2MedkitSanitizers)
+include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
 find_package(ros2_medkit_beacon_common REQUIRED)
 find_package(ros2_medkit_gateway REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(nlohmann_json REQUIRED)
-find_package(OpenSSL REQUIRED)
-
-# cpp-httplib via multi-distro compatibility macro
-medkit_find_cpp_httplib()
-
-# Enable OpenSSL support for cpp-httplib
-add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
 
 # MODULE target: loaded via dlopen at runtime by PluginManager.
 add_library(param_beacon_plugin MODULE
@@ -57,8 +49,6 @@ medkit_target_dependencies(param_beacon_plugin
 target_link_libraries(param_beacon_plugin
   nlohmann_json::nlohmann_json
   ros2_medkit_beacon_common::beacon_common_lib
-  cpp_httplib_target
-  OpenSSL::SSL OpenSSL::Crypto
 )
 
 install(TARGETS param_beacon_plugin
@@ -75,31 +65,42 @@ if(BUILD_TESTING)
   )
   ament_lint_auto_find_test_dependencies()
 
-  find_package(ament_cmake_clang_format REQUIRED)
-  file(GLOB_RECURSE _format_files
-    "include/*.hpp" "src/*.cpp" "test/*.cpp"
-  )
-  ament_clang_format(${_format_files}
-    CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+  # ci.yml skips the ament_cmake_clang_format rosdep key in the build-and-test
+  # job (linters only run in the Jazzy quality job), so QUIET + FOUND check
+  # avoids hard-failing when the package is not installed.
+  find_package(ament_cmake_clang_format QUIET)
+  if(ament_cmake_clang_format_FOUND)
+    file(GLOB_RECURSE _format_files
+      "include/*.hpp" "src/*.cpp" "test/*.cpp"
+    )
+    ament_clang_format(${_format_files}
+      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+  endif()
 
   find_package(ament_cmake_gmock REQUIRED)
 
+  include(ROS2MedkitTestDomain)
+  medkit_init_test_domains(START 100 END 109)
+
   # Include plugin source in test (plugin is MODULE/dlopen, test instantiates directly)
+  # TIMEOUT 180: the 12 test cases each spin a node for ~200-400 ms. Under
+  # plain gcc that's ~4 s total, well under the 30 s ctest default, but TSan
+  # instrumentation inflates that 5-10x and occasionally trips the 30 s cap
+  # (CI saw timeouts at test 4/12 around 27 s). 180 s covers the worst-case
+  # sanitizer slowdown without masking real hangs.
   ament_add_gmock(test_param_beacon_plugin
     test/test_param_beacon_plugin.cpp
     src/param_beacon_plugin.cpp
-    TIMEOUT 30)
+    TIMEOUT 180)
   target_include_directories(test_param_beacon_plugin PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
   medkit_target_dependencies(test_param_beacon_plugin
     ros2_medkit_gateway ros2_medkit_beacon_common rclcpp)
   target_link_libraries(test_param_beacon_plugin
     nlohmann_json::nlohmann_json
-    ros2_medkit_beacon_common::beacon_common_lib
-    cpp_httplib_target
-    OpenSSL::SSL OpenSSL::Crypto)
-  set_tests_properties(test_param_beacon_plugin PROPERTIES
-    ENVIRONMENT "ROS_DOMAIN_ID=70")
+    ros2_medkit_beacon_common::beacon_common_lib)
+  medkit_set_test_domain(test_param_beacon_plugin)
+  ros2_medkit_relax_vendor_warnings()
 endif()
 
 ament_package()
