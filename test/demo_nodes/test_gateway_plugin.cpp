@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "ros2_medkit_gateway/plugins/gateway_plugin.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_context.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_types.hpp"
-#include "ros2_medkit_gateway/providers/introspection_provider.hpp"
-#include "ros2_medkit_gateway/providers/update_provider.hpp"
+#include "ros2_medkit_gateway/core/plugins/gateway_plugin.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_context.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_types.hpp"
+#include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/core/providers/update_provider.hpp"
 
-#include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -51,63 +50,66 @@ class TestGatewayPlugin : public GatewayPlugin, public UpdateProvider, public In
     ctx_->register_capability(SovdEntityType::COMPONENT, "x-medkit-diagnostics");
   }
 
-  void register_routes(httplib::Server & server, const std::string & api_prefix) override {
-    // Global vendor extension endpoint
-    server.Get((api_prefix + "/x-test/ping").c_str(), [](const httplib::Request &, httplib::Response & res) {
-      res.set_content("pong", "text/plain");
-    });
-
-    // Entity-scoped vendor extension: GET /components/{id}/x-medkit-diagnostics
-    server.Get((api_prefix + R"(/components/([^/]+)/x-medkit-diagnostics)").c_str(),
-               [this](const httplib::Request & req, httplib::Response & res) {
-                 auto entity_id = req.matches[1].str();
-                 auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
-                 if (!entity) {
-                   return;
-                 }
-                 nlohmann::json data = {{"entity_id", entity->id},
-                                        {"plugin", "test_plugin"},
-                                        {"cpu_usage", 42.5},
-                                        {"memory_mb", 128},
-                                        {"uptime_seconds", 3600}};
-                 PluginContext::send_json(res, data);
-               });
+  std::vector<PluginRoute> get_routes() override {
+    return {
+        {"GET", "x-test/ping",
+         [](const PluginRequest &, PluginResponse & res) {
+           res.send_json({{"response", "pong"}});
+         }},
+        {"GET", R"(components/([^/]+)/x-medkit-diagnostics)",
+         [this](const PluginRequest & req, PluginResponse & res) {
+           auto entity_id = req.path_param(1);
+           auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
+           if (!entity) {
+             return;
+           }
+           nlohmann::json data = {{"entity_id", entity->id},
+                                  {"plugin", "test_plugin"},
+                                  {"cpu_usage", 42.5},
+                                  {"memory_mb", 128},
+                                  {"uptime_seconds", 3600}};
+           res.send_json(data);
+         }},
+    };
   }
 
  private:
   PluginContext * ctx_{nullptr};
 
   // --- UpdateProvider ---
-  tl::expected<std::vector<std::string>, UpdateBackendErrorInfo> list_updates(const UpdateFilter &) override {
+  tl::expected<std::vector<std::string>, UpdateBackendErrorInfo>
+  list_updates(const UpdateFilter & /*filter*/) override {
     return std::vector<std::string>{};
   }
 
-  tl::expected<nlohmann::json, UpdateBackendErrorInfo> get_update(const std::string & id) override {
+  tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo> get_update(const std::string & id) override {
     return tl::make_unexpected(UpdateBackendErrorInfo{UpdateBackendError::NotFound, "not found: " + id});
   }
 
-  tl::expected<void, UpdateBackendErrorInfo> register_update(const nlohmann::json &) override {
+  tl::expected<void, UpdateBackendErrorInfo> register_update(const nlohmann::json & /*metadata*/) override {
     return {};
   }
 
-  tl::expected<void, UpdateBackendErrorInfo> delete_update(const std::string &) override {
+  tl::expected<void, UpdateBackendErrorInfo> delete_update(const std::string & /*id*/) override {
     return {};
   }
 
-  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string &, UpdateProgressReporter &) override {
+  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string & /*id*/,
+                                                     UpdateProgressReporter & /*reporter*/) override {
     return {};
   }
 
-  tl::expected<void, UpdateBackendErrorInfo> execute(const std::string &, UpdateProgressReporter &) override {
+  tl::expected<void, UpdateBackendErrorInfo> execute(const std::string & /*id*/,
+                                                     UpdateProgressReporter & /*reporter*/) override {
     return {};
   }
 
-  tl::expected<bool, UpdateBackendErrorInfo> supports_automated(const std::string &) override {
+  tl::expected<bool, UpdateBackendErrorInfo> supports_automated(const std::string & /*id*/) override {
     return false;
   }
 
   // --- IntrospectionProvider ---
-  IntrospectionResult introspect(const IntrospectionInput &) override {
+  IntrospectionResult introspect(const IntrospectionInput & /*input*/) override {
     return {};
   }
 };

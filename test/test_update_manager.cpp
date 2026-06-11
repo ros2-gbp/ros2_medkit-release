@@ -17,7 +17,7 @@
 #include <chrono>
 #include <thread>
 
-#include "ros2_medkit_gateway/updates/update_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/update_manager.hpp"
 
 using namespace ros2_medkit_gateway;
 using json = nlohmann::json;
@@ -25,22 +25,24 @@ using json = nlohmann::json;
 /// Mock backend for unit testing
 class MockUpdateBackend : public UpdateProvider {
  public:
-  tl::expected<std::vector<std::string>, UpdateBackendErrorInfo> list_updates(const UpdateFilter &) override {
+  tl::expected<std::vector<std::string>, UpdateBackendErrorInfo>
+  list_updates(const UpdateFilter & /*filter*/) override {
     std::lock_guard<std::mutex> lock(mutex_);
     std::vector<std::string> ids;
+    ids.reserve(packages_.size());
     for (const auto & [id, _] : packages_) {
       ids.push_back(id);
     }
     return ids;
   }
 
-  tl::expected<json, UpdateBackendErrorInfo> get_update(const std::string & id) override {
+  tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo> get_update(const std::string & id) override {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = packages_.find(id);
     if (it == packages_.end()) {
       return tl::make_unexpected(UpdateBackendErrorInfo{UpdateBackendError::NotFound, "not found"});
     }
-    return it->second;
+    return dto::UpdateDetail{it->second};
   }
 
   tl::expected<void, UpdateBackendErrorInfo> register_update(const json & metadata) override {
@@ -64,14 +66,16 @@ class MockUpdateBackend : public UpdateProvider {
     return {};
   }
 
-  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string &, UpdateProgressReporter & reporter) override {
+  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string & /*id*/,
+                                                     UpdateProgressReporter & reporter) override {
     reporter.set_progress(50);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     reporter.set_progress(100);
     return {};
   }
 
-  tl::expected<void, UpdateBackendErrorInfo> execute(const std::string &, UpdateProgressReporter & reporter) override {
+  tl::expected<void, UpdateBackendErrorInfo> execute(const std::string & /*id*/,
+                                                     UpdateProgressReporter & reporter) override {
     reporter.set_progress(100);
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     return {};
@@ -142,7 +146,11 @@ TEST_F(UpdateManagerTest, GetUpdate) {
 
   auto result = manager_->get_update("test-pkg");
   ASSERT_TRUE(result.has_value());
-  EXPECT_EQ((*result)["id"], "test-pkg");
+  EXPECT_EQ(result->content["id"], "test-pkg");
+  // Wire-byte round-trip: JsonWriter<UpdateDetail> must reproduce the bare
+  // metadata object the plugin stored, so vendor extension keys survive the
+  // typed envelope.
+  EXPECT_EQ(dto::JsonWriter<dto::UpdateDetail>::write(*result), pkg);
 }
 
 // @verifies REQ_INTEROP_085
@@ -298,6 +306,22 @@ TEST_F(UpdateManagerTest, StatusNotFoundForUnknown) {
   EXPECT_EQ(result.error().code, UpdateErrorCode::NotFound);
 }
 
+// @verifies REQ_INTEROP_094
+TEST_F(UpdateManagerTest, StatusPendingRightAfterRegister) {
+  // Registering an update must immediately yield a Pending status so the
+  // UpdatesDashboard (which gates action buttons on a non-null status
+  // response) can render Prepare / Execute / Delete without waiting for a
+  // separate prepare call.
+  json pkg = {{"id", "fresh-pkg"}, {"update_name", "Fresh"}, {"automated", false}};
+  ASSERT_TRUE(manager_->register_update(pkg).has_value());
+
+  auto status = manager_->get_status("fresh-pkg");
+  ASSERT_TRUE(status.has_value()) << status.error().message;
+  EXPECT_EQ(status->status, UpdateStatus::Pending);
+  EXPECT_FALSE(status->progress.has_value());
+  EXPECT_FALSE(status->error_message.has_value());
+}
+
 // @verifies REQ_INTEROP_083
 TEST_F(UpdateManagerTest, DuplicateRegistration) {
   json pkg = {{"id", "test-pkg"}, {"update_name", "Test"}, {"automated", false}};
@@ -329,8 +353,8 @@ class MockFailingBackend : public UpdateProvider {
   list_updates(const UpdateFilter & /*filter*/) override {
     return tl::make_unexpected(UpdateBackendErrorInfo{UpdateBackendError::Internal, "backend error"});
   }
-  tl::expected<json, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
-    return json{{"id", "pkg"}};
+  tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
+    return dto::UpdateDetail{json{{"id", "pkg"}}};
   }
   tl::expected<void, UpdateBackendErrorInfo> register_update(const json & metadata) override {
     auto id = metadata.value("id", std::string{});
@@ -362,8 +386,8 @@ class MockThrowingBackend : public UpdateProvider {
   list_updates(const UpdateFilter & /*filter*/) override {
     return std::vector<std::string>{};
   }
-  tl::expected<json, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
-    return json{{"id", "pkg"}};
+  tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
+    return dto::UpdateDetail{json{{"id", "pkg"}}};
   }
   tl::expected<void, UpdateBackendErrorInfo> register_update(const json & /*metadata*/) override {
     return {};
@@ -420,8 +444,8 @@ class MockExecuteFailingBackend : public UpdateProvider {
   list_updates(const UpdateFilter & /*filter*/) override {
     return std::vector<std::string>{};
   }
-  tl::expected<json, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
-    return json{{"id", "pkg"}};
+  tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
+    return dto::UpdateDetail{json{{"id", "pkg"}}};
   }
   tl::expected<void, UpdateBackendErrorInfo> register_update(const json & /*metadata*/) override {
     return {};
@@ -450,8 +474,8 @@ class MockExecuteThrowingBackend : public UpdateProvider {
   list_updates(const UpdateFilter & /*filter*/) override {
     return std::vector<std::string>{};
   }
-  tl::expected<json, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
-    return json{{"id", "pkg"}};
+  tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
+    return dto::UpdateDetail{json{{"id", "pkg"}}};
   }
   tl::expected<void, UpdateBackendErrorInfo> register_update(const json & /*metadata*/) override {
     return {};
@@ -582,4 +606,95 @@ TEST(UpdateManagerFailureTest, ExecuteExceptionSetsFailedStatus) {
   EXPECT_NE(status.error_message->find("Exception"), std::string::npos);
   manager.reset();
   backend.reset();
+}
+
+/// Mock backend whose register succeeds but delete_update fails. Lets us
+/// verify the rollback path updates status, phase, and error_message so the
+/// /updates/{id}/status payload stays internally consistent.
+class MockDeleteFailingBackend : public UpdateProvider {
+ public:
+  tl::expected<std::vector<std::string>, UpdateBackendErrorInfo>
+  list_updates(const UpdateFilter & /*filter*/) override {
+    return std::vector<std::string>{};
+  }
+  tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
+    return dto::UpdateDetail{json{{"id", "pkg"}}};
+  }
+  tl::expected<void, UpdateBackendErrorInfo> register_update(const json & /*metadata*/) override {
+    return {};
+  }
+  tl::expected<void, UpdateBackendErrorInfo> delete_update(const std::string & /*id*/) override {
+    return tl::make_unexpected(UpdateBackendErrorInfo{UpdateBackendError::Internal, "backend delete exploded"});
+  }
+  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string & /*id*/,
+                                                     UpdateProgressReporter & /*reporter*/) override {
+    return {};
+  }
+  tl::expected<void, UpdateBackendErrorInfo> execute(const std::string & /*id*/,
+                                                     UpdateProgressReporter & /*reporter*/) override {
+    return {};
+  }
+  tl::expected<bool, UpdateBackendErrorInfo> supports_automated(const std::string & /*id*/) override {
+    return true;
+  }
+};
+
+TEST(UpdateManagerFailureTest, DeleteRollbackUpdatesStatusPhaseAndErrorMessage) {
+  // When delete_update fails for a known package, the rollback must leave
+  // status=Failed, phase=Failed, and error_message populated so the status
+  // endpoint does not emit an inconsistent payload like
+  // {status:pending, "x-medkit":{phase:failed}} without any error details.
+  auto backend = std::make_unique<MockDeleteFailingBackend>();
+  auto manager = std::make_unique<UpdateManager>();
+  manager->set_backend(backend.get());
+
+  json pkg = {{"id", "test-pkg"}};
+  ASSERT_TRUE(manager->register_update(pkg).has_value());
+
+  auto del = manager->delete_update("test-pkg");
+  ASSERT_FALSE(del.has_value());
+
+  auto status = manager->get_status("test-pkg");
+  ASSERT_TRUE(status.has_value());
+  EXPECT_EQ(status->status, UpdateStatus::Failed);
+  EXPECT_EQ(status->phase, UpdatePhase::Failed);
+  ASSERT_TRUE(status->error_message.has_value());
+  EXPECT_NE(status->error_message->find("backend delete exploded"), std::string::npos);
+
+  // Serialized payload reflects the rollback end-to-end. Use at() so a
+  // missing x-medkit/phase fails the test deterministically instead of being
+  // inserted as null by operator[].
+  auto j = update_status_to_json(*status);
+  EXPECT_EQ(j.at("status"), "failed");
+  ASSERT_TRUE(j.contains("x-medkit"));
+  EXPECT_EQ(j.at("x-medkit").at("phase"), "failed");
+  EXPECT_EQ(j.at("error"), "backend delete exploded");
+
+  manager.reset();
+  backend.reset();
+}
+
+TEST(UpdateStatusToJson, SerializesPhaseAsVendorExtension) {
+  UpdateStatusInfo status{UpdateStatus::Completed, UpdatePhase::Prepared, std::nullopt, std::nullopt, std::nullopt};
+  auto j = update_status_to_json(status);
+  EXPECT_EQ(j.at("status"), "completed");
+  ASSERT_TRUE(j.contains("x-medkit"));
+  EXPECT_EQ(j.at("x-medkit").at("phase"), "prepared");
+}
+
+TEST(UpdateStatusToJson, ExposesExecutedPhaseForTerminalCompletion) {
+  UpdateStatusInfo status{UpdateStatus::Completed, UpdatePhase::Executed, 100, std::nullopt, std::nullopt};
+  auto j = update_status_to_json(status);
+  EXPECT_EQ(j.at("status"), "completed");
+  ASSERT_TRUE(j.contains("x-medkit"));
+  EXPECT_EQ(j.at("x-medkit").at("phase"), "executed");
+  EXPECT_EQ(j.at("progress"), 100);
+}
+
+TEST(UpdateStatusToJson, EmitsNonePhaseForFreshlyRegistered) {
+  UpdateStatusInfo status;
+  auto j = update_status_to_json(status);
+  EXPECT_EQ(j.at("status"), "pending");
+  ASSERT_TRUE(j.contains("x-medkit"));
+  EXPECT_EQ(j.at("x-medkit").at("phase"), "none");
 }

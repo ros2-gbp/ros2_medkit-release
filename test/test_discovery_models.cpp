@@ -16,7 +16,7 @@
  * @file test_discovery_models.cpp
  * @brief Unit tests for SOVD discovery model serialization
  *
- * @verifies REQ_DISCOVERY_002 App/Function model serialization
+ * @verifies REQ_INTEROP_003
  */
 
 #include <gtest/gtest.h>
@@ -24,11 +24,11 @@
 #include <string>
 #include <vector>
 
-#include "ros2_medkit_gateway/discovery/models/app.hpp"
-#include "ros2_medkit_gateway/discovery/models/area.hpp"
-#include "ros2_medkit_gateway/discovery/models/common.hpp"
-#include "ros2_medkit_gateway/discovery/models/component.hpp"
-#include "ros2_medkit_gateway/discovery/models/function.hpp"
+#include "ros2_medkit_gateway/core/discovery/models/app.hpp"
+#include "ros2_medkit_gateway/core/discovery/models/area.hpp"
+#include "ros2_medkit_gateway/core/discovery/models/common.hpp"
+#include "ros2_medkit_gateway/core/discovery/models/component.hpp"
+#include "ros2_medkit_gateway/core/discovery/models/function.hpp"
 
 using ros2_medkit_gateway::App;
 using ros2_medkit_gateway::Area;
@@ -56,6 +56,7 @@ class AreaModelTest : public ::testing::Test {
   Area area_;
 };
 
+// @verifies REQ_INTEROP_003
 TEST_F(AreaModelTest, ToJson_ContainsRequiredFields) {
   json j = area_.to_json();
 
@@ -130,6 +131,7 @@ class ComponentModelTest : public ::testing::Test {
   Component comp_;
 };
 
+// @verifies REQ_INTEROP_003
 TEST_F(ComponentModelTest, ToJson_ContainsRequiredFields) {
   json j = comp_.to_json();
 
@@ -205,6 +207,7 @@ class AppModelTest : public ::testing::Test {
   App app_;
 };
 
+// @verifies REQ_INTEROP_003
 TEST_F(AppModelTest, ToJson_ContainsRequiredFields) {
   json j = app_.to_json();
 
@@ -245,6 +248,33 @@ TEST_F(AppModelTest, ToJson_ExternalWhenTrue) {
   json j = app_.to_json();
 
   EXPECT_EQ(j["x-medkit"]["external"], true);
+}
+
+// @verifies REQ_INTEROP_105 REQ_INTEROP_106
+TEST_F(AppModelTest, ToCapabilities_ContainsRelationshipLinks) {
+  json j = app_.to_capabilities("http://localhost:8080/api/v1");
+
+  // Both is-located-on and belongs-to are gated on the same component_id
+  // condition - handler emits the same set in handle_get_app, so
+  // to_capabilities must stay in sync for notification and snapshot
+  // consumers that go through the model.
+  EXPECT_EQ(j["is-located-on"], "http://localhost:8080/api/v1/components/navigation_server");
+  EXPECT_EQ(j["belongs-to"], "http://localhost:8080/api/v1/apps/nav2/belongs-to");
+  EXPECT_EQ(j["depends-on"], "http://localhost:8080/api/v1/apps/nav2/depends-on");
+}
+
+TEST_F(AppModelTest, ToCapabilities_OmitsRelationshipLinksWhenAppIsStandalone) {
+  App standalone;
+  standalone.id = "standalone";
+  standalone.name = "Standalone";
+  standalone.source = "manifest";
+  // No component_id, no depends_on - mirrors discovery_handlers.cpp gating.
+
+  json j = standalone.to_capabilities("http://localhost:8080/api/v1");
+
+  EXPECT_FALSE(j.contains("is-located-on"));
+  EXPECT_FALSE(j.contains("belongs-to"));
+  EXPECT_FALSE(j.contains("depends-on"));
 }
 
 TEST_F(AppModelTest, ToJson_OmitsEmptyOptionalFields) {
@@ -367,6 +397,7 @@ class FunctionModelTest : public ::testing::Test {
   Function func_;
 };
 
+// @verifies REQ_INTEROP_003
 TEST_F(FunctionModelTest, ToJson_ContainsRequiredFields) {
   json j = func_.to_json();
 
@@ -482,6 +513,32 @@ TEST(CommonTypesTest, QosProfile_ToJson) {
   EXPECT_EQ(j["history"], "keep_last");
   EXPECT_EQ(j["depth"], 10);
   EXPECT_EQ(j["liveliness"], "automatic");
+}
+
+// =============================================================================
+// sorted_contributors() ordering - local first, then peers alphabetical
+// =============================================================================
+//
+// Regression guard for the local-first + alphabetical sort. Feeds reverse- and
+// unsorted input so a flipped comparator (the failure this guards against) is
+// caught; asserting only on already-sorted input would not detect it. This
+// coverage previously lived in the deleted test_x_medkit.cpp.
+
+// @verifies REQ_INTEROP_003
+TEST(CommonTypesTest, SortedContributors_LocalFirstThenAlphabetical) {
+  EXPECT_EQ(ros2_medkit_gateway::sorted_contributors({"peer:zulu", "peer:alpha", "local"}),
+            (std::vector<std::string>{"local", "peer:alpha", "peer:zulu"}));
+}
+
+// @verifies REQ_INTEROP_003
+TEST(CommonTypesTest, SortedContributors_NoLocalIsAlphabetical) {
+  EXPECT_EQ(ros2_medkit_gateway::sorted_contributors({"peer:charlie", "peer:alpha", "peer:bravo"}),
+            (std::vector<std::string>{"peer:alpha", "peer:bravo", "peer:charlie"}));
+}
+
+// @verifies REQ_INTEROP_003
+TEST(CommonTypesTest, SortedContributors_EmptyStaysEmpty) {
+  EXPECT_TRUE(ros2_medkit_gateway::sorted_contributors({}).empty());
 }
 
 // =============================================================================
