@@ -14,42 +14,50 @@
 
 #pragma once
 
-#include <atomic>
-#include <condition_variable>
 #include <memory>
-#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include "ros2_medkit_gateway/auth/auth_config.hpp"
-#include "ros2_medkit_gateway/bulk_data_store.hpp"
-#include "ros2_medkit_gateway/condition_evaluator.hpp"
-#include "ros2_medkit_gateway/config.hpp"
-#include "ros2_medkit_gateway/configuration_manager.hpp"
-#include "ros2_medkit_gateway/data_access_manager.hpp"
-#include "ros2_medkit_gateway/default_script_provider.hpp"
+#include "ros2_medkit_gateway/aggregation/aggregation_manager.hpp"
+#include "ros2_medkit_gateway/core/aggregation/mdns_discovery.hpp"
+#include "ros2_medkit_gateway/core/auth/auth_config.hpp"
+#include "ros2_medkit_gateway/core/condition_evaluator.hpp"
+#include "ros2_medkit_gateway/core/config.hpp"
+#include "ros2_medkit_gateway/core/data/topic_data_provider.hpp"
+#include "ros2_medkit_gateway/core/default_script_provider.hpp"
+#include "ros2_medkit_gateway/core/http/rate_limiter.hpp"
+#include "ros2_medkit_gateway/core/http/rest_server.hpp"
+#include "ros2_medkit_gateway/core/http/sse_client_tracker.hpp"
+#include "ros2_medkit_gateway/core/managers/bulk_data_store.hpp"
+#include "ros2_medkit_gateway/core/managers/configuration_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/data_access_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/fault_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/lock_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/log_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/script_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/subscription_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/trigger_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/update_manager.hpp"
+#include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
+#include "ros2_medkit_gateway/core/plugins/entity_change_scope.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
+#include "ros2_medkit_gateway/core/resource_change_notifier.hpp"
+#include "ros2_medkit_gateway/core/resource_sampler.hpp"
+#include "ros2_medkit_gateway/core/subscription_transport.hpp"
+#include "ros2_medkit_gateway/core/trigger_store.hpp"
 #include "ros2_medkit_gateway/discovery/discovery_manager.hpp"
-#include "ros2_medkit_gateway/fault_manager.hpp"
-#include "ros2_medkit_gateway/http/rate_limiter.hpp"
-#include "ros2_medkit_gateway/http/rest_server.hpp"
-#include "ros2_medkit_gateway/http/sse_client_tracker.hpp"
-#include "ros2_medkit_gateway/lock_manager.hpp"
-#include "ros2_medkit_gateway/log_manager.hpp"
-#include "ros2_medkit_gateway/models/thread_safe_entity_cache.hpp"
-#include "ros2_medkit_gateway/operation_manager.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_manager.hpp"
-#include "ros2_medkit_gateway/resource_change_notifier.hpp"
-#include "ros2_medkit_gateway/resource_sampler.hpp"
-#include "ros2_medkit_gateway/script_manager.hpp"
-#include "ros2_medkit_gateway/subscription_manager.hpp"
-#include "ros2_medkit_gateway/subscription_transport.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_action_transport.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_fault_service_transport.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_log_source.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_parameter_transport.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_service_transport.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_topic_subscription_transport.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_topic_transport.hpp"
+#include "ros2_medkit_gateway/ros2/trigger_topic_subscriber.hpp"
 #include "ros2_medkit_gateway/trigger_fault_subscriber.hpp"
-#include "ros2_medkit_gateway/trigger_manager.hpp"
-#include "ros2_medkit_gateway/trigger_store.hpp"
-#include "ros2_medkit_gateway/trigger_topic_subscriber.hpp"
-#include "ros2_medkit_gateway/updates/update_manager.hpp"
 
 namespace ros2_medkit_gateway {
 
@@ -57,6 +65,10 @@ class GatewayNode : public rclcpp::Node {
  public:
   explicit GatewayNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions{});
   ~GatewayNode() override;
+  GatewayNode(const GatewayNode &) = delete;
+  GatewayNode & operator=(const GatewayNode &) = delete;
+  GatewayNode(GatewayNode &&) = delete;
+  GatewayNode & operator=(GatewayNode &&) = delete;
 
   /**
    * @brief Get the thread-safe entity cache with O(1) lookups
@@ -71,6 +83,23 @@ class GatewayNode : public rclcpp::Node {
    *       REST server is stopped before GatewayNode destruction to ensure safe access.
    */
   DataAccessManager * get_data_access_manager() const;
+
+  /**
+   * @brief Attach a TopicDataProvider to route topic sampling through.
+   *
+   * Called by main() after the rclcpp::Executor is constructed and the gateway
+   * node added to it, so the provider can build its subscription node. Stores
+   * the shared_ptr to keep the provider alive for the gateway node's lifetime
+   * and forwards the raw pointer into DataAccessManager. The pool-backed
+   * provider is the single sampling path (issue #375 race fix).
+   */
+  void set_topic_data_provider(std::shared_ptr<TopicDataProvider> provider);
+
+  /// @return Non-owning pointer to the currently attached TopicDataProvider,
+  ///         or nullptr when no provider has been wired up yet.
+  TopicDataProvider * get_topic_data_provider() const {
+    return topic_data_provider_.get();
+  }
 
   /**
    * @brief Get the OperationManager instance
@@ -174,6 +203,43 @@ class GatewayNode : public rclcpp::Node {
    */
   ConditionRegistry * get_condition_registry() const;
 
+  /**
+   * @brief Get the AggregationManager instance
+   * @return Raw pointer to AggregationManager (valid for lifetime of GatewayNode), or nullptr if disabled
+   */
+  AggregationManager * get_aggregation_manager() const;
+
+  /**
+   * @brief Handle a plugin's `PluginContext::notify_entities_changed` request.
+   *
+   * Runs a single `refresh_cache()` pass synchronously. The scope hint is
+   * accepted and logged but the current implementation ignores it and always
+   * does a full refresh - future work may limit the rediscovery to the
+   * indicated area / component. The entry point is safe to call from any
+   * thread: refresh passes triggered by plugin notifications, the periodic
+   * refresh timer, and startup are serialized by an internal mutex inside
+   * `refresh_cache()` because refresh touches discovery state (e.g., the
+   * merge pipeline cached inside `DiscoveryManager`) that itself assumes
+   * single-threaded execution - `ThreadSafeEntityCache`'s own mutex is not
+   * sufficient.
+   */
+  void handle_entity_change_notification(const EntityChangeScope & scope);
+
+  /**
+   * @brief Test hook: simulate a plugin calling notify_entities_changed
+   *        from within its own IntrospectionProvider::introspect() callback.
+   *
+   * Sets the per-thread in-refresh flag (the same flag the real refresh
+   * path uses) and invokes `handle_entity_change_notification(scope)`.
+   * The gateway is expected to short-circuit the call with a warning log
+   * and return without reloading the manifest.
+   *
+   * Exists purely to let unit tests exercise the reentrancy guard without
+   * spinning up a full plugin with a real IntrospectionProvider. Do NOT
+   * call this from production code.
+   */
+  void trigger_reentrant_notification_for_testing(const EntityChangeScope & scope);
+
  private:
   void refresh_cache();
   void start_rest_server();
@@ -182,11 +248,48 @@ class GatewayNode : public rclcpp::Node {
   // Configuration parameters
   std::string server_host_;
   int server_port_;
+  // Safety-backstop refresh interval in milliseconds. The primary refresh
+  // trigger is the rclcpp graph event polled by `graph_check_timer_`; this
+  // value drives `backstop_timer_` which guarantees liveness if a graph
+  // event is ever missed (lost wakeup, rclcpp anomaly, etc.).
   int refresh_interval_ms_;
+  bool filter_internal_nodes_{true};
   CorsConfig cors_config_;
   AuthConfig auth_config_;
   RateLimitConfig rate_limit_config_;
   TlsConfig tls_config_;
+
+  // ROS 2 subscription infrastructure (injected from main() after the executor
+  // is constructed). Owned via shared_ptr because the provider is handed out
+  // as a raw TopicDataProvider* to DataAccessManager.
+  std::shared_ptr<TopicDataProvider> topic_data_provider_;
+
+  // Topic transport adapter shared with DataAccessManager. Held here so the
+  // provider attach/detach hooks can forward into the adapter alongside the
+  // manager and discovery side updates.
+  std::shared_ptr<ros2::Ros2TopicTransport> topic_transport_;
+
+  // Service / action transport adapters shared with OperationManager. Held
+  // here so their lifetime matches the gateway's executor (transports own
+  // rclcpp clients + subscriptions and must outlive the manager).
+  std::shared_ptr<ros2::Ros2ServiceTransport> service_transport_;
+  std::shared_ptr<ros2::Ros2ActionTransport> action_transport_;
+
+  // Parameter transport adapter shared with ConfigurationManager. Owns the
+  // parameter-client cache + defaults cache + spin_mutex; the manager forwards
+  // shutdown() into it before rclcpp::shutdown() runs.
+  std::shared_ptr<ros2::Ros2ParameterTransport> parameter_transport_;
+
+  // Fault-service transport adapter shared with FaultManager. Owns the seven
+  // rclcpp service clients, the seven per-client mutexes, and the
+  // ros2_medkit_msgs <-> JSON conversion helpers that previously lived inside
+  // FaultManager.
+  std::shared_ptr<ros2::Ros2FaultServiceTransport> fault_service_transport_;
+
+  // /rosout source adapter shared with LogManager. Owns the
+  // rclcpp::Subscription<rcl_interfaces::msg::Log> + msg-to-LogEntry
+  // conversion that previously lived inside LogManager.
+  std::shared_ptr<ros2::Ros2LogSource> log_source_;
 
   // Managers
   std::unique_ptr<DiscoveryManager> discovery_mgr_;
@@ -217,14 +320,46 @@ class GatewayNode : public rclcpp::Node {
   std::unique_ptr<TriggerManager> trigger_mgr_;
   std::unique_ptr<TriggerFaultSubscriber> trigger_fault_subscriber_;
   std::unique_ptr<TriggerTopicSubscriber> trigger_topic_subscriber_;
+  // Adapter routing manager-side subscribe() calls onto trigger_topic_subscriber_.
+  std::shared_ptr<ros2::Ros2TopicSubscriptionTransport> trigger_topic_transport_;
+
+  // Aggregation infrastructure (destroyed in order: mdns -> rest_server -> aggregation)
+  // mDNS threads must stop before rest_server to avoid callbacks during shutdown.
+  // AggregationManager must outlive rest_server because handlers reference it.
+  std::unique_ptr<AggregationManager> aggregation_mgr_;
+  std::unique_ptr<MdnsDiscovery> mdns_discovery_;
 
   std::unique_ptr<RESTServer> rest_server_;
 
   // Cache with thread safety
   ThreadSafeEntityCache thread_safe_cache_;
 
-  // Timer for periodic refresh
-  rclcpp::TimerBase::SharedPtr refresh_timer_;
+  // Graph-change-driven discovery refresh.
+  //
+  // `graph_event_` is the rclcpp::Event signalled whenever the ROS 2 graph
+  // changes (node up/down, topic/service/action add or remove). It is a
+  // shared_ptr handed out by `rclcpp::Node::get_graph_event()`; the executor
+  // owns the underlying notification and we just poll-and-clear it.
+  //
+  // `graph_check_timer_` polls `graph_event_->check_and_clear()` at a fast
+  // cadence (100 ms) and runs `refresh_cache()` only when the event fires.
+  // On a stable graph this keeps idle CPU near zero.
+  //
+  // `backstop_timer_` runs `refresh_cache()` unconditionally at the slower
+  // `refresh_interval_ms_` cadence. Its sole purpose is liveness in the
+  // unlikely case a graph event is missed.
+  rclcpp::Event::SharedPtr graph_event_;
+  rclcpp::TimerBase::SharedPtr graph_check_timer_;
+  rclcpp::TimerBase::SharedPtr backstop_timer_;
+
+  // Serializes `refresh_cache()` across the refresh timer, plugin
+  // `notify_entities_changed` calls and any other caller. Required because
+  // the refresh pipeline touches discovery state that is not itself
+  // thread-safe (the merge pipeline cached inside `DiscoveryManager`).
+  // Recursive so that `handle_entity_change_notification` can also cover
+  // the preceding `reload_manifest()` call without deadlocking when it
+  // subsequently invokes `refresh_cache()`.
+  std::recursive_mutex refresh_mutex_;
 
   // Timer for periodic cleanup of old action goals
   rclcpp::TimerBase::SharedPtr cleanup_timer_;
@@ -237,9 +372,21 @@ class GatewayNode : public rclcpp::Node {
 
   // REST server thread management
   std::unique_ptr<std::thread> server_thread_;
-  std::atomic<bool> server_running_{false};
-  std::mutex server_mutex_;
-  std::condition_variable server_cv_;
 };
+
+/**
+ * @brief Filter ROS 2 internal nodes from an app list
+ *
+ * Removes apps whose base name begins with '_' (ROS 2 internal node convention).
+ * For remote (peer-prefixed) apps, the peer prefix ("peer_name__") is stripped
+ * before checking for the underscore prefix, using the routing table for precise
+ * prefix detection.
+ *
+ * @param apps App vector to filter in place
+ * @param peer_routing_table Maps entity_id -> peer_name for remote entities
+ * @return Number of apps removed
+ */
+size_t filter_internal_node_apps(std::vector<App> & apps,
+                                 const std::unordered_map<std::string, std::string> & peer_routing_table);
 
 }  // namespace ros2_medkit_gateway

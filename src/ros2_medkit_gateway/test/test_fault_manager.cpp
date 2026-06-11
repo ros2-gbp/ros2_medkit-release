@@ -24,9 +24,10 @@
 #include <nlohmann/json.hpp>
 #include <rclcpp/rclcpp.hpp>
 
-#include "ros2_medkit_gateway/fault_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/fault_manager.hpp"
+#include "ros2_medkit_gateway/core/resource_change_notifier.hpp"
 #include "ros2_medkit_gateway/fault_manager_paths.hpp"
-#include "ros2_medkit_gateway/resource_change_notifier.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_fault_service_transport.hpp"
 #include "ros2_medkit_gateway/trigger_fault_subscriber.hpp"
 #include "ros2_medkit_msgs/msg/fault_event.hpp"
 #include "ros2_medkit_msgs/srv/get_rosbag.hpp"
@@ -84,6 +85,13 @@ class FaultManagerTest : public ::testing::Test {
     });
   }
 
+  void stop_spinning() {
+    if (spin_thread_.joinable()) {
+      executor_->cancel();
+      spin_thread_.join();
+    }
+  }
+
   bool wait_for_subscription_count(const std::string & topic_name, size_t expected_count,
                                    std::chrono::milliseconds timeout = 1s) {
     auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -118,7 +126,7 @@ TEST(FaultManagerPathsTest, BuildPathsFromNamespaceString) {
 
 // @verifies REQ_INTEROP_088
 TEST_F(FaultManagerTest, GetSnapshotsServiceNotAvailable) {
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   // Don't create a service, so it will timeout
   auto result = fault_manager.get_snapshots("TEST_FAULT");
@@ -134,8 +142,8 @@ TEST_F(FaultManagerTest, GetSnapshotsServiceNotAvailable) {
 TEST_F(FaultManagerTest, GetSnapshotsSuccessWithValidJson) {
   // Create mock service
   auto service = node_->create_service<GetSnapshots>(
-      "/fault_manager/get_snapshots",
-      [](const std::shared_ptr<GetSnapshots::Request> request, std::shared_ptr<GetSnapshots::Response> response) {
+      "/fault_manager/get_snapshots", [](const std::shared_ptr<GetSnapshots::Request> & request,
+                                         const std::shared_ptr<GetSnapshots::Response> & response) {
         response->success = true;
         nlohmann::json snapshot_data;
         snapshot_data["fault_code"] = request->fault_code;
@@ -147,9 +155,10 @@ TEST_F(FaultManagerTest, GetSnapshotsSuccessWithValidJson) {
       });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   auto result = fault_manager.get_snapshots("MOTOR_OVERHEAT");
+  stop_spinning();
 
   EXPECT_TRUE(result.success);
   EXPECT_TRUE(result.error_message.empty());
@@ -157,6 +166,40 @@ TEST_F(FaultManagerTest, GetSnapshotsSuccessWithValidJson) {
   EXPECT_EQ(result.data["fault_code"], "MOTOR_OVERHEAT");
   EXPECT_TRUE(result.data.contains("topics"));
   EXPECT_TRUE(result.data["topics"].contains("/joint_states"));
+}
+
+// Regression guard: Ros2FaultServiceTransport must drive its service clients
+// on its own private executor. The transport's host node (node_) is left
+// unspun here - the mock service runs on a separate node with its own spin
+// thread - so the RPC can only complete if the transport spins its private
+// client node itself.
+TEST_F(FaultManagerTest, GetSnapshotsDrivesPrivateClientWithoutSpinningHostNode) {
+  auto service_node = std::make_shared<rclcpp::Node>("mock_fault_service_node_" + std::to_string(test_counter_++));
+  auto service = service_node->create_service<GetSnapshots>(
+      "/fault_manager/get_snapshots", [](const std::shared_ptr<GetSnapshots::Request> & request,
+                                         const std::shared_ptr<GetSnapshots::Response> & response) {
+        response->success = true;
+        nlohmann::json snapshot_data;
+        snapshot_data["fault_code"] = request->fault_code;
+        response->data = snapshot_data.dump();
+      });
+
+  rclcpp::executors::SingleThreadedExecutor service_executor;
+  service_executor.add_node(service_node);
+  std::thread service_thread([&service_executor]() {
+    service_executor.spin();
+  });
+
+  // node_ is deliberately never spun by this test.
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
+  auto result = fault_manager.get_snapshots("SELF_DRIVEN_FAULT");
+
+  service_executor.cancel();
+  service_thread.join();
+
+  EXPECT_TRUE(result.success);
+  EXPECT_TRUE(result.error_message.empty());
+  EXPECT_EQ(result.data["fault_code"], "SELF_DRIVEN_FAULT");
 }
 
 // @verifies REQ_INTEROP_088
@@ -170,8 +213,8 @@ TEST_F(FaultManagerTest, GetSnapshotsUsesConfiguredFaultManagerNamespace) {
   executor_->add_node(node_);
 
   auto service = node_->create_service<GetSnapshots>(
-      "/robot1/fault_manager/get_snapshots",
-      [](const std::shared_ptr<GetSnapshots::Request> request, std::shared_ptr<GetSnapshots::Response> response) {
+      "/robot1/fault_manager/get_snapshots", [](const std::shared_ptr<GetSnapshots::Request> & request,
+                                                const std::shared_ptr<GetSnapshots::Response> & response) {
         response->success = true;
         nlohmann::json snapshot_data;
         snapshot_data["fault_code"] = request->fault_code;
@@ -180,9 +223,10 @@ TEST_F(FaultManagerTest, GetSnapshotsUsesConfiguredFaultManagerNamespace) {
       });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   auto result = fault_manager.get_snapshots("NAMESPACED_FAULT");
+  stop_spinning();
 
   EXPECT_TRUE(result.success);
   EXPECT_EQ(result.data["fault_code"], "NAMESPACED_FAULT");
@@ -198,20 +242,21 @@ TEST_F(FaultManagerTest, InvalidFaultManagerNamespaceFallsBackToRootServicePath)
   executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
   executor_->add_node(node_);
 
-  auto service = node_->create_service<GetSnapshots>(
-      "/fault_manager/get_snapshots",
-      [](const std::shared_ptr<GetSnapshots::Request> request, std::shared_ptr<GetSnapshots::Response> response) {
-        response->success = true;
-        nlohmann::json snapshot_data;
-        snapshot_data["fault_code"] = request->fault_code;
-        snapshot_data["service_path"] = "/fault_manager/get_snapshots";
-        response->data = snapshot_data.dump();
-      });
+  auto service = node_->create_service<GetSnapshots>("/fault_manager/get_snapshots",
+                                                     [](const std::shared_ptr<GetSnapshots::Request> & request,
+                                                        const std::shared_ptr<GetSnapshots::Response> & response) {
+                                                       response->success = true;
+                                                       nlohmann::json snapshot_data;
+                                                       snapshot_data["fault_code"] = request->fault_code;
+                                                       snapshot_data["service_path"] = "/fault_manager/get_snapshots";
+                                                       response->data = snapshot_data.dump();
+                                                     });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   auto result = fault_manager.get_snapshots("INVALID_NAMESPACE_FAULT");
+  stop_spinning();
 
   EXPECT_TRUE(result.success);
   EXPECT_EQ(result.data["service_path"], "/fault_manager/get_snapshots");
@@ -222,34 +267,36 @@ TEST_F(FaultManagerTest, GetSnapshotsSuccessWithTopicFilter) {
   // Create mock service that verifies topic filter is passed
   std::string received_topic;
   auto service = node_->create_service<GetSnapshots>(
-      "/fault_manager/get_snapshots", [&received_topic](const std::shared_ptr<GetSnapshots::Request> request,
-                                                        std::shared_ptr<GetSnapshots::Response> response) {
+      "/fault_manager/get_snapshots", [&received_topic](const std::shared_ptr<GetSnapshots::Request> & request,
+                                                        const std::shared_ptr<GetSnapshots::Response> & response) {
         received_topic = request->topic;
         response->success = true;
         response->data = "{}";
       });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   fault_manager.get_snapshots("TEST_FAULT", "/specific_topic");
+  stop_spinning();
 
   EXPECT_EQ(received_topic, "/specific_topic");
 }
 
 // @verifies REQ_INTEROP_088
 TEST_F(FaultManagerTest, GetSnapshotsErrorResponse) {
-  auto service = node_->create_service<GetSnapshots>(
-      "/fault_manager/get_snapshots",
-      [](const std::shared_ptr<GetSnapshots::Request> /*request*/, std::shared_ptr<GetSnapshots::Response> response) {
-        response->success = false;
-        response->error_message = "Fault not found";
-      });
+  auto service = node_->create_service<GetSnapshots>("/fault_manager/get_snapshots",
+                                                     [](const std::shared_ptr<GetSnapshots::Request> & /*request*/,
+                                                        const std::shared_ptr<GetSnapshots::Response> & response) {
+                                                       response->success = false;
+                                                       response->error_message = "Fault not found";
+                                                     });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   auto result = fault_manager.get_snapshots("NONEXISTENT_FAULT");
+  stop_spinning();
 
   EXPECT_FALSE(result.success);
   EXPECT_EQ(result.error_message, "Fault not found");
@@ -257,17 +304,18 @@ TEST_F(FaultManagerTest, GetSnapshotsErrorResponse) {
 
 // @verifies REQ_INTEROP_088
 TEST_F(FaultManagerTest, GetSnapshotsInvalidJsonFallback) {
-  auto service = node_->create_service<GetSnapshots>(
-      "/fault_manager/get_snapshots",
-      [](const std::shared_ptr<GetSnapshots::Request> /*request*/, std::shared_ptr<GetSnapshots::Response> response) {
-        response->success = true;
-        response->data = "not valid json {{{";
-      });
+  auto service = node_->create_service<GetSnapshots>("/fault_manager/get_snapshots",
+                                                     [](const std::shared_ptr<GetSnapshots::Request> & /*request*/,
+                                                        const std::shared_ptr<GetSnapshots::Response> & response) {
+                                                       response->success = true;
+                                                       response->data = "not valid json {{{";
+                                                     });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   auto result = fault_manager.get_snapshots("TEST_FAULT");
+  stop_spinning();
 
   EXPECT_TRUE(result.success);
   // When JSON parsing fails, raw_data should be returned
@@ -277,17 +325,18 @@ TEST_F(FaultManagerTest, GetSnapshotsInvalidJsonFallback) {
 
 // @verifies REQ_INTEROP_088
 TEST_F(FaultManagerTest, GetSnapshotsEmptyResponse) {
-  auto service = node_->create_service<GetSnapshots>(
-      "/fault_manager/get_snapshots",
-      [](const std::shared_ptr<GetSnapshots::Request> /*request*/, std::shared_ptr<GetSnapshots::Response> response) {
-        response->success = true;
-        response->data = "{}";
-      });
+  auto service = node_->create_service<GetSnapshots>("/fault_manager/get_snapshots",
+                                                     [](const std::shared_ptr<GetSnapshots::Request> & /*request*/,
+                                                        const std::shared_ptr<GetSnapshots::Response> & response) {
+                                                       response->success = true;
+                                                       response->data = "{}";
+                                                     });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   auto result = fault_manager.get_snapshots("TEST_FAULT");
+  stop_spinning();
 
   EXPECT_TRUE(result.success);
   EXPECT_TRUE(result.data.is_object());
@@ -298,7 +347,7 @@ TEST_F(FaultManagerTest, GetSnapshotsEmptyResponse) {
 
 // @verifies REQ_INTEROP_088
 TEST_F(FaultManagerTest, GetRosbagServiceNotAvailable) {
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   // Don't create a service, so it will timeout
   auto result = fault_manager.get_rosbag("TEST_FAULT");
@@ -314,7 +363,7 @@ TEST_F(FaultManagerTest, GetRosbagServiceNotAvailable) {
 TEST_F(FaultManagerTest, GetRosbagSuccess) {
   auto service = node_->create_service<GetRosbag>(
       "/fault_manager/get_rosbag",
-      [](const std::shared_ptr<GetRosbag::Request> request, std::shared_ptr<GetRosbag::Response> response) {
+      [](const std::shared_ptr<GetRosbag::Request> & request, const std::shared_ptr<GetRosbag::Response> & response) {
         response->success = true;
         response->file_path = "/tmp/test_bag_" + request->fault_code;
         response->format = "sqlite3";
@@ -323,9 +372,10 @@ TEST_F(FaultManagerTest, GetRosbagSuccess) {
       });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   auto result = fault_manager.get_rosbag("TEST_ROSBAG_FAULT");
+  stop_spinning();
 
   EXPECT_TRUE(result.success);
   EXPECT_TRUE(result.data.contains("file_path"));
@@ -347,7 +397,7 @@ TEST_F(FaultManagerTest, GetRosbagUsesConfiguredFaultManagerNamespace) {
 
   auto service = node_->create_service<GetRosbag>(
       "/robot2/fault_manager/get_rosbag",
-      [](const std::shared_ptr<GetRosbag::Request> request, std::shared_ptr<GetRosbag::Response> response) {
+      [](const std::shared_ptr<GetRosbag::Request> & request, const std::shared_ptr<GetRosbag::Response> & response) {
         response->success = true;
         response->file_path = "/tmp/" + request->fault_code;
         response->format = "mcap";
@@ -356,9 +406,10 @@ TEST_F(FaultManagerTest, GetRosbagUsesConfiguredFaultManagerNamespace) {
       });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   auto result = fault_manager.get_rosbag("NAMESPACED_ROSBAG");
+  stop_spinning();
 
   EXPECT_TRUE(result.success);
   EXPECT_EQ(result.data["file_path"], "/tmp/NAMESPACED_ROSBAG");
@@ -425,22 +476,154 @@ TEST_F(FaultManagerTest, TriggerFaultSubscriberForwardsNamespacedFaultEvents) {
   EXPECT_EQ(change.value["fault_code"], "FAULT_1");
   EXPECT_EQ(change.value["event_type"], "fault_confirmed");
 
+  stop_spinning();
+  notifier.unsubscribe(subscription_id);
+}
+
+TEST_F(FaultManagerTest, TriggerFaultSubscriberResolverCalledAndEntityIdUsed) {
+  // Resolver is called with the raw FQN and the returned entity_id is used in the notification.
+  node_ = std::make_shared<rclcpp::Node>("test_trigger_resolver_called",
+                                         rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
+  executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+  executor_->add_node(node_);
+
+  ResourceChangeNotifier notifier;
+  TriggerFaultSubscriber subscriber(node_.get(), notifier);
+
+  std::string received_fqn;
+  subscriber.set_node_to_entity_resolver([&received_fqn](const std::string & fqn) -> std::string {
+    received_fqn = fqn;
+    return "manifest_entity_id";
+  });
+
+  auto publisher = node_->create_publisher<ros2_medkit_msgs::msg::FaultEvent>("/fault_manager/events", rclcpp::QoS(10));
+
+  std::promise<ResourceChange> change_promise;
+  auto change_future = change_promise.get_future();
+  auto subscription_id = notifier.subscribe({"faults", "manifest_entity_id", "/RESOLVER_FAULT"},
+                                            [&change_promise](const ResourceChange & change) {
+                                              change_promise.set_value(change);
+                                            });
+
+  ASSERT_TRUE(wait_for_subscription_count("/fault_manager/events", 1u));
+  start_spinning();
+
+  ros2_medkit_msgs::msg::FaultEvent event;
+  event.event_type = "fault_confirmed";
+  event.fault.fault_code = "RESOLVER_FAULT";
+  event.fault.reporting_sources.push_back("/pipeline/some_node");
+  event.fault.severity = ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR;
+  publisher->publish(event);
+
+  auto status = change_future.wait_for(2s);
+  ASSERT_EQ(status, std::future_status::ready);
+
+  auto change = change_future.get();
+  EXPECT_EQ(change.entity_id, "manifest_entity_id");
+  EXPECT_EQ(received_fqn, "/pipeline/some_node");
+
+  stop_spinning();
+  notifier.unsubscribe(subscription_id);
+}
+
+TEST_F(FaultManagerTest, TriggerFaultSubscriberResolverEmptyFallsBackToLastSegment) {
+  // When resolver returns empty string, last-segment extraction is used.
+  node_ = std::make_shared<rclcpp::Node>("test_trigger_resolver_empty_fallback",
+                                         rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
+  executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+  executor_->add_node(node_);
+
+  ResourceChangeNotifier notifier;
+  TriggerFaultSubscriber subscriber(node_.get(), notifier);
+
+  // Resolver always returns empty -> fallback to last segment
+  subscriber.set_node_to_entity_resolver([](const std::string & /*fqn*/) -> std::string {
+    return "";
+  });
+
+  auto publisher = node_->create_publisher<ros2_medkit_msgs::msg::FaultEvent>("/fault_manager/events", rclcpp::QoS(10));
+
+  std::promise<ResourceChange> change_promise;
+  auto change_future = change_promise.get_future();
+  auto subscription_id = notifier.subscribe({"faults", "fallback_node", "/FALLBACK_FAULT"},
+                                            [&change_promise](const ResourceChange & change) {
+                                              change_promise.set_value(change);
+                                            });
+
+  ASSERT_TRUE(wait_for_subscription_count("/fault_manager/events", 1u));
+  start_spinning();
+
+  ros2_medkit_msgs::msg::FaultEvent event;
+  event.event_type = "fault_confirmed";
+  event.fault.fault_code = "FALLBACK_FAULT";
+  event.fault.reporting_sources.push_back("/pipeline/fallback_node");
+  event.fault.severity = ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR;
+  publisher->publish(event);
+
+  auto status = change_future.wait_for(2s);
+  ASSERT_EQ(status, std::future_status::ready);
+
+  auto change = change_future.get();
+  EXPECT_EQ(change.entity_id, "fallback_node");
+
+  stop_spinning();
+  notifier.unsubscribe(subscription_id);
+}
+
+TEST_F(FaultManagerTest, TriggerFaultSubscriberNoResolverUsesLastSegment) {
+  // When no resolver is set, last-segment extraction works as before.
+  node_ = std::make_shared<rclcpp::Node>("test_trigger_no_resolver",
+                                         rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
+  executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>();
+  executor_->add_node(node_);
+
+  ResourceChangeNotifier notifier;
+  TriggerFaultSubscriber subscriber(node_.get(), notifier);
+  // No resolver set
+
+  auto publisher = node_->create_publisher<ros2_medkit_msgs::msg::FaultEvent>("/fault_manager/events", rclcpp::QoS(10));
+
+  std::promise<ResourceChange> change_promise;
+  auto change_future = change_promise.get_future();
+  auto subscription_id = notifier.subscribe({"faults", "camera_proc", "/NO_RESOLVER_FAULT"},
+                                            [&change_promise](const ResourceChange & change) {
+                                              change_promise.set_value(change);
+                                            });
+
+  ASSERT_TRUE(wait_for_subscription_count("/fault_manager/events", 1u));
+  start_spinning();
+
+  ros2_medkit_msgs::msg::FaultEvent event;
+  event.event_type = "fault_confirmed";
+  event.fault.fault_code = "NO_RESOLVER_FAULT";
+  event.fault.reporting_sources.push_back("/sensors/camera_proc");
+  event.fault.severity = ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR;
+  publisher->publish(event);
+
+  auto status = change_future.wait_for(2s);
+  ASSERT_EQ(status, std::future_status::ready);
+
+  auto change = change_future.get();
+  EXPECT_EQ(change.entity_id, "camera_proc");
+
+  stop_spinning();
   notifier.unsubscribe(subscription_id);
 }
 
 // @verifies REQ_INTEROP_088
 TEST_F(FaultManagerTest, GetRosbagNotFound) {
-  auto service = node_->create_service<GetRosbag>(
-      "/fault_manager/get_rosbag",
-      [](const std::shared_ptr<GetRosbag::Request> /*request*/, std::shared_ptr<GetRosbag::Response> response) {
-        response->success = false;
-        response->error_message = "No rosbag file available for fault";
-      });
+  auto service = node_->create_service<GetRosbag>("/fault_manager/get_rosbag",
+                                                  [](const std::shared_ptr<GetRosbag::Request> & /*request*/,
+                                                     const std::shared_ptr<GetRosbag::Response> & response) {
+                                                    response->success = false;
+                                                    response->error_message = "No rosbag file available for fault";
+                                                  });
 
   start_spinning();
-  FaultManager fault_manager(node_.get());
+  FaultManager fault_manager(std::make_shared<ros2_medkit_gateway::ros2::Ros2FaultServiceTransport>(node_.get()));
 
   auto result = fault_manager.get_rosbag("NONEXISTENT_FAULT");
+  stop_spinning();
 
   EXPECT_FALSE(result.success);
   EXPECT_EQ(result.error_message, "No rosbag file available for fault");
