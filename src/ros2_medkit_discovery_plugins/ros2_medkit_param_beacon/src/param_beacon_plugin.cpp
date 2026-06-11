@@ -34,6 +34,17 @@ using ros2_medkit_gateway::PLUGIN_API_VERSION;
 using ros2_medkit_gateway::PluginContext;
 using ros2_medkit_gateway::SovdEntityType;
 
+ParameterBeaconPlugin::~ParameterBeaconPlugin() noexcept {
+  // On Lyrical (originally observed on Rolling), ~rclcpp::Node can throw
+  // graph_listener::NodeNotFoundError once rclcpp::shutdown() has invalidated
+  // the context. An exception escaping a destructor calls std::terminate(),
+  // so swallow it here.
+  try {
+    shutdown();
+  } catch (...) {
+  }
+}
+
 std::string ParameterBeaconPlugin::name() const {
   return "parameter_beacon";
 }
@@ -98,7 +109,7 @@ void ParameterBeaconPlugin::configure(const nlohmann::json & config) {
 }
 
 void ParameterBeaconPlugin::set_context(PluginContext & context) {
-  ctx_ = &context;
+  ctx_ = as_ros_plugin_context(context);
 
   if (!store_) {
     store_ = std::make_unique<BeaconHintStore>();
@@ -134,48 +145,53 @@ void ParameterBeaconPlugin::set_context(PluginContext & context) {
 }
 
 void ParameterBeaconPlugin::shutdown() {
-  {
-    std::lock_guard<std::mutex> lock(shutdown_mutex_);
-    shutdown_requested_ = true;
+  if (shutdown_requested_.exchange(true)) {
+    return;
   }
   shutdown_cv_.notify_one();
   if (poll_thread_.joinable()) {
     poll_thread_.join();
   }
-  param_node_.reset();
-  std::lock_guard<std::mutex> lock(clients_mutex_);
-  clients_.clear();
-  backoff_counts_.clear();
-  skip_remaining_.clear();
-}
-
-std::vector<GatewayPlugin::RouteDescription> ParameterBeaconPlugin::get_route_descriptions() const {
-  return {
-      {"GET", "apps/{app_id}/x-medkit-param-beacon"},
-      {"GET", "components/{component_id}/x-medkit-param-beacon"},
-  };
-}
-
-void ParameterBeaconPlugin::register_routes(httplib::Server & server, const std::string & api_prefix) {
-  for (const auto & entity_type : {"apps", "components"}) {
-    auto pattern = api_prefix + "/" + entity_type + R"(/([^/]+)/x-medkit-param-beacon)";
-    server.Get(pattern.c_str(), [this](const httplib::Request & req, httplib::Response & res) {
-      auto entity_id = req.matches[1].str();
-
-      auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
-      if (!entity) {
-        return;
-      }
-
-      auto stored = store_->get(entity_id);
-      if (!stored) {
-        PluginContext::send_error(res, 404, "x-medkit-beacon-not-found", "No beacon data for entity");
-        return;
-      }
-
-      PluginContext::send_json(res, ros2_medkit_beacon::build_beacon_response(entity_id, *stored));
-    });
+  {
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    clients_.clear();
+    backoff_counts_.clear();
+    skip_remaining_.clear();
   }
+  // ~rclcpp::Node can throw graph_listener::NodeNotFoundError on Lyrical
+  // (and Rolling) when the context was already torn down by rclcpp::shutdown(). Swallow
+  // it so the plugin_manager shutdown sequence (and the plugin destructor
+  // that calls back into us) does not abort the process.
+  try {
+    param_node_.reset();
+  } catch (...) {
+  }
+}
+
+std::vector<GatewayPlugin::PluginRoute> ParameterBeaconPlugin::get_routes() {
+  std::vector<GatewayPlugin::PluginRoute> routes;
+  for (const auto * entity_type : {"apps", "components"}) {
+    std::string pattern = std::string(entity_type) + R"(/([^/]+)/x-medkit-param-beacon)";
+    routes.push_back(
+        {"GET", pattern,
+         [this](const ros2_medkit_gateway::PluginRequest & req, ros2_medkit_gateway::PluginResponse & res) {
+           auto entity_id = req.path_param(1);
+
+           auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
+           if (!entity) {
+             return;
+           }
+
+           auto stored = store_->get(entity_id);
+           if (!stored) {
+             res.send_error(404, "x-medkit-beacon-not-found", "No beacon data for entity");
+             return;
+           }
+
+           res.send_json(ros2_medkit_beacon::build_beacon_response(entity_id, *stored));
+         }});
+  }
+  return routes;
 }
 
 IntrospectionResult ParameterBeaconPlugin::introspect(const IntrospectionInput & input) {
@@ -224,6 +240,9 @@ void ParameterBeaconPlugin::poll_loop() {
 }
 
 void ParameterBeaconPlugin::poll_cycle() {
+  if (shutdown_requested_.load()) {
+    return;
+  }
   // Get targets: prefer introspection-provided list, fall back to ROS graph discovery
   std::vector<std::string> targets;
   {
@@ -233,8 +252,17 @@ void ParameterBeaconPlugin::poll_cycle() {
 
   if (targets.empty() && param_node_) {
     // No introspection targets available (e.g., not in hybrid mode).
-    // Discover nodes directly from the ROS 2 graph.
-    auto names_and_ns = param_node_->get_node_graph_interface()->get_node_names_and_namespaces();
+    // Discover nodes directly from the ROS 2 graph. rclcpp throws
+    // "rcl node's context is invalid" if the poll timer fires between
+    // SIGINT handling and the executor stopping; swallow it so the
+    // shutdown path isn't aborted by std::terminate.
+    std::vector<std::pair<std::string, std::string>> names_and_ns;
+    try {
+      names_and_ns = param_node_->get_node_graph_interface()->get_node_names_and_namespaces();
+    } catch (const std::runtime_error & ex) {
+      RCLCPP_DEBUG(param_node_->get_logger(), "get_node_names_and_namespaces threw during shutdown: %s", ex.what());
+      return;
+    }
     for (const auto & [name, ns] : names_and_ns) {
       // Skip internal nodes (leading underscore) and the gateway
       if (name.empty() || name[0] == '_' || name == "ros2_medkit_gateway") {
