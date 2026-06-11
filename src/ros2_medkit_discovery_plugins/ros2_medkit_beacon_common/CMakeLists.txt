@@ -15,16 +15,15 @@
 cmake_minimum_required(VERSION 3.8)
 project(ros2_medkit_beacon_common)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
-endif()
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Shared cmake modules (multi-distro compat, ccache, linting)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
+include(ROS2MedkitCcache)
+include(ROS2MedkitSanitizers)
+include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
 find_package(ros2_medkit_msgs REQUIRED)
@@ -80,12 +79,17 @@ if(BUILD_TESTING)
   )
   ament_lint_auto_find_test_dependencies()
 
-  find_package(ament_cmake_clang_format REQUIRED)
-  file(GLOB_RECURSE _format_files
-    "include/*.hpp" "src/*.cpp" "test/*.cpp"
-  )
-  ament_clang_format(${_format_files}
-    CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+  # ci.yml skips the ament_cmake_clang_format rosdep key in the build-and-test
+  # job (linters only run in the Jazzy quality job), so QUIET + FOUND check
+  # avoids hard-failing when the package is not installed.
+  find_package(ament_cmake_clang_format QUIET)
+  if(ament_cmake_clang_format_FOUND)
+    file(GLOB_RECURSE _format_files
+      "include/*.hpp" "src/*.cpp" "test/*.cpp"
+    )
+    ament_clang_format(${_format_files}
+      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+  endif()
 
   find_package(ament_cmake_gtest REQUIRED)
 
@@ -100,6 +104,7 @@ if(BUILD_TESTING)
   ament_add_gtest(test_beacon_entity_mapper test/test_beacon_entity_mapper.cpp)
   target_link_libraries(test_beacon_entity_mapper beacon_common_lib)
   medkit_target_dependencies(test_beacon_entity_mapper ros2_medkit_gateway)
+  ros2_medkit_relax_vendor_warnings()
 endif()
 
 ament_package()
