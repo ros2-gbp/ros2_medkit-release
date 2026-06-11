@@ -15,16 +15,15 @@
 cmake_minimum_required(VERSION 3.8)
 project(ros2_medkit_graph_provider)
 
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
-endif()
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Shared cmake modules (multi-distro compat)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
+include(ROS2MedkitCcache)
+include(ROS2MedkitSanitizers)
+include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
 find_package(ros2_medkit_gateway REQUIRED)
@@ -32,16 +31,9 @@ find_package(ros2_medkit_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
-find_package(OpenSSL REQUIRED)
-
-# cpp-httplib via multi-distro compatibility macro
-medkit_find_cpp_httplib()
-
-# Enable OpenSSL support for cpp-httplib
-add_compile_definitions(CPPHTTPLIB_OPENSSL_SUPPORT)
-
 # MODULE target: loaded via dlopen at runtime by PluginManager.
-# Symbols from gateway_lib are resolved from the host process at runtime.
+# Symbols from gateway_ros2 (and gateway_core transitively) are resolved
+# from the host process at runtime.
 # We only need headers at compile time (via medkit_target_dependencies).
 add_library(ros2_medkit_graph_provider_plugin MODULE
   src/graph_provider_plugin.cpp
@@ -66,8 +58,6 @@ target_link_options(ros2_medkit_graph_provider_plugin PRIVATE
 
 target_link_libraries(ros2_medkit_graph_provider_plugin
   nlohmann_json::nlohmann_json
-  cpp_httplib_target
-  OpenSSL::SSL OpenSSL::Crypto
 )
 
 install(TARGETS ros2_medkit_graph_provider_plugin
@@ -84,14 +74,30 @@ if(BUILD_TESTING)
   )
   ament_lint_auto_find_test_dependencies()
 
-  find_package(ament_cmake_clang_format REQUIRED)
-  file(GLOB_RECURSE _format_files
-    "include/*.hpp" "src/*.cpp" "test/*.cpp"
-  )
-  ament_clang_format(${_format_files}
-    CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+  # ci.yml skips the ament_cmake_clang_format rosdep key in the build-and-test
+  # job (linters only run in the Jazzy quality job), so QUIET + FOUND check
+  # avoids hard-failing when the package is not installed.
+  find_package(ament_cmake_clang_format QUIET)
+  if(ament_cmake_clang_format_FOUND)
+    file(GLOB_RECURSE _format_files
+      "include/*.hpp" "src/*.cpp" "test/*.cpp"
+    )
+    ament_clang_format(${_format_files}
+      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+  endif()
 
   find_package(ament_cmake_gtest REQUIRED)
+
+  # The route test uses httplib::Server/Client directly for end-to-end HTTP testing.
+  # On Humble/Jammy the system package is too old (0.10.x); fall back to gateway's
+  # vendored copy which is installed alongside the gateway package.
+  find_package(OpenSSL REQUIRED)
+  set(_gw_vendored "${ros2_medkit_gateway_DIR}/../vendored/cpp_httplib")
+  medkit_find_cpp_httplib(VENDORED_DIR "${_gw_vendored}")
+  unset(_gw_vendored)
+
+  include(ROS2MedkitTestDomain)
+  medkit_init_test_domains(START 120 END 129)
 
   ament_add_gtest(test_graph_provider_plugin
     test/test_graph_provider_plugin.cpp
@@ -106,14 +112,14 @@ if(BUILD_TESTING)
     diagnostic_msgs
     ros2_medkit_msgs
   )
+  target_compile_definitions(test_graph_provider_plugin PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
   target_link_libraries(test_graph_provider_plugin
     nlohmann_json::nlohmann_json
     cpp_httplib_target
     OpenSSL::SSL OpenSSL::Crypto
   )
-  set_tests_properties(test_graph_provider_plugin
-    PROPERTIES ENVIRONMENT "ROS_DOMAIN_ID=77"
-  )
+  medkit_set_test_domain(test_graph_provider_plugin)
+  ros2_medkit_relax_vendor_warnings()
 endif()
 
 ament_package()
