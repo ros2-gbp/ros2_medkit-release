@@ -1,199 +1,183 @@
-# ros2_medkit
+# ros2_medkit_msgs
 
-[![CI](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml/badge.svg)](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/selfpatch/ros2_medkit/branch/main/graph/badge.svg)](https://codecov.io/gh/selfpatch/ros2_medkit)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selfpatch.github.io/ros2_medkit/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![ROS 2 Jazzy](https://img.shields.io/badge/ROS%202-Jazzy-blue)](https://docs.ros.org/en/jazzy/)
-[![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-blue)](https://docs.ros.org/en/humble/)
-[![ROS 2 Lyrical](https://img.shields.io/badge/ROS%202-Lyrical-blue)](https://docs.ros.org/en/lyrical/)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/6CXPMApAyq)
-[![Quality Level 3](https://img.shields.io/badge/Quality-Level%203-yellow)](QUALITY_DECLARATION.md)
+ROS 2 message and service definitions for the ros2_medkit fault management system.
 
-<p align="center">
-  <img src="hero-full-720-12fps.gif" alt="Robots break. Now you'll know why." width="720">
-</p>
+## Overview
 
-<p align="center">
-  <b>Structured diagnostics for ROS 2 robots.</b><br>
-  When your robot fails, find out why - in minutes, not hours.
-</p>
+This package provides the interface definitions used by the fault management components:
 
-<p align="center">
-  Fault management · Live introspection · REST API · <a href="https://github.com/selfpatch/ros2_medkit_mcp">AI via MCP</a>
-</p>
+- **FaultManager** (`ros2_medkit_fault_manager`) - Central fault aggregation and lifecycle management
+- **FaultReporter** (`ros2_medkit_fault_reporter`) - Client library for fault reporting
+- **Gateway** (`ros2_medkit_gateway`) - REST API endpoints for fault access
 
-## The problem
+## Messages
 
-When a robot breaks in the field, you SSH in, run `ros2 node list`, grep through logs, and try to reconstruct what happened. It works for one robot on your desk. It does not work for 20 robots at a customer site, at 2 AM, when you cannot reproduce the issue.
+### Fault.msg
 
-ros2_medkit gives your ROS 2 system a **diagnostic REST API** so you can inspect what is running, what failed, and why, without SSH and without custom tooling.
+Core fault data model representing an aggregated fault condition with AUTOSAR DEM-style debounce filtering.
 
-## 🚀 Quick Start
+| Field | Type | Description |
+|-------|------|-------------|
+| `fault_code` | string | Global fault identifier (e.g., "MOTOR_OVERHEAT") |
+| `severity` | uint8 | Severity level (use SEVERITY_* constants) |
+| `description` | string | Human-readable description |
+| `first_occurred` | builtin_interfaces/Time | When fault was first reported |
+| `last_occurred` | builtin_interfaces/Time | When fault was last reported (FAILED or PASSED) |
+| `occurrence_count` | uint32 | Total FAILED events aggregated across all sources |
+| `status` | string | Current status (see STATUS_* constants) |
+| `reporting_sources` | string[] | List of source identifiers that reported this fault |
 
-**Try the full demo** (requires [Docker](https://docs.docker.com/get-docker/) with Compose, no ROS 2 needed):
+**Severity Levels:**
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `SEVERITY_INFO` | 0 | Informational, no action required |
+| `SEVERITY_WARN` | 1 | May require attention, no impact on functionality |
+| `SEVERITY_ERROR` | 2 | Impacts functionality, requires intervention |
+| `SEVERITY_CRITICAL` | 3 | Severe, may compromise safety or system operation. Bypasses debounce. |
+
+**Status Constants:**
+| Constant | Description |
+|----------|-------------|
+| `STATUS_PREFAILED` | Debounce counter < 0 but above confirmation threshold |
+| `STATUS_PREPASSED` | Debounce counter > 0 but below healing threshold |
+| `STATUS_CONFIRMED` | Fault confirmed (counter <= threshold, e.g., -3) |
+| `STATUS_HEALED` | Fault healed by PASSED events (if healing enabled) |
+| `STATUS_CLEARED` | Fault manually cleared via ClearFault service |
+
+**Status Lifecycle (Debounce Model):**
+```
+PREFAILED ←→ PREPASSED → HEALED (retained)
+    ↓
+CONFIRMED → CLEARED (manual)
+```
+- FAILED events decrement counter (towards confirmation)
+- PASSED events increment counter (towards healing)
+- CRITICAL severity bypasses debounce and confirms immediately
+
+### FaultEvent.msg
+
+Real-time fault event notification for SSE streaming (published on `/fault_manager/events`).
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `event_type` | string | Event type (see constants below) |
+| `fault` | Fault | The fault data (state after event) |
+| `timestamp` | builtin_interfaces/Time | When the event occurred |
+
+**Event Types:**
+| Constant | Trigger |
+|----------|---------|
+| `EVENT_CONFIRMED` | Fault transitions PREFAILED → CONFIRMED |
+| `EVENT_CLEARED` | Fault transitions to CLEARED |
+| `EVENT_UPDATED` | Fault data changes without status transition |
+
+## Services
+
+### ReportFault.srv
+
+Report a fault event (FAILED or PASSED) to the FaultManager.
+
+**Request:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `fault_code` | string | Global identifier (UPPER_SNAKE_CASE, max 64 chars) |
+| `event_type` | uint8 | Event type: EVENT_FAILED (0) or EVENT_PASSED (1) |
+| `severity` | uint8 | Severity level (0-3, only for FAILED events) |
+| `description` | string | Human-readable description (only for FAILED events) |
+| `source_id` | string | Reporting node FQN (e.g., "/powertrain/engine/temp_sensor") |
+
+**Response:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `accepted` | bool | True if the event was accepted |
+
+**Event Types:**
+- `EVENT_FAILED` (0): Fault condition detected - decrements debounce counter
+- `EVENT_PASSED` (1): Fault condition cleared - increments debounce counter
+
+### ListFaults.srv
+
+Query faults with optional filtering.
+
+**Request:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `filter_by_severity` | bool | If true, filter by severity field; if false, return all severities |
+| `severity` | uint8 | Severity level (0-3), only used if filter_by_severity is true |
+| `statuses` | string[] | Statuses to include (empty = CONFIRMED only) |
+
+**Response:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `faults` | Fault[] | Matching faults |
+
+**Examples:**
+- Default (active faults): `filter_by_severity=false, statuses=[]` → all CONFIRMED faults
+- Only errors: `filter_by_severity=true, severity=2, statuses=[]` → CONFIRMED with ERROR
+- All faults: `filter_by_severity=false, statuses=["PREFAILED", "CONFIRMED", "CLEARED"]`
+- Historical: `filter_by_severity=false, statuses=["CLEARED"]`
+
+### ClearFault.srv
+
+Clear/acknowledge a fault. Cleared faults are retained and queryable with `statuses=["CLEARED"]`.
+
+**Request:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `fault_code` | string | The fault to clear |
+| `skip_correlation_auto_clear` | bool | When `true`, only the requested fault_code is cleared; symptom faults that the correlation engine would normally auto-clear via `auto_clear_with_root` rules are left untouched. Default `false` (cascade clear). The gateway sets this to `true` on per-entity `DELETE /{entity-path}/faults/{fault_code}` so that an operator with access to one entity cannot cascade-clear correlated symptoms reported by apps in other entities. |
+
+**Response:**
+| Field | Type | Description |
+|-------|------|-------------|
+| `success` | bool | True if fault was cleared |
+| `message` | string | Status or error message |
+| `auto_cleared_codes` | string[] | Symptom fault codes auto-cleared with the root cause (empty when `skip_correlation_auto_clear=true`) |
+
+> **Note:** `skip_correlation_auto_clear` was added in `ros2_medkit_msgs` post-0.4.0. Adding a request field changes the service type hash, so out-of-tree callers that invoke `/fault_manager/clear_fault` directly (via `ros2 service call` or a generated client) must rebuild against the new `ros2_medkit_msgs` release to keep talking to `fault_manager`.
+
+## Usage
+
+### C++
+
+```cpp
+#include "ros2_medkit_msgs/msg/fault.hpp"
+#include "ros2_medkit_msgs/srv/report_fault.hpp"
+
+// Create a fault message
+ros2_medkit_msgs::msg::Fault fault;
+fault.fault_code = "MOTOR_OVERHEAT";
+fault.severity = ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR;
+fault.status = ros2_medkit_msgs::msg::Fault::STATUS_CONFIRMED;
+```
+
+### Python
+
+```python
+from ros2_medkit_msgs.msg import Fault
+from ros2_medkit_msgs.srv import ReportFault
+
+# Create a fault message
+fault = Fault()
+fault.fault_code = "MOTOR_OVERHEAT"
+fault.severity = Fault.SEVERITY_ERROR
+fault.status = Fault.STATUS_CONFIRMED
+```
+
+## Building
 
 ```bash
-git clone https://github.com/selfpatch/selfpatch_demos.git
-cd selfpatch_demos/demos/turtlebot3_integration
-./run-demo.sh
-# → API: http://localhost:8080/api/v1/  Web UI: http://localhost:3000
+colcon build --packages-select ros2_medkit_msgs
+source install/setup.bash  # or setup.zsh for zsh users
 ```
 
-Open `http://localhost:3000` in your browser. You will see a TurtleBot3 with Nav2, organized into a browsable entity tree with live faults, topic data, and parameter access.
-
-**Build from source** (ROS 2 Jazzy, Humble, or Lyrical):
+## Verifying
 
 ```bash
-source /opt/ros/jazzy/setup.bash   # or humble - adjust for your distro
-git clone --recurse-submodules https://github.com/selfpatch/ros2_medkit.git
-cd ros2_medkit
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install && source install/setup.bash
-ros2 launch ros2_medkit_gateway gateway.launch.py
-# → http://localhost:8080/api/v1/health
+ros2 interface show ros2_medkit_msgs/msg/Fault
+ros2 interface show ros2_medkit_msgs/srv/ReportFault
 ```
 
-Verify it works: `curl http://localhost:8080/api/v1/health` should return `{"status": "healthy", ...}`.
+## License
 
-For a guided walkthrough with demo nodes and the full API, see the [Getting Started tutorial](https://selfpatch.github.io/ros2_medkit/getting_started.html). For API examples, see our [Postman collection](postman/).
-
-### Experimental: Pixi
-
-[Pixi](https://pixi.sh) provides a reproducible, lockfile-based environment
-without requiring a system-wide ROS 2 installation (Linux x86_64 only).
-This is experimental; the standard ROS 2 toolchain (rosdep + colcon) remains the primary method.
-
-```bash
-curl -fsSL https://pixi.sh/install.sh | bash
-pixi install -e jazzy     # or: pixi install -e humble
-pixi run -e jazzy build
-pixi run -e jazzy test
-pixi run -e jazzy smoke   # verify gateway starts
-```
-
-See [installation docs](https://selfpatch.github.io/ros2_medkit/installation.html#experimental-pixi)
-for details. Feedback welcome on [#265](https://github.com/selfpatch/ros2_medkit/issues/265).
-
-## What you get
-
-**Start here: Faults.** Your robot has 47 nodes. Something throws an error.
-Instead of grepping logs, you query `GET /api/v1/faults` and get a structured list
-with fault codes, timestamps, affected entities, environment snapshots, and history.
-Clear faults, subscribe to new ones via SSE, correlate them across components.
-
-Beyond faults, medkit exposes the full ROS 2 graph through REST:
-
-| | What it does |
-|---|---|
-| **Discovery** | Automatically finds running nodes, topics, services, and actions |
-| **Data** | Read and write topic data via REST |
-| **Operations** | Call services and actions with execution tracking |
-| **Configurations** | Read, write, and reset node parameters |
-| **Bulk Data** | Upload/download files (calibration, firmware, rosbags) |
-| **Subscriptions** | Stream live data and fault events via SSE |
-| **Triggers** | Condition-based push notifications for resource changes |
-| **Locking** | Resource locking for safe concurrent access |
-| **Scripts** | Upload and execute diagnostic scripts on entities |
-| **Software Updates** | Async prepare/execute lifecycle with pluggable backends |
-| **Authentication** | JWT-based RBAC (viewer, operator, configurator, admin) |
-| **Logs** | Log entries and configuration |
-| **Docs** | OpenAPI 3.1.0 spec and Swagger UI at `/api/v1/docs` - schemas are generated from typed C++ structs so the spec always matches the wire format |
-
-On the [roadmap](https://selfpatch.github.io/ros2_medkit/roadmap.html): entity lifecycle control, mode management, communication logs.
-
-## How it organizes your robot
-
-medkit models your system as an **entity tree** with four levels:
-
-```
-Areas          Components         Apps (nodes)
-─────          ──────────         ────────────
-base       ┬─ motor_controller ┬─ left_wheel_driver
-           │                   └─ right_wheel_driver
-           └─ battery_monitor  └─ bms_node
-
-navigation ┬─ lidar_driver     └─ rplidar_node
-           └─ nav_stack        ┬─ nav2_controller
-                               ├─ nav2_planner
-                               └─ nav2_bt_navigator
-```
-
-A small robot might have a single area. A large robot can use areas to separate physical domains:
-
-```
-areas/
-├── base/
-│   └── components/
-│       ├── motor_controller/   → apps: left_wheel, right_wheel
-│       └── battery_monitor/    → apps: bms_node
-├── arm/
-│   └── components/
-│       ├── joint_controller/   → apps: joint_1..joint_6
-│       └── gripper/            → apps: gripper_driver
-├── navigation/
-│   └── components/
-│       ├── lidar_driver/       → apps: rplidar_node
-│       ├── camera_driver/      → apps: realsense_node
-│       └── nav_stack/          → apps: controller, planner, bt_navigator
-└── safety/
-    └── components/
-        ├── emergency_stop/     → apps: estop_monitor
-        └── collision_detect/   → apps: collision_checker
-```
-
-**Functions** cut across the tree. A function like `localization` might depend on apps from both `navigation` and `base`, giving you a capability-oriented view alongside the physical hierarchy.
-
-This entity model follows the **SOVD (Service-Oriented Vehicle Diagnostics)** standard, so the same concepts work across robots, vehicles, and embedded systems.
-
-## 📋 Requirements
-
-- **OS:** Ubuntu 26.04 LTS (Resolute, for Lyrical), Ubuntu 24.04 LTS (Noble, for Jazzy), or Ubuntu 22.04 LTS (Jammy, for Humble)
-- **ROS 2:** Jazzy Jalisco, Humble Hawksbill, or Lyrical Luth (LTS, released May 2026)
-- **Compiler:** GCC 11+ (C++17 support)
-- **Build System:** colcon + ament_cmake
-
-## 📚 Documentation
-
-- 📖 [Full Documentation](https://selfpatch.github.io/ros2_medkit/)
-- 🗺️ [Roadmap](https://selfpatch.github.io/ros2_medkit/roadmap.html)
-- 📋 [GitHub Milestones](https://github.com/selfpatch/ros2_medkit/milestones)
-
-## 💬 Community
-
-- **💬 Discord** - [Join our server](https://discord.gg/6CXPMApAyq) for discussions, help, and announcements
-- **🐛 Issues** - [Report bugs or request features](https://github.com/selfpatch/ros2_medkit/issues)
-- **💡 Discussions** - [GitHub Discussions](https://github.com/selfpatch/ros2_medkit/discussions) for Q&A and ideas
-
-## 🤝 Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, testing, pre-commit hooks, CI/CD details, and code coverage.
-
-Quick version:
-
-```bash
-source /opt/ros/jazzy/setup.bash  # or humble
-pipx install pre-commit && pre-commit install && pre-commit install --hook-type pre-push
-colcon build --symlink-install
-source install/setup.bash
-./scripts/test.sh          # unit tests
-./scripts/test.sh all      # everything
-```
-
-Check out [good first issues](https://github.com/selfpatch/ros2_medkit/labels/good%20first%20issue) for places to start.
-
-## 🔒 Security
-
-If you discover a security vulnerability, please follow the responsible disclosure process in [SECURITY.md](SECURITY.md).
-
-## 📄 License
-
-Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
----
-
-<p align="center">
-  Made with ❤️ by the <a href="https://github.com/selfpatch">selfpatch</a> community
-  <br>
-  <a href="https://discord.gg/6CXPMApAyq">💬 Join us on Discord</a>
-</p>
+Apache-2.0
