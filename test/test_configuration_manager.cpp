@@ -19,7 +19,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <thread>
 
-#include "ros2_medkit_gateway/configuration_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/configuration_manager.hpp"
+#include "ros2_medkit_gateway/ros2/transports/ros2_parameter_transport.hpp"
 
 using namespace ros2_medkit_gateway;
 
@@ -38,9 +39,10 @@ class TestConfigurationManager : public ::testing::Test {
     // Use short timeout for tests to avoid long waits on nonexistent nodes
     rclcpp::NodeOptions options;
     options.allow_undeclared_parameters(false);
-    options.parameter_overrides({rclcpp::Parameter("parameter_service_timeout_sec", 0.1)});
     node_ = std::make_shared<rclcpp::Node>("test_config_manager_node", options);
-    config_manager_ = std::make_unique<ConfigurationManager>(node_.get());
+    // Short timeout (0.1s) for tests to avoid long waits on nonexistent nodes.
+    parameter_transport_ = std::make_shared<ros2::Ros2ParameterTransport>(node_.get(), 0.1, 60.0);
+    config_manager_ = std::make_unique<ConfigurationManager>(parameter_transport_);
 
     // Create and start executor in separate thread to avoid deadlocks
     executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
@@ -60,11 +62,13 @@ class TestConfigurationManager : public ::testing::Test {
     }
     executor_->remove_node(node_);
     config_manager_.reset();
+    parameter_transport_.reset();
     node_.reset();
     executor_.reset();
   }
 
   std::shared_ptr<rclcpp::Node> node_;
+  std::shared_ptr<ros2::Ros2ParameterTransport> parameter_transport_;
   std::unique_ptr<ConfigurationManager> config_manager_;
   std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> executor_;
   std::thread spin_thread_;
@@ -316,6 +320,105 @@ TEST_F(TestConfigurationManager, test_error_messages_informative) {
   EXPECT_FALSE(result2.error_message.empty());
 }
 
+// ==================== NEGATIVE CACHE TESTS ====================
+
+TEST_F(TestConfigurationManager, test_negative_cache_fast_return) {
+  // First call to nonexistent node: waits for timeout, returns SERVICE_UNAVAILABLE
+  auto result1 = config_manager_->list_parameters("/nonexistent_cached_node");
+  EXPECT_FALSE(result1.success);
+  EXPECT_EQ(result1.error_code, ParameterErrorCode::SERVICE_UNAVAILABLE);
+
+  // Second call: should return from negative cache (no service discovery wait)
+  auto result2 = config_manager_->list_parameters("/nonexistent_cached_node");
+  EXPECT_FALSE(result2.success);
+  EXPECT_EQ(result2.error_code, ParameterErrorCode::SERVICE_UNAVAILABLE);
+  EXPECT_TRUE(result2.error_message.find("cached") != std::string::npos);
+}
+
+// ==================== SELF-QUERY GUARD TESTS ====================
+
+TEST_F(TestConfigurationManager, test_self_query_no_deadlock) {
+  // Querying our own node should work without deadlock (direct access, no IPC)
+  auto result = config_manager_->list_parameters("/test_config_manager_node");
+
+  EXPECT_TRUE(result.success);
+}
+
+// ==================== SPIN SERIALIZATION TESTS ====================
+
+TEST_F(TestConfigurationManager, test_concurrent_queries_no_crash) {
+  // Concurrent queries to different nonexistent nodes must not crash
+  // (spin_mutex_ serializes ROS 2 IPC to prevent executor conflicts).
+  std::vector<ParameterResult> results(3);
+  std::vector<std::thread> threads;
+  threads.reserve(3);
+  for (int i = 0; i < 3; ++i) {
+    threads.emplace_back([this, i, &results]() {
+      results[static_cast<size_t>(i)] = config_manager_->list_parameters("/concurrent_node_" + std::to_string(i));
+    });
+  }
+  for (auto & t : threads) {
+    t.join();
+  }
+  for (int i = 0; i < 3; ++i) {
+    EXPECT_FALSE(results[static_cast<size_t>(i)].success);
+    EXPECT_EQ(results[static_cast<size_t>(i)].error_code, ParameterErrorCode::SERVICE_UNAVAILABLE);
+  }
+}
+
+TEST_F(TestConfigurationManager, test_spin_lock_timeout_returns_error) {
+  // Hold spin_mutex_ from a background thread, verify public method returns TIMEOUT
+  // Access the mutex via a configurations call that blocks on a nonexistent node
+  std::atomic<bool> holding{false};
+  std::atomic<bool> done{false};
+
+  // Background thread: acquire spin_mutex_ and hold it
+  std::thread blocker([this, &holding, &done]() {
+    auto result = config_manager_->list_parameters("/blocking_node_timeout_test");
+    holding = true;
+    // list_parameters already released the lock, but by the time it returns
+    // the test thread should have observed the TIMEOUT. Spin briefly to keep
+    // the test deterministic.
+    while (!done.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  });
+
+  // Wait for blocker to start (it will hold spin_mutex_ during wait_for_service)
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // This call should timeout on spin_mutex_ if blocker is still holding it,
+  // OR succeed if blocker already released. Either way, no hang.
+  auto start = std::chrono::steady_clock::now();
+  auto result = config_manager_->list_parameters("/timeout_test_node");
+  auto elapsed = std::chrono::steady_clock::now() - start;
+
+  // Should complete within reasonable time (not hang forever)
+  EXPECT_LT(elapsed, std::chrono::seconds(10));
+  // Result is either TIMEOUT or SERVICE_UNAVAILABLE - both are acceptable
+  EXPECT_FALSE(result.success);
+
+  done = true;
+  blocker.join();
+}
+
+TEST_F(TestConfigurationManager, test_negative_cache_cross_method) {
+  // list_parameters marks node unavailable, get_parameter should return cached
+  auto list_result = config_manager_->list_parameters("/cross_method_cached_node");
+  EXPECT_FALSE(list_result.success);
+  EXPECT_EQ(list_result.error_code, ParameterErrorCode::SERVICE_UNAVAILABLE);
+
+  auto get_result = config_manager_->get_parameter("/cross_method_cached_node", "param");
+  EXPECT_FALSE(get_result.success);
+  EXPECT_EQ(get_result.error_code, ParameterErrorCode::SERVICE_UNAVAILABLE);
+  EXPECT_TRUE(get_result.error_message.find("cached") != std::string::npos);
+
+  auto set_result = config_manager_->set_parameter("/cross_method_cached_node", "param", nlohmann::json(42));
+  EXPECT_FALSE(set_result.success);
+  EXPECT_EQ(set_result.error_code, ParameterErrorCode::SERVICE_UNAVAILABLE);
+  EXPECT_TRUE(set_result.error_message.find("cached") != std::string::npos);
+}
+
 // ==================== CONCURRENT ACCESS TEST ====================
 
 TEST_F(TestConfigurationManager, test_concurrent_parameter_access) {
@@ -324,6 +427,7 @@ TEST_F(TestConfigurationManager, test_concurrent_parameter_access) {
 
   // Access from multiple threads should be safe
   std::vector<std::thread> threads;
+  threads.reserve(3);
   std::atomic<int> success_count{0};
 
   for (int i = 0; i < 3; ++i) {
@@ -363,6 +467,7 @@ TEST_F(TestConfigurationManager, test_concurrent_parameter_operations_no_executo
   constexpr int kOpsPerThread = 5;
 
   std::vector<std::thread> threads;
+  threads.reserve(kNumThreads);
   std::atomic<int> success_count{0};
   std::atomic<int> exception_count{0};
   std::atomic<bool> start_flag{false};
