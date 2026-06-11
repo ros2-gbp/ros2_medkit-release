@@ -1,0 +1,90 @@
+# TSan suppression file for ros2_medkit
+# Suppresses known issues in third-party code (DDS, rclcpp, httplib).
+# This file is referenced by TSAN_OPTIONS in CI.
+#
+# RULE: Never suppress ros2_medkit code. If TSan finds a race in our
+# code, fix it. Suppressions are only for libraries we don't control.
+
+# FastDDS internal thread pool and transport layer
+race:eprosima::fastdds::*
+race:eprosima::fastrtps::*
+# FastCDR serialize/deserialize races on TopicPayloadPool buffer during
+# intra-process communication. Write by publisher thread via serialize_array
+# races against read by subscriber thread via deserialize_array on the same
+# payload allocation from eprosima::fastrtps::rtps::TopicPayloadPool::do_get_payload.
+# Upstream tracking: https://github.com/eProsima/Fast-DDS/issues/6340 (open).
+# Narrowed to the exact symbols on the reported TSan stack so future races
+# introduced by our own FastCDR misuse (e.g. sharing a Cdr across threads)
+# would still be reported.
+race:eprosima::fastcdr::Cdr::serialize*
+race:eprosima::fastcdr::Cdr::deserialize*
+
+# rclcpp signal handler (writes to global atomic from signal context)
+race:rclcpp::SignalHandler*
+race:rclcpp::signal_handler
+
+# rcl/rcutils logging lazy initialization (benign one-time race)
+race:rcl_logging_*
+race:rcutils_logging_*
+
+# cpp-httplib: data race in Server::stop() and create_server_socket()
+# on internal socket fd between listen and stop threads.
+# System-packaged libcpp-httplib.so, not our code. The .so is shipped
+# stripped, so TSan stacks point at <null> in libcpp-httplib.so.0.14
+# instead of demangled httplib:: symbols; match by library name as well
+# so the stripped frames are also covered.
+race:httplib::*
+called_from_lib:libcpp-httplib.so.0.14
+called_from_lib:libcpp-httplib.so
+
+# rclcpp/glibc: unlock-of-unlocked-mutex in __gthread_mutex_unlock during
+# test teardown when executor threads race with node destruction.
+mutex:__gthread_mutex_unlock
+
+# rclcpp: NodeGraph::notify_graph_change() iterates the per-context vector
+# of graph events (held as Event::WeakPtr) from the graph listener thread
+# while a node is being destroyed in another thread, racing on the Event's
+# shared_ptr control block. Triggered by TestGatewayNode where many nodes
+# are created/destroyed in sequence while the per-process GraphListener
+# keeps running. We already reset graph_event_ before automatic member
+# destruction (see ~GatewayNode); this suppression covers the remaining
+# library-side window we cannot tighten without changing rclcpp.
+race:rclcpp::node_interfaces::NodeGraph::notify_graph_change
+
+
+# rclcpp: lock-order-inversion in Context::add_on_shutdown_callback
+# during test TearDownTestSuite when rclcpp::shutdown() races with
+# executor threads still calling context methods.
+deadlock:rclcpp::Context*
+
+# rclcpp GenericClient: std::future shared state racing between the
+# executor thread that fulfils the response promise (_M_do_set ->
+# unique_ptr::swap) and the caller thread reading via future::get().
+# The happens-before is established by rclcpp's pthread_once around
+# _State_baseV2::wait, but TSan does not see pthread_once as
+# synchronisation when the wait completes after the promise was
+# already satisfied. Suppress the standard-library frames that surface
+# the rclcpp/glibc internal synchronisation - the race lives in the
+# stdc++ future implementation, not in our handlers.
+race:std::__future_base::_State_baseV2*
+race:std::__uniq_ptr_impl*_Result_base*
+race:std::unique_ptr*_Result_base*
+
+# rclcpp GenericClient response staging: the executor thread fills the
+# generic response via rclcpp::GenericClient::create_response() before
+# satisfying the promise, while the caller thread reads it after
+# future::get(). dynmsg (the vendored ROS introspection serialiser used
+# inside our JsonSerializer::to_json) and yaml-cpp 0.8 both reach into
+# the staged response buffer; TSan reports races on yaml-cpp's
+# Node::Assign / inner_encode and on dynmsg's basic_value_to_yaml and
+# get_vector_size because libstdc++ future synchronisation is invisible
+# to TSan (see suppression above). Suppress the library/vendored frames
+# rather than the call sites in our code, so any race we introduce in
+# our own JSON path still gets reported.
+race:YAML::Node::Assign*
+race:YAML::conversion::inner_encode*
+race:YAML::detail::node_data::set_scalar*
+called_from_lib:libyaml-cpp.so.0.8
+race:dynmsg::cpp::impl::basic_value_to_yaml*
+race:dynmsg::cpp::impl::member_to_yaml*
+race:dynmsg::get_vector_size*
