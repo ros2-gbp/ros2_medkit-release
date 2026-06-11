@@ -30,9 +30,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SRC_DIR="${REPO_ROOT}/src"
-VERSION_HPP="${SRC_DIR}/ros2_medkit_gateway/include/ros2_medkit_gateway/version.hpp"
+VERSION_HPP="${SRC_DIR}/ros2_medkit_gateway/include/ros2_medkit_gateway/core/version.hpp"
 CONF_PY="${REPO_ROOT}/docs/conf.py"
 DOCS_PYPROJECT="${REPO_ROOT}/docs/pyproject.toml"
+DOXYFILE="${REPO_ROOT}/docs/Doxyfile"
+QUALITY_DECL="${REPO_ROOT}/QUALITY_DECLARATION.md"
+REST_RST="${REPO_ROOT}/docs/api/rest.rst"
 
 usage() {
     echo "Usage: $0 {bump <version>|verify [<version>]}"
@@ -107,6 +110,37 @@ cmd_bump() {
         echo "  docs/pyproject.toml: -> ${target_version}"
     fi
 
+    # Update docs/Doxyfile PROJECT_NUMBER
+    if [ -f "$DOXYFILE" ]; then
+        sed -i "s|\(PROJECT_NUMBER[[:space:]]*=[[:space:]]*\)\"[0-9]\+\.[0-9]\+\.[0-9]\+\"|\1\"${target_version}\"|" "$DOXYFILE"
+        echo "  docs/Doxyfile PROJECT_NUMBER: -> ${target_version}"
+    fi
+
+    # Update QUALITY_DECLARATION.md current-version references (leave the
+    # ">=1.0.0" stability-policy mentions untouched via anchored patterns)
+    if [ -f "$QUALITY_DECL" ]; then
+        sed -i \
+            -e "s|current version is \*\*[0-9]\+\.[0-9]\+\.[0-9]\+\*\*|current version is **${target_version}**|" \
+            -e "s|all packages at [0-9]\+\.[0-9]\+\.[0-9]\+|all packages at ${target_version}|" \
+            -e "s|Version is [0-9]\+\.[0-9]\+\.[0-9]\+|Version is ${target_version}|" \
+            "$QUALITY_DECL"
+        echo "  QUALITY_DECLARATION.md: -> ${target_version}"
+    fi
+
+    # Update the gateway-version literals in docs/api/rest.rst example responses.
+    # Each is anchored on its adjacent "name" key so the SOVD API "version":
+    # "1.0.0" (which has neither anchor) is never rewritten:
+    #   - root "/" response:       "name": "ROS 2 Medkit Gateway" then "version"
+    #   - version-info vendor_info: "version" then "name": "ros2_medkit"
+    if [ -f "$REST_RST" ]; then
+        REST_TARGET="$target_version" perl -0pi -e '
+            my $v = $ENV{REST_TARGET};
+            s/("name": "ROS 2 Medkit Gateway",\s*\n\s*"version": ")\d+\.\d+\.\d+(")/$1$v$2/g;
+            s/("version": ")\d+\.\d+\.\d+(",\s*\n\s*"name": "ros2_medkit")/$1$v$2/g;
+        ' "$REST_RST"
+        echo "  docs/api/rest.rst example versions: -> ${target_version}"
+    fi
+
     echo ""
     echo "Bumped ${count} packages + version.hpp + docs to ${target_version}."
     echo ""
@@ -177,8 +211,64 @@ cmd_verify() {
         versions_seen+=("$pyproject_version")
     fi
 
+    # Check docs/Doxyfile PROJECT_NUMBER
+    if [ -f "$DOXYFILE" ]; then
+        local doxy_version
+        doxy_version=$(grep -oP 'PROJECT_NUMBER\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$DOXYFILE" || echo "unknown")
+        if [ -n "$expected_version" ] && [ "$doxy_version" != "$expected_version" ]; then
+            echo "  MISMATCH: docs/Doxyfile PROJECT_NUMBER is ${doxy_version}, expected ${expected_version}"
+            all_ok=false
+        else
+            echo "  OK: docs/Doxyfile PROJECT_NUMBER = ${doxy_version}"
+        fi
+        versions_seen+=("$doxy_version")
+    fi
+
+    # Check QUALITY_DECLARATION.md current version
+    if [ -f "$QUALITY_DECL" ]; then
+        local qd_version
+        qd_version=$(grep -oP 'current version is \*\*\K[0-9]+\.[0-9]+\.[0-9]+' "$QUALITY_DECL" || echo "unknown")
+        if [ -n "$expected_version" ] && [ "$qd_version" != "$expected_version" ]; then
+            echo "  MISMATCH: QUALITY_DECLARATION.md current version is ${qd_version}, expected ${expected_version}"
+            all_ok=false
+        else
+            echo "  OK: QUALITY_DECLARATION.md current version = ${qd_version}"
+        fi
+        versions_seen+=("$qd_version")
+    fi
+
+    # Check docs/api/rest.rst example-response versions (gateway version only;
+    # the SOVD API "version": "1.0.0" is excluded via the same name anchors as
+    # the bump path, so it is neither rewritten nor verified here).
+    if [ -f "$REST_RST" ]; then
+        local rest_versions
+        rest_versions=$(perl -0ne '
+            while (/"name": "ROS 2 Medkit Gateway",\s*\n\s*"version": "(\d+\.\d+\.\d+)"/g) { print "$1\n" }
+            while (/"version": "(\d+\.\d+\.\d+)",\s*\n\s*"name": "ros2_medkit"/g) { print "$1\n" }
+        ' "$REST_RST")
+        [ -n "$rest_versions" ] || rest_versions="unknown"
+        while IFS= read -r rest_version; do
+            if [ -n "$expected_version" ] && [ "$rest_version" != "$expected_version" ]; then
+                echo "  MISMATCH: docs/api/rest.rst example version is ${rest_version}, expected ${expected_version}"
+                all_ok=false
+            else
+                echo "  OK: docs/api/rest.rst example version = ${rest_version}"
+            fi
+            versions_seen+=("$rest_version")
+        done <<< "$rest_versions"
+    fi
+
     # Check consistency if no expected version given
     if [ -z "$expected_version" ]; then
+        # An "unknown" means a version pattern failed to match in some file.
+        # Without this guard an all-"unknown" run collapses to one unique value
+        # and would false-pass the consistency check below.
+        if printf '%s\n' "${versions_seen[@]}" | grep -qx "unknown"; then
+            echo ""
+            echo "ERROR: could not parse a version from one or more files (got 'unknown')."
+            all_ok=false
+        fi
+
         local unique_versions
         unique_versions=$(printf '%s\n' "${versions_seen[@]}" | sort -u)
         local unique_count

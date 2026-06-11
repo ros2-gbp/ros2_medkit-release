@@ -21,11 +21,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCcache)
+include(ROS2MedkitSanitizers)
 include(ROS2MedkitLinting)
-
-if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-  add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wconversion)
-endif()
+include(ROS2MedkitWarnings)
 
 # Code coverage option
 option(ENABLE_COVERAGE "Enable code coverage reporting" OFF)
@@ -105,10 +103,14 @@ if(BUILD_TESTING)
 
   ros2_medkit_clang_tidy()
 
+  include(ROS2MedkitTestDomain)
+  medkit_init_test_domains(START 90 END 99)
+
   # Unit tests
   ament_add_gtest(test_diagnostic_bridge test/test_diagnostic_bridge.cpp)
   target_link_libraries(test_diagnostic_bridge diagnostic_bridge_lib)
   medkit_target_dependencies(test_diagnostic_bridge rclcpp diagnostic_msgs ros2_medkit_msgs)
+  medkit_set_test_domain(test_diagnostic_bridge)
 
   if(ENABLE_COVERAGE)
     target_compile_options(test_diagnostic_bridge PRIVATE --coverage -O0 -g)
@@ -125,6 +127,7 @@ if(BUILD_TESTING)
     TARGET test_integration
     TIMEOUT 60
   )
+  ros2_medkit_relax_vendor_warnings()
 endif()
 
 ament_package()

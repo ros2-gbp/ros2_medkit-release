@@ -46,7 +46,7 @@ class TestLoggingApi(GatewayTestCase):
 
     MIN_EXPECTED_APPS = 1
     REQUIRED_APPS = {'temp_sensor'}
-    REQUIRED_AREAS = {'powertrain'}
+    REQUIRED_FUNCTIONS = {'powertrain'}
 
     # ------------------------------------------------------------------
     # GET /apps/{id}/logs
@@ -229,6 +229,49 @@ class TestLoggingApi(GatewayTestCase):
         self.assertIn('items', data)
         self.assertIsInstance(data['items'], list)
 
+    def test_component_get_logs_aggregates_child_apps(self):
+        """GET /components/{id}/logs aggregates from hosted apps.
+
+        Synthetic / runtime-discovered components have an empty fqn, so
+        the legacy prefix-match path silently returned zero items. The
+        handler now mirrors the AREA / FUNCTION pattern: look up child
+        apps via the entity cache, build their host fqns, and merge.
+
+        # @verifies REQ_INTEROP_061
+        """
+        components = self.get_json('/components')['items']
+        self.assertGreater(len(components), 0, 'At least one component required')
+        # Pick the component that hosts temp_sensor (the only demo node).
+        comp_id = None
+        for c in components:
+            hosts = self.get_json(f"/components/{c['id']}/hosts").get('items', [])
+            if any(h.get('id') == 'temp_sensor' for h in hosts):
+                comp_id = c['id']
+                break
+        self.assertIsNotNone(comp_id, 'No component hosts temp_sensor')
+
+        # Poll - /rosout buffer fills asynchronously after node startup, so
+        # the items list may be briefly empty. Without polling this assertion
+        # is timing-dependent in CI.
+        data = self.poll_endpoint_until(
+            f'/components/{comp_id}/logs?severity=debug',
+            condition=lambda d: d if d.get('items') else None,
+            timeout=15.0,
+        )
+        # Items must be non-empty - the original bug was a silent empty list
+        # for synthetic components, so app_count alone is not sufficient.
+        self.assertGreater(len(data['items']), 0,
+                           'Component logs aggregation returned zero items')
+        ext = data.get('x-medkit', {})
+        self.assertEqual(ext.get('aggregation_level'), 'component')
+        self.assertEqual(ext.get('aggregated'), True)
+        self.assertGreaterEqual(ext.get('app_count', 0), 1)
+        sources = ext.get('aggregation_sources', [])
+        self.assertTrue(
+            any('temp_sensor' in src for src in sources),
+            f"Expected aggregation_sources to contain a temp_sensor fqn, got: {sources}",
+        )
+
     def test_component_get_logs_configuration_returns_200(self):
         """GET /components/{id}/logs/configuration returns 200 with config.
 
@@ -292,36 +335,36 @@ class TestLoggingApi(GatewayTestCase):
         self.assertEqual(data['severity_filter'], 'info')
 
     # ------------------------------------------------------------------
-    # GET /areas/{id}/logs  (prefix match on area namespace)
+    # GET /functions/{id}/logs  (prefix match on function namespace)
     # ------------------------------------------------------------------
 
-    def test_area_get_logs_returns_200(self):
-        """GET /areas/{id}/logs returns 200 with items array.
+    def test_function_get_logs_returns_200(self):
+        """GET /functions/{id}/logs returns 200 with items array.
 
-        Areas use namespace prefix matching - all nodes under the area
-        namespace are included. This is a ros2_medkit extension (SOVD
-        defines resource collections only for apps/components).
+        Functions use namespace prefix matching in runtime_only mode.
+        This is a ros2_medkit extension (SOVD defines resource
+        collections only for apps/components).
 
         # @verifies REQ_INTEROP_061
         """
-        areas = self.get_json('/areas')['items']
-        self.assertGreater(len(areas), 0, 'Expected at least one area')
-        area_id = areas[0]['id']
+        functions = self.get_json('/functions')['items']
+        self.assertGreater(len(functions), 0, 'Expected at least one function')
+        func_id = functions[0]['id']
 
-        data = self.get_json(f'/areas/{area_id}/logs')
+        data = self.get_json(f'/functions/{func_id}/logs')
         self.assertIn('items', data)
         self.assertIsInstance(data['items'], list)
 
-    def test_area_get_logs_configuration_returns_200(self):
-        """GET /areas/{id}/logs/configuration returns default config.
+    def test_function_get_logs_configuration_returns_200(self):
+        """GET /functions/{id}/logs/configuration returns default config.
 
         # @verifies REQ_INTEROP_063
         """
-        areas = self.get_json('/areas')['items']
-        self.assertGreater(len(areas), 0, 'Expected at least one area')
-        area_id = areas[0]['id']
+        functions = self.get_json('/functions')['items']
+        self.assertGreater(len(functions), 0, 'Expected at least one function')
+        func_id = functions[0]['id']
 
-        data = self.get_json(f'/areas/{area_id}/logs/configuration')
+        data = self.get_json(f'/functions/{func_id}/logs/configuration')
         self.assertIn('severity_filter', data)
         self.assertIn('max_entries', data)
 
