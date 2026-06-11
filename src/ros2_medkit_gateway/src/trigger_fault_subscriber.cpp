@@ -14,8 +14,8 @@
 
 #include "ros2_medkit_gateway/trigger_fault_subscriber.hpp"
 
-#include "ros2_medkit_gateway/fault_manager.hpp"
 #include "ros2_medkit_gateway/fault_manager_paths.hpp"
+#include "ros2_medkit_gateway/ros2/conversions/fault_msg_conversions.hpp"
 
 namespace ros2_medkit_gateway {
 
@@ -31,21 +31,36 @@ TriggerFaultSubscriber::TriggerFaultSubscriber(rclcpp::Node * node, ResourceChan
   RCLCPP_INFO(logger_, "TriggerFaultSubscriber initialized, subscribed to %s", fault_events_topic.c_str());
 }
 
+TriggerFaultSubscriber::~TriggerFaultSubscriber() {
+  subscription_.reset();
+}
+
+void TriggerFaultSubscriber::set_node_to_entity_resolver(NodeToEntityFn resolver) {
+  node_to_entity_resolver_ = std::move(resolver);
+}
+
 void TriggerFaultSubscriber::on_fault_event(const ros2_medkit_msgs::msg::FaultEvent::ConstSharedPtr & msg) {
-  // Convert fault to JSON using the same method as SSEFaultHandler
-  nlohmann::json fault_json = FaultManager::fault_to_json(msg->fault);
+  // Convert fault to JSON using the same helper as SSEFaultHandler
+  nlohmann::json fault_json = ros2::conversions::fault_to_json(msg->fault);
   fault_json["event_type"] = msg->event_type;
 
   // Derive entity_id from reporting_sources (first source, if available).
-  // reporting_sources contains FQNs like "/powertrain/engine/temp_sensor",
-  // but triggers use SOVD entity IDs (just the node name, e.g. "temp_sensor").
-  // Extract the last segment after the final '/'.
+  // In hybrid/manifest mode, the resolver maps ROS FQNs to manifest entity IDs.
+  // Falls back to last-segment extraction for runtime_only mode or when the
+  // resolver cannot map the FQN.
   std::string entity_id;
   if (!msg->fault.reporting_sources.empty()) {
-    entity_id = msg->fault.reporting_sources[0];
-    auto last_slash = entity_id.rfind('/');
-    if (last_slash != std::string::npos) {
-      entity_id = entity_id.substr(last_slash + 1);
+    auto raw_fqn = msg->fault.reporting_sources[0];
+
+    // Try resolving ROS FQN to manifest entity ID
+    if (node_to_entity_resolver_) {
+      entity_id = node_to_entity_resolver_(raw_fqn);
+    }
+
+    // Fallback: extract last path segment (backward compat for runtime_only)
+    if (entity_id.empty()) {
+      auto last_slash = raw_fqn.rfind('/');
+      entity_id = (last_slash != std::string::npos) ? raw_fqn.substr(last_slash + 1) : raw_fqn;
     }
   }
 

@@ -19,10 +19,10 @@
 #include <thread>
 #include <vector>
 
-#include "ros2_medkit_gateway/models/aggregation_service.hpp"
-#include "ros2_medkit_gateway/models/entity_capabilities.hpp"
-#include "ros2_medkit_gateway/models/entity_types.hpp"
-#include "ros2_medkit_gateway/models/thread_safe_entity_cache.hpp"
+#include "ros2_medkit_gateway/core/models/aggregation_service.hpp"
+#include "ros2_medkit_gateway/core/models/entity_capabilities.hpp"
+#include "ros2_medkit_gateway/core/models/entity_types.hpp"
+#include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
 
 using namespace ros2_medkit_gateway;
 using namespace std::chrono_literals;
@@ -173,6 +173,11 @@ TEST(EntityCapabilities, AppSupportsIsLocatedOn) {
   EXPECT_TRUE(caps.supports_resource("is-located-on"));
   EXPECT_TRUE(caps.supports_collection(ResourceCollection::OPERATIONS));
   EXPECT_FALSE(caps.supports_resource("hosts"));  // Apps don't host anything
+}
+
+TEST(EntityCapabilities, AppSupportsBelongsTo) {
+  auto caps = EntityCapabilities::for_type(SovdEntityType::APP);
+  EXPECT_TRUE(caps.supports_resource("belongs-to"));
 }
 
 TEST(EntityCapabilities, FunctionAggregatesCollections) {

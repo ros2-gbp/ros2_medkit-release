@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "ros2_medkit_gateway/discovery/manifest/manifest_parser.hpp"
+#include "ros2_medkit_gateway/core/discovery/manifest/manifest_parser.hpp"
 
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <system_error>
 
 #include "ros2_medkit_serialization/json_serializer.hpp"
 
@@ -34,6 +36,65 @@ Manifest ManifestParser::parse_file(const std::string & file_path) const {
   std::stringstream buffer;
   buffer << file.rdbuf();
   return parse_string(buffer.str());
+}
+
+Manifest ManifestParser::parse_fragment_file(const std::string & file_path) const {
+  // Read the yaml into a string, inject a synthetic manifest_version if the
+  // fragment omits one (fragments are not required to declare it), then
+  // reuse the main parse_string pipeline so every field is parsed with the
+  // exact same logic as a full manifest. Anything forbidden in fragments
+  // (areas, metadata, scripts, ...) is still parsed, which lets the caller
+  // detect and reject it with a specific error message.
+
+  // Cap file size before opening to avoid OOM on a misconfigured fragments_dir
+  // (e.g., a symlink to a log file). yaml-cpp has no builtin size limit.
+  std::error_code size_ec;
+  auto size = std::filesystem::file_size(file_path, size_ec);
+  if (size_ec) {
+    throw std::runtime_error("Cannot stat manifest fragment '" + file_path + "': " + size_ec.message());
+  }
+  if (size > kMaxFragmentBytes) {
+    throw std::runtime_error("Manifest fragment '" + file_path + "' exceeds " + std::to_string(kMaxFragmentBytes) +
+                             "-byte limit (size=" + std::to_string(size) + ")");
+  }
+
+  std::ifstream file(file_path);
+  if (!file.is_open()) {
+    throw std::runtime_error("Cannot open manifest fragment: " + file_path);
+  }
+  std::stringstream buffer;
+  buffer << file.rdbuf();
+  std::string contents = buffer.str();
+
+  // Version prefix is appended-only when the source yaml does not set one.
+  // Look for a TOP-LEVEL `manifest_version:` key - i.e., exactly at column 0
+  // (no leading whitespace). An earlier revision tolerated any indentation,
+  // which accidentally matched any nested sub-map key of the same name
+  // (e.g., `ros_binding: { manifest_version: ... }`) and disabled the
+  // synthetic injection, making otherwise-valid fragments fail to parse.
+  // Sufficient for the yaml dialect we accept (no flow-style top-level
+  // document, no document separators that would shift the top level).
+  auto has_version_field = [](const std::string & s) {
+    size_t pos = 0;
+    while (pos < s.size()) {
+      size_t end = s.find('\n', pos);
+      std::string line = s.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+      // Require column 0: only an un-indented line with this exact key is
+      // treated as a manifest-level declaration.
+      if (line.compare(0, sizeof("manifest_version:") - 1, "manifest_version:") == 0) {
+        return true;
+      }
+      if (end == std::string::npos) {
+        break;
+      }
+      pos = end + 1;
+    }
+    return false;
+  };
+  if (!has_version_field(contents)) {
+    contents = "manifest_version: \"1.0\"\n" + contents;
+  }
+  return parse_string(contents);
 }
 
 Manifest ManifestParser::parse_string(const std::string & yaml_content) const {
@@ -278,6 +339,7 @@ std::string ManifestConfig::policy_to_string(UnmanifestedNodePolicy policy) {
       return "error";
     case UnmanifestedNodePolicy::INCLUDE_AS_ORPHAN:
       return "include_as_orphan";
+    case UnmanifestedNodePolicy::WARN:
     default:
       return "warn";
   }
