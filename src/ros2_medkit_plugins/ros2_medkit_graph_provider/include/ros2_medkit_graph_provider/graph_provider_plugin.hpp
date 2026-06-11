@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <mutex>
@@ -23,12 +24,13 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "ros2_medkit_gateway/plugins/gateway_plugin.hpp"
-#include "ros2_medkit_gateway/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/core/plugins/gateway_plugin.hpp"
+#include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
 
 namespace ros2_medkit_gateway {
 
 class PluginContext;
+class RosPluginContext;
 
 class GraphProviderPlugin : public GatewayPlugin, public IntrospectionProvider {
  public:
@@ -53,12 +55,13 @@ class GraphProviderPlugin : public GatewayPlugin, public IntrospectionProvider {
   };
 
   GraphProviderPlugin() = default;
-  ~GraphProviderPlugin() override = default;
+  ~GraphProviderPlugin() noexcept override;
 
   std::string name() const override;
   void configure(const nlohmann::json & config) override;
   void set_context(PluginContext & context) override;
-  void register_routes(httplib::Server & server, const std::string & api_prefix) override;
+  std::vector<PluginRoute> get_routes() override;
+  void shutdown() override;
   IntrospectionResult introspect(const IntrospectionInput & input) override;
 
   static nlohmann::json build_graph_document(const std::string & function_id, const IntrospectionInput & input,
@@ -86,7 +89,7 @@ class GraphProviderPlugin : public GatewayPlugin, public IntrospectionProvider {
                                        const std::string & timestamp, bool include_stale_topics = true);
   void load_parameters();
 
-  PluginContext * ctx_{nullptr};
+  RosPluginContext * ctx_{nullptr};
   nlohmann::json plugin_config_;
 
   // Each mutex protects an independent cache/state bucket; no code path acquires more than one.
@@ -105,6 +108,7 @@ class GraphProviderPlugin : public GatewayPlugin, public IntrospectionProvider {
   ConfigOverrides config_;
 
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_sub_;
+  std::atomic<bool> shutdown_requested_{false};
 };
 
 }  // namespace ros2_medkit_gateway
