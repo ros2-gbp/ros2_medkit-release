@@ -14,8 +14,6 @@
 
 #pragma once
 
-#include <httplib.h>
-
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -37,16 +35,17 @@
 #include "ros2_medkit_beacon_common/beacon_hint_store.hpp"
 #include "ros2_medkit_beacon_common/beacon_types.hpp"
 #include "ros2_medkit_beacon_common/beacon_validator.hpp"
-#include "ros2_medkit_gateway/plugins/gateway_plugin.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_context.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_types.hpp"
-#include "ros2_medkit_gateway/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/core/plugins/gateway_plugin.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_types.hpp"
+#include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 #include "ros2_medkit_param_beacon/parameter_client_interface.hpp"
 
 class ParameterBeaconPlugin : public ros2_medkit_gateway::GatewayPlugin,
                               public ros2_medkit_gateway::IntrospectionProvider {
  public:
   ParameterBeaconPlugin() = default;
+  ~ParameterBeaconPlugin() noexcept override;
 
   /// Constructor with injectable client factory (for testing).
   explicit ParameterBeaconPlugin(ros2_medkit_param_beacon::ParameterClientFactory factory)
@@ -58,8 +57,7 @@ class ParameterBeaconPlugin : public ros2_medkit_gateway::GatewayPlugin,
   void configure(const nlohmann::json & config) override;
   void set_context(ros2_medkit_gateway::PluginContext & context) override;
   void shutdown() override;
-  void register_routes(httplib::Server & server, const std::string & api_prefix) override;
-  std::vector<ros2_medkit_gateway::GatewayPlugin::RouteDescription> get_route_descriptions() const override;
+  std::vector<ros2_medkit_gateway::GatewayPlugin::PluginRoute> get_routes() override;
 
   // IntrospectionProvider
   ros2_medkit_gateway::IntrospectionResult introspect(const ros2_medkit_gateway::IntrospectionInput & input) override;
@@ -88,7 +86,7 @@ class ParameterBeaconPlugin : public ros2_medkit_gateway::GatewayPlugin,
   double param_timeout_sec_{2.0};
 
   // State
-  ros2_medkit_gateway::PluginContext * ctx_{nullptr};
+  ros2_medkit_gateway::RosPluginContext * ctx_{nullptr};
   rclcpp::Node::SharedPtr param_node_;
   std::thread poll_thread_;
   std::atomic<bool> shutdown_requested_{false};

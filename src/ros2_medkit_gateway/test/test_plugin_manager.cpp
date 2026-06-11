@@ -19,12 +19,14 @@
 #include <chrono>
 #include <thread>
 
-#include "ros2_medkit_gateway/plugins/plugin_context.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_manager.hpp"
-#include "ros2_medkit_gateway/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
+#include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 
 using namespace ros2_medkit_gateway;
-using json = nlohmann::json;
+// json alias is already imported by the `using namespace` above (defined in
+// discovery/models/common.hpp). A local `using json = nlohmann::json;` would
+// shadow it and trip clang-diagnostic-shadow under clang-tidy.
 
 /// Minimal mock plugin for compile-time testing (no .so needed)
 class MockPlugin : public GatewayPlugin, public UpdateProvider, public IntrospectionProvider {
@@ -41,30 +43,33 @@ class MockPlugin : public GatewayPlugin, public UpdateProvider, public Introspec
   }
 
   // UpdateProvider
-  tl::expected<std::vector<std::string>, UpdateBackendErrorInfo> list_updates(const UpdateFilter &) override {
+  tl::expected<std::vector<std::string>, UpdateBackendErrorInfo>
+  list_updates(const UpdateFilter & /*filter*/) override {
     return std::vector<std::string>{};
   }
-  tl::expected<json, UpdateBackendErrorInfo> get_update(const std::string &) override {
+  tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
     return tl::make_unexpected(UpdateBackendErrorInfo{UpdateBackendError::NotFound, "mock"});
   }
-  tl::expected<void, UpdateBackendErrorInfo> register_update(const json &) override {
+  tl::expected<void, UpdateBackendErrorInfo> register_update(const json & /*metadata*/) override {
     return {};
   }
-  tl::expected<void, UpdateBackendErrorInfo> delete_update(const std::string &) override {
+  tl::expected<void, UpdateBackendErrorInfo> delete_update(const std::string & /*id*/) override {
     return {};
   }
-  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string &, UpdateProgressReporter &) override {
+  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string & /*id*/,
+                                                     UpdateProgressReporter & /*reporter*/) override {
     return {};
   }
-  tl::expected<void, UpdateBackendErrorInfo> execute(const std::string &, UpdateProgressReporter &) override {
+  tl::expected<void, UpdateBackendErrorInfo> execute(const std::string & /*id*/,
+                                                     UpdateProgressReporter & /*reporter*/) override {
     return {};
   }
-  tl::expected<bool, UpdateBackendErrorInfo> supports_automated(const std::string &) override {
+  tl::expected<bool, UpdateBackendErrorInfo> supports_automated(const std::string & /*id*/) override {
     return false;
   }
 
   // IntrospectionProvider
-  IntrospectionResult introspect(const IntrospectionInput &) override {
+  IntrospectionResult introspect(const IntrospectionInput & /*input*/) override {
     return {};
   }
 
@@ -79,9 +84,9 @@ class MockIntrospectionOnly : public GatewayPlugin, public IntrospectionProvider
   std::string name() const override {
     return "introspection_only";
   }
-  void configure(const json &) override {
+  void configure(const json & /*cfg*/) override {
   }
-  IntrospectionResult introspect(const IntrospectionInput &) override {
+  IntrospectionResult introspect(const IntrospectionInput & /*input*/) override {
     return {};
   }
 };
@@ -92,7 +97,7 @@ class MockThrowingPlugin : public GatewayPlugin {
   std::string name() const override {
     return "throwing";
   }
-  void configure(const json &) override {
+  void configure(const json & /*cfg*/) override {
     throw std::runtime_error("configure failed");
   }
 };
@@ -103,48 +108,71 @@ class MockThrowOnSetContext : public GatewayPlugin, public UpdateProvider {
   std::string name() const override {
     return "throw_set_context";
   }
-  void configure(const json &) override {
+  void configure(const json & /*cfg*/) override {
   }
-  void set_context(PluginContext &) override {
+  void set_context(PluginContext & /*ctx*/) override {
     throw std::runtime_error("set_context failed");
   }
 
-  tl::expected<std::vector<std::string>, UpdateBackendErrorInfo> list_updates(const UpdateFilter &) override {
+  tl::expected<std::vector<std::string>, UpdateBackendErrorInfo>
+  list_updates(const UpdateFilter & /*filter*/) override {
     return std::vector<std::string>{};
   }
-  tl::expected<json, UpdateBackendErrorInfo> get_update(const std::string &) override {
-    return json::object();
+  tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo> get_update(const std::string & /*id*/) override {
+    return dto::UpdateDetail{json::object()};
   }
-  tl::expected<void, UpdateBackendErrorInfo> register_update(const json &) override {
+  tl::expected<void, UpdateBackendErrorInfo> register_update(const json & /*metadata*/) override {
     return {};
   }
-  tl::expected<void, UpdateBackendErrorInfo> delete_update(const std::string &) override {
+  tl::expected<void, UpdateBackendErrorInfo> delete_update(const std::string & /*id*/) override {
     return {};
   }
-  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string &, UpdateProgressReporter &) override {
+  tl::expected<void, UpdateBackendErrorInfo> prepare(const std::string & /*id*/,
+                                                     UpdateProgressReporter & /*reporter*/) override {
     return {};
   }
-  tl::expected<void, UpdateBackendErrorInfo> execute(const std::string &, UpdateProgressReporter &) override {
+  tl::expected<void, UpdateBackendErrorInfo> execute(const std::string & /*id*/,
+                                                     UpdateProgressReporter & /*reporter*/) override {
     return {};
   }
-  tl::expected<bool, UpdateBackendErrorInfo> supports_automated(const std::string &) override {
+  tl::expected<bool, UpdateBackendErrorInfo> supports_automated(const std::string & /*id*/) override {
     return false;
   }
 };
 
-/// Plugin that throws during register_routes
-class MockThrowOnRegisterRoutes : public GatewayPlugin, public IntrospectionProvider {
+/// Plugin that returns a test route for verifying wrapping logic
+class MockRoutePlugin : public GatewayPlugin {
  public:
   std::string name() const override {
-    return "throw_register_routes";
+    return "mock_route";
   }
-  void configure(const json &) override {
+  void configure(const json & /*cfg*/) override {
   }
-  void register_routes(httplib::Server &, const std::string &) override {
-    throw std::runtime_error("register_routes failed");
+  std::vector<PluginRoute> get_routes() override {
+    return {
+        {"GET", R"(apps/([^/]+)/x-test-route)",
+         [this](const PluginRequest & req, PluginResponse & res) {
+           last_path_param_ = req.path_param(1);
+           res.send_json({{"handled", true}, {"entity", last_path_param_}});
+         }},
+    };
+  }
+  std::string last_path_param_;
+};
+
+/// Plugin that throws during get_routes
+class MockThrowOnGetRoutes : public GatewayPlugin, public IntrospectionProvider {
+ public:
+  std::string name() const override {
+    return "throw_get_routes";
+  }
+  void configure(const json & /*cfg*/) override {
+  }
+  std::vector<PluginRoute> get_routes() override {
+    throw std::runtime_error("get_routes failed");
   }
 
-  IntrospectionResult introspect(const IntrospectionInput &) override {
+  IntrospectionResult introspect(const IntrospectionInput & /*input*/) override {
     return {};
   }
 };
@@ -155,7 +183,7 @@ class MockThrowOnShutdown : public GatewayPlugin {
   std::string name() const override {
     return "throw_shutdown";
   }
-  void configure(const json &) override {
+  void configure(const json & /*cfg*/) override {
   }
   void shutdown() override {
     throw std::runtime_error("shutdown failed");
@@ -296,9 +324,9 @@ TEST(PluginManagerTest, ThrowOnSetContextDisablesPlugin) {
   EXPECT_EQ(mgr.plugin_names()[0], "mock");
 }
 
-TEST(PluginManagerTest, ThrowOnRegisterRoutesDisablesPlugin) {
+TEST(PluginManagerTest, ThrowOnGetRoutesDisablesPlugin) {
   PluginManager mgr;
-  mgr.add_plugin(std::make_unique<MockThrowOnRegisterRoutes>());
+  mgr.add_plugin(std::make_unique<MockThrowOnGetRoutes>());
   auto good = std::make_unique<MockIntrospectionOnly>();
   mgr.add_plugin(std::move(good));
 
@@ -310,6 +338,37 @@ TEST(PluginManagerTest, ThrowOnRegisterRoutesDisablesPlugin) {
   EXPECT_EQ(mgr.get_introspection_providers().size(), 1u);
   EXPECT_EQ(mgr.plugin_names().size(), 1u);
   EXPECT_EQ(mgr.plugin_names()[0], "introspection_only");
+}
+
+TEST(PluginManagerTest, RegisterRoutesWrapsPluginHandlers) {
+  PluginManager mgr;
+  auto plugin = std::make_unique<MockRoutePlugin>();
+  auto * raw = plugin.get();
+  mgr.add_plugin(std::move(plugin));
+  mgr.configure_plugins();
+
+  httplib::Server srv;
+  mgr.register_routes(srv, "/api/v1");
+
+  // Bind to ephemeral port to avoid conflicts in parallel CTest runs
+  auto port = srv.bind_to_any_port("127.0.0.1");
+  std::thread server_thread([&srv]() {
+    srv.listen_after_bind();
+  });
+  srv.wait_until_ready();
+
+  httplib::Client cli("127.0.0.1", port);
+  auto res = cli.Get("/api/v1/apps/test_entity/x-test-route");
+
+  srv.stop();
+  server_thread.join();
+
+  ASSERT_TRUE(res);
+  EXPECT_EQ(res->status, 200);
+  auto body = json::parse(res->body);
+  EXPECT_EQ(body["handled"], true);
+  EXPECT_EQ(body["entity"], "test_entity");
+  EXPECT_EQ(raw->last_path_param_, "test_entity");
 }
 
 TEST(PluginManagerTest, ShutdownAllIdempotent) {
@@ -349,6 +408,7 @@ TEST(PluginManagerConcurrencyTest, ConcurrentReadsDoNotBlock) {
 
   std::atomic<int> completed{0};
   std::vector<std::thread> readers;
+  readers.reserve(8);
 
   for (int i = 0; i < 8; ++i) {
     readers.emplace_back([&mgr, &completed] {
@@ -392,6 +452,7 @@ TEST(PluginManagerConcurrencyTest, ConcurrentReadsAndLifecycleDoNotDeadlock) {
 
   // Multiple reader threads (simulating ROS 2 executor calling get_log_observers)
   std::vector<std::thread> readers;
+  readers.reserve(4);
   for (int i = 0; i < 4; ++i) {
     readers.emplace_back([&mgr, &keep_running, &read_count] {
       while (keep_running) {
@@ -435,6 +496,7 @@ TEST(PluginManagerConcurrencyTest, ShutdownWhileReadersActiveDoesNotDeadlock) {
   std::atomic<int> read_count{0};
 
   std::vector<std::thread> readers;
+  readers.reserve(4);
   for (int i = 0; i < 4; ++i) {
     readers.emplace_back([&mgr, &keep_running, &read_count] {
       while (keep_running) {
