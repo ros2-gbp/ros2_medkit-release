@@ -7,7 +7,7 @@ Discovery Options Reference
 
 This document describes configuration options for the gateway's discovery system.
 The discovery system maps ROS 2 graph entities (nodes, topics, services, actions)
-to SOVD entities (areas, components, apps).
+to SOVD entities (areas, components, apps, functions).
 
 Discovery Modes
 ---------------
@@ -35,61 +35,72 @@ Runtime Discovery Options
 When using ``runtime_only`` or ``hybrid`` mode, the following options control
 how ROS 2 nodes are mapped to SOVD entities.
 
-Synthetic Components
-^^^^^^^^^^^^^^^^^^^^
+Entity Model
+^^^^^^^^^^^^
+
+.. important::
+
+   The entity model changed in this release. Synthetic Areas and per-namespace
+   Components are no longer created. If you are upgrading from a previous
+   version, see :ref:`Breaking Changes <aggregation-breaking-changes>` for
+   details, removed parameters, cross-layer impact, and migration guidance.
+
+In runtime mode, the gateway maps the ROS 2 graph to SOVD entities as follows:
+
+- **Areas** - not created by runtime discovery. Areas come from manifest only.
+- **Components** - a single host-level Component is created from
+  ``HostInfoProvider`` (see Default Component below). No synthetic/heuristic
+  Components are created from namespaces.
+- **Apps** - each ROS 2 node becomes an App with ``source: "heuristic"``.
+- **Functions** - namespace grouping creates Function entities (see below).
+
+Default Component
+^^^^^^^^^^^^^^^^^
 
 .. code-block:: yaml
 
    discovery:
      runtime:
-       create_synthetic_components: true
-       grouping_strategy: "namespace"
-       synthetic_component_name_pattern: "{area}"
+       default_component:
+         enabled: true
 
-When ``create_synthetic_components`` is true:
+When ``default_component.enabled`` is true (the default), the gateway creates
+a single host-level Component from the local system info (hostname, OS,
+architecture) via ``HostInfoProvider``. All discovered Apps are linked to this
+Component.
 
-- Components are created as logical groupings of Apps
-- ``grouping_strategy: "namespace"`` groups nodes by their first namespace segment
-- ``synthetic_component_name_pattern`` defines the component ID format
-
-Topic-Only Namespaces
-^^^^^^^^^^^^^^^^^^^^^
-
-Some ROS 2 systems have topics published to namespaces without any associated nodes.
-This is common with:
-
-- Isaac Sim and other simulators
-- External bridges (MQTT, Zenoh, ROS 1)
-- Dead/orphaned topics from crashed processes
-
-The ``topic_only_policy`` controls how these namespaces are handled:
+Internal Node Filtering
+^^^^^^^^^^^^^^^^^^^^^^^
 
 .. code-block:: yaml
 
    discovery:
      runtime:
-       topic_only_policy: "create_component"
-       min_topics_for_component: 1
+       filter_internal_nodes: true
 
-.. list-table:: Topic-Only Policies
-   :header-rows: 1
-   :widths: 25 75
+When ``filter_internal_nodes`` is true (the default), ROS 2 nodes whose names
+start with an underscore (``_``) are excluded from the entity tree. This
+filters out ROS 2 internal infrastructure nodes such as ``_ros2cli_*``,
+``_param_client_node``, and similar system nodes that should not appear as
+SOVD entities. The filter applies to both locally discovered Apps and
+peer-discovered Apps (after stripping the peer prefix).
 
-   * - Policy
-     - Description
-   * - ``ignore``
-     - Don't create any entities for topic-only namespaces.
-       Use this to reduce noise from orphaned topics.
-   * - ``create_component``
-     - Create a Component with ``source: "topic"`` for each topic-only
-       namespace. (default)
-   * - ``create_area_only``
-     - Only create the Area, but don't create a Component.
-       Useful when you want the namespace visible but not as a component.
+Set to ``false`` if you need to expose all ROS 2 nodes regardless of naming
+convention.
 
-The ``min_topics_for_component`` parameter (default: 1) sets the minimum number
-of topics required before creating a component. This can filter out namespaces
-with only a few stray topics.
+Function Entities from Namespaces
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. code-block:: yaml
+
+   discovery:
+     runtime:
+       create_functions_from_namespaces: true
+
+When ``create_functions_from_namespaces`` is true (the default), each ROS 2
+namespace becomes a Function entity that groups the Apps in that namespace.
+This is the SOVD-correct mapping where Functions represent logical capabilities
+(what the software does) rather than deployment topology.
 
 Merge Pipeline (Hybrid Mode)
 -----------------------------
@@ -139,7 +150,7 @@ Field Groups
    * - ``status``
      - is_online, bound_fqn
    * - ``metadata``
-     - source, x-medkit extensions, custom metadata fields
+     - source, ros_binding, external, x-medkit extensions, custom metadata fields
 
 Merge Policies
 ^^^^^^^^^^^^^^
@@ -198,12 +209,15 @@ to create:
    discovery:
      merge_pipeline:
        gap_fill:
-         allow_heuristic_areas: true
-         allow_heuristic_components: true
          allow_heuristic_apps: true
          allow_heuristic_functions: false
          # namespace_blacklist: ["/rosout"]
          # namespace_whitelist: []
+
+.. note::
+
+   Areas and Components are never created by runtime discovery. Areas come
+   from manifest only. Components come from ``HostInfoProvider`` or manifest.
 
 .. list-table::
    :header-rows: 1
@@ -212,12 +226,6 @@ to create:
    * - Parameter
      - Default
      - Description
-   * - ``allow_heuristic_areas``
-     - ``true``
-     - Create areas from namespaces not in manifest.
-   * - ``allow_heuristic_components``
-     - ``true``
-     - Create synthetic components for unmanifested namespaces.
    * - ``allow_heuristic_apps``
      - ``true``
      - Create apps for nodes without manifest ``ros_binding``.
@@ -274,20 +282,16 @@ Complete YAML configuration for runtime discovery:
          mode: "runtime_only"
 
          runtime:
-           # Group Apps into Components by namespace
-           create_synthetic_components: true
-           grouping_strategy: "namespace"
-           synthetic_component_name_pattern: "{area}"
+           # Function entities from namespace grouping (default: true)
+           create_functions_from_namespaces: true
 
-           # Handle topic-only namespaces
-           topic_only_policy: "create_component"
-           min_topics_for_component: 2  # Require at least 2 topics
+           # Single host-level Component (default: true)
+           default_component:
+             enabled: true
 
          # Merge pipeline (hybrid mode only)
          merge_pipeline:
            gap_fill:
-             allow_heuristic_areas: true
-             allow_heuristic_components: true
              allow_heuristic_apps: true
              namespace_blacklist: ["/rosout"]
 
@@ -299,8 +303,7 @@ Override discovery options via command line:
 .. code-block:: bash
 
    ros2 launch ros2_medkit_gateway gateway.launch.py \
-     discovery.runtime.topic_only_policy:="ignore" \
-     discovery.runtime.min_topics_for_component:=3
+     discovery.runtime.create_functions_from_namespaces:=false
 
 Discovery Mechanism Selection
 -----------------------------

@@ -23,8 +23,11 @@
  */
 
 #include <chrono>
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
+
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
 
 using namespace std::chrono_literals;
 
@@ -46,21 +49,34 @@ class LightController : public rclcpp::Node {
 
   ~LightController() {
     timer_->cancel();
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    cmd_sub_.reset();
+    timer_.reset();
+    status_pub_.reset();
   }
 
  private:
   void command_callback(const std_msgs::msg::Bool::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!status_pub_) {
+      return;
+    }
     light_on_ = msg->data;
     RCLCPP_INFO(this->get_logger(), "Light command: %s", light_on_ ? "ON" : "OFF");
   }
 
   void timer_callback() {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!status_pub_) {
+      return;
+    }
     // Publish current status
     auto msg = std_msgs::msg::Bool();
     msg.data = light_on_;
     status_pub_->publish(msg);
   }
 
+  std::mutex callback_mutex_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr cmd_sub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr status_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
@@ -68,8 +84,7 @@ class LightController : public rclcpp::Node {
 };
 
 int main(int argc, char * argv[]) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<LightController>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<LightController>();
+  });
 }

@@ -154,6 +154,18 @@ Data Access Settings
      - float
      - ``2.0``
      - Timeout for sampling topics with active publishers. Range: 0.1-30.0.
+   * - ``parameter_service_timeout_sec``
+     - float
+     - ``2.0``
+     - Timeout for ROS 2 parameter service calls (configurations endpoint).
+       Nodes without parameter service (e.g., micro-ROS bridges) block for this
+       duration before returning SERVICE_UNAVAILABLE. Range: 0.1-10.0.
+   * - ``parameter_service_negative_cache_sec``
+     - float
+     - ``60.0``
+     - After a node's parameter service fails to respond, subsequent requests
+       return immediately with SERVICE_UNAVAILABLE for this duration.
+       Set to 0 to disable. Range: 0-3600.
 
 .. note::
 
@@ -243,10 +255,14 @@ Performance Tuning
      - Description
    * - ``refresh_interval_ms``
      - int
-     - ``10000``
-     - Cache refresh interval. How often to discover ROS 2 nodes. Range: 100-60000 (0.1s-60s).
+     - ``30000``
+     - Safety-backstop refresh interval (ms). Primary discovery is graph-event
+       driven (polled every 100 ms); this timer forces a full refresh only if
+       a graph event is missed. Range: 100-60000 (0.1s-60s).
 
-Lower values provide faster updates but increase CPU usage.
+Lower values shorten the worst-case recovery window if a graph event is missed
+but increase idle CPU. The default rarely fires on a stable graph because the
+graph-event poll handles node up/down events directly.
 
 Bulk Data Storage
 -----------------
@@ -552,7 +568,7 @@ Plugin loading lifecycle:
 4. Provider interfaces are queried via ``extern "C"`` functions
 5. ``configure()`` is called with per-plugin config
 6. ``set_context()`` passes the gateway context to the plugin
-7. ``register_routes()`` allows the plugin to add custom REST endpoints
+7. ``get_routes()`` returns custom REST endpoint definitions as ``vector<PluginRoute>``
 
 Error isolation: if a plugin throws during any lifecycle call, it is disabled
 without crashing the gateway. Other plugins continue to operate normally.
