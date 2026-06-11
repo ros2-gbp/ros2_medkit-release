@@ -24,6 +24,9 @@ install(
     cmake/ROS2MedkitCompat.cmake
     cmake/ROS2MedkitCcache.cmake
     cmake/ROS2MedkitLinting.cmake
+    cmake/ROS2MedkitSanitizers.cmake
+    cmake/ROS2MedkitTestDomain.cmake
+    cmake/ROS2MedkitWarnings.cmake
   DESTINATION share/${PROJECT_NAME}/cmake
 )
 
