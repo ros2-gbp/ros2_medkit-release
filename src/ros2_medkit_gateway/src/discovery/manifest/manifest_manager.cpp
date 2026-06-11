@@ -14,6 +14,11 @@
 
 #include "ros2_medkit_gateway/discovery/manifest/manifest_manager.hpp"
 
+#include <yaml-cpp/yaml.h>
+
+#include <algorithm>
+#include <filesystem>
+
 namespace ros2_medkit_gateway {
 namespace discovery {
 
@@ -30,8 +35,25 @@ bool ManifestManager::load_manifest(const std::string & file_path, bool strict) 
     log_info("Loading manifest from: " + file_path);
     Manifest loaded = parser_.parse_file(file_path);
 
-    // Validate
+    // Apply any fragments dropped in the fragments directory on top of the
+    // base manifest before validation. `apply_fragments` appends its own
+    // errors to validation_result_ so they surface in the normal flow.
+    validation_result_ = ValidationResult{};
+    if (!apply_fragments(loaded)) {
+      // apply_fragments already recorded the errors; fall through to the
+      // regular validation step so the full error set is reported.
+    }
+
+    // Validate the merged manifest.
+    auto merge_errors = std::move(validation_result_);
     validation_result_ = validator_.validate(loaded);
+    // Preserve any fragment errors recorded above.
+    for (auto & err : merge_errors.errors) {
+      validation_result_.errors.push_back(std::move(err));
+    }
+    for (auto & warn : merge_errors.warnings) {
+      validation_result_.warnings.push_back(std::move(warn));
+    }
 
     // Always fail on ERRORs (broken references, circular deps, duplicate bindings)
     // These indicate a fundamentally broken manifest that would cause runtime issues
@@ -442,6 +464,167 @@ void ManifestManager::build_lookup_maps() {
   for (size_t i = 0; i < manifest_->functions.size(); ++i) {
     function_index_[manifest_->functions[i].id] = i;
   }
+}
+
+void ManifestManager::set_fragments_dir(const std::string & dir) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  fragments_dir_ = dir;
+}
+
+std::string ManifestManager::get_fragments_dir() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return fragments_dir_;
+}
+
+bool ManifestManager::apply_fragments(Manifest & base) {
+  // Called with mutex_ held by the caller.
+  if (fragments_dir_.empty()) {
+    return true;
+  }
+  std::filesystem::path dir(fragments_dir_);
+  std::error_code ec;
+  if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) {
+    // A missing directory is "no fragments", not an error. This lets the
+    // deploy side create the directory lazily on first install.
+    return true;
+  }
+
+  // Resolve the configured dir once so we can compare canonical paths below.
+  // Symlinks ARE followed (k8s ConfigMap mounts rely on that), but we refuse
+  // to read anything whose resolved location is not a descendant of the
+  // configured fragments directory. That blocks `evil.yaml -> /etc/shadow`
+  // while keeping the ConfigMap case working.
+  std::filesystem::path canonical_dir = std::filesystem::canonical(dir, ec);
+  if (ec) {
+    log_error("Failed to canonicalize fragments_dir '" + fragments_dir_ + "': " + ec.message());
+    return false;
+  }
+
+  // Collect + sort file paths so the merge order is deterministic. Without
+  // this the validator's "duplicate id" error could point at a different
+  // fragment run to run, which is nightmarish to diagnose.
+  std::vector<std::filesystem::path> files;
+  for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
+    if (ec) {
+      break;
+    }
+    if (!entry.is_regular_file(ec)) {
+      continue;
+    }
+    auto ext = entry.path().extension().string();
+    if (ext != ".yaml" && ext != ".yml") {
+      continue;
+    }
+    std::error_code canon_ec;
+    std::filesystem::path resolved = std::filesystem::canonical(entry.path(), canon_ec);
+    if (canon_ec) {
+      log_warn("Skipping fragment with unresolvable path " + entry.path().string() + ": " + canon_ec.message());
+      continue;
+    }
+    // Reject any resolved path that escapes the configured directory. Compare
+    // via the generic string form so the check is path-component safe.
+    auto rel = std::filesystem::relative(resolved, canonical_dir, canon_ec);
+    if (canon_ec || rel.empty() || rel.native().rfind("..", 0) == 0) {
+      log_warn("Skipping fragment '" + entry.path().string() + "': resolves outside fragments_dir (" +
+               resolved.string() + ")");
+      continue;
+    }
+    files.push_back(entry.path());
+  }
+  std::sort(files.begin(), files.end());
+
+  bool ok = true;
+  for (const auto & path : files) {
+    log_info("Merging manifest fragment: " + path.string());
+    Manifest fragment;
+    try {
+      fragment = parser_.parse_fragment_file(path.string());
+    } catch (const std::exception & e) {
+      validation_result_.add_error("FRAGMENT_PARSE", e.what(), path.string());
+      log_error("Failed to parse fragment " + path.string() + ": " + e.what());
+      ok = false;
+      continue;
+    }
+
+    // Fragments may only contribute apps, components, functions. Reject any
+    // attempt to redeclare top-level properties owned by the base manifest.
+    auto reject = [&](const std::string & field) {
+      validation_result_.add_error("FRAGMENT_FORBIDDEN_FIELD", "fragment may not declare '" + field + "'",
+                                   path.string());
+      log_error("Fragment " + path.string() + " declares forbidden field '" + field + "'");
+      ok = false;
+    };
+
+    // Presence-based checks must inspect the raw YAML, not the parsed Manifest:
+    // empty arrays / maps (for example `areas: []` or `metadata: {}`) are still
+    // forbidden even though they parse to empty-default structs and would not
+    // be detected by the struct checks. manifest_version is auto-injected by
+    // parse_fragment_file when the fragment omits it, so we do not inspect it
+    // here - fragments are free to declare or omit it.
+    static constexpr const char * kForbiddenKeys[] = {
+        "areas", "metadata", "scripts", "capabilities", "lock_overrides", "discovery",
+    };
+    static constexpr const char * kAllowedKeys[] = {
+        "apps",
+        "components",
+        "functions",
+        "manifest_version",
+    };
+    try {
+      YAML::Node raw = YAML::LoadFile(path.string());
+      if (raw && raw.IsMap()) {
+        for (const char * key : kForbiddenKeys) {
+          if (raw[key]) {
+            reject(key);
+          }
+        }
+        // Warn on unknown top-level keys so typos like `app:` (singular)
+        // don't silently produce an empty fragment with no feedback.
+        for (const auto & it : raw) {
+          if (!it.first.IsScalar()) {
+            continue;
+          }
+          std::string key = it.first.as<std::string>();
+          bool known = false;
+          for (const char * k : kAllowedKeys) {
+            if (key == k) {
+              known = true;
+              break;
+            }
+          }
+          if (!known) {
+            for (const char * k : kForbiddenKeys) {
+              if (key == k) {
+                known = true;
+                break;
+              }
+            }
+          }
+          if (!known) {
+            log_warn("Fragment " + path.string() + " has unknown top-level key '" + key +
+                     "' - expected one of: apps, components, functions (ignored).");
+          }
+        }
+      }
+    } catch (const YAML::Exception & e) {
+      validation_result_.add_error("FRAGMENT_PARSE", e.what(), path.string());
+      log_error("Failed to re-parse fragment " + path.string() + " for forbidden-field check: " + e.what());
+      ok = false;
+    }
+
+    // Append allowed entity lists. Duplicate IDs are caught by the regular
+    // validator run once all fragments have been merged.
+    for (auto & comp : fragment.components) {
+      base.components.push_back(std::move(comp));
+    }
+    for (auto & app : fragment.apps) {
+      base.apps.push_back(std::move(app));
+    }
+    for (auto & fn : fragment.functions) {
+      base.functions.push_back(std::move(fn));
+    }
+  }
+  return ok;
 }
 
 void ManifestManager::log_info(const std::string & msg) const {
