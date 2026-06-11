@@ -14,6 +14,8 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
+
 /// Demo node that declares ros2_medkit.discovery.* parameters.
 /// Used by integration tests for the ParameterBeaconPlugin.
 /// The gateway polls these parameters to build BeaconHints.
@@ -38,8 +40,7 @@ class ParamBeaconNode : public rclcpp::Node {
 };
 
 int main(int argc, char * argv[]) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<ParamBeaconNode>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<ParamBeaconNode>();
+  });
 }
