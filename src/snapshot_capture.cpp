@@ -26,6 +26,54 @@
 
 namespace ros2_medkit_fault_manager {
 
+namespace {
+
+/// RAII guard that destroys a per-capture subscription and callback group
+/// while holding the node-ops mutex. Creation of these entities is already
+/// serialised by the same mutex; TSan confirmed a data race on the node's
+/// internal rcutils_hash_map when two capture threads destroyed their
+/// subscriptions concurrently after the create-side lock was released.
+/// Locking the destroy-side too closes the window (same race class as
+/// issue #375 in the gateway).
+struct LockedSubscriptionGuard {
+  std::mutex * mtx;
+  rclcpp::GenericSubscription::SharedPtr subscription;
+  rclcpp::CallbackGroup::SharedPtr callback_group;
+
+  // Explicit constructor instead of relying on aggregate initialization:
+  // C++20 [dcl.init.aggr] disqualifies a class as an aggregate if it has
+  // any user-declared constructors, including ``= delete`` ones (the rule
+  // tightened from "user-provided" in C++17 to "user-declared" in C++20).
+  // Lyrical's gcc 15 / libstdc++ enforces the C++20 wording even when
+  // CMAKE_CXX_STANDARD is 17, so brace-init ``LockedSubscriptionGuard{
+  // &mtx, sub, cg}`` would fail to find a matching constructor on Lyrical.
+  // An explicit constructor sidesteps the aggregate-init rules entirely.
+  LockedSubscriptionGuard(std::mutex * m, rclcpp::GenericSubscription::SharedPtr s, rclcpp::CallbackGroup::SharedPtr cg)
+    : mtx(m), subscription(std::move(s)), callback_group(std::move(cg)) {
+  }
+
+  ~LockedSubscriptionGuard() {
+    if (!subscription && !callback_group) {
+      return;
+    }
+    std::lock_guard<std::mutex> lock(*mtx);
+    // Drop subscription before callback group so any in-flight dispatch
+    // finishes against a live group. Both destructors mutate the node
+    // hash map.
+    subscription.reset();
+    callback_group.reset();
+  }
+
+  // Non-copyable, non-movable: the guard owns per-capture rcl state and
+  // must destroy it exactly once, under the provided mutex.
+  LockedSubscriptionGuard(const LockedSubscriptionGuard &) = delete;
+  LockedSubscriptionGuard & operator=(const LockedSubscriptionGuard &) = delete;
+  LockedSubscriptionGuard(LockedSubscriptionGuard &&) = delete;
+  LockedSubscriptionGuard & operator=(LockedSubscriptionGuard &&) = delete;
+};
+
+}  // namespace
+
 SnapshotCapture::SnapshotCapture(rclcpp::Node * node, FaultStorage * storage, const SnapshotConfig & config)
   : node_(node), storage_(storage), config_(config) {
   if (!node_) {
@@ -156,34 +204,48 @@ bool SnapshotCapture::capture_topic_on_demand(const std::string & fault_code, co
   }
 
   // Create a local callback group for this capture operation (ensures clean executor lifecycle).
-  // Pass false to prevent automatic association with the node's main executor —
+  // Pass false to prevent automatic association with the node's main executor -
   // we manually add this group to a local SingleThreadedExecutor below.
-  auto local_callback_group = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
+  //
+  // node_ops_mutex_ serialises create AND destroy of these entities across
+  // concurrent capture threads. rclcpp node internals (rcutils_hash_map) are
+  // not thread-safe for concurrent entity creation OR destruction: TSan
+  // initially caught the create race (fixed by locking the create side), then
+  // caught an identical read-vs-write race on the destroy side (two capture
+  // threads releasing their shared_ptr<GenericSubscription> concurrently, same
+  // class as issue #375). LockedSubscriptionGuard above takes the same mutex
+  // on destruction so both sides are now serialised.
+  LockedSubscriptionGuard guard{&node_ops_mutex_, nullptr, nullptr};
+  {
+    std::lock_guard<std::mutex> lock(node_ops_mutex_);
+    guard.callback_group = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false);
 
-  rclcpp::GenericSubscription::SharedPtr subscription;
-  try {
-    // NOLINTNEXTLINE(performance-unnecessary-value-param)
-    auto callback = [&received, &captured_msg, &msg_mutex](std::shared_ptr<const rclcpp::SerializedMessage> msg) {
-      bool expected = false;
-      if (received.compare_exchange_strong(expected, true)) {
-        std::lock_guard<std::mutex> lock(msg_mutex);
-        captured_msg = *msg;
-      }
-    };
+    try {
+      // NOLINTNEXTLINE(performance-unnecessary-value-param)
+      auto callback = [&received, &captured_msg, &msg_mutex](std::shared_ptr<const rclcpp::SerializedMessage> msg) {
+        bool expected = false;
+        if (received.compare_exchange_strong(expected, true)) {
+          std::lock_guard<std::mutex> msg_lock(msg_mutex);
+          captured_msg = *msg;
+        }
+      };
 
-    // Use local callback group to avoid reentrancy with service callbacks
-    rclcpp::SubscriptionOptions sub_options;
-    sub_options.callback_group = local_callback_group;
+      // Use local callback group to avoid reentrancy with service callbacks
+      rclcpp::SubscriptionOptions sub_options;
+      sub_options.callback_group = guard.callback_group;
 
-    subscription = node_->create_generic_subscription(topic, msg_type, qos, callback, sub_options);
-  } catch (const std::exception & e) {
-    RCLCPP_WARN(node_->get_logger(), "Failed to create subscription for '%s': %s", topic.c_str(), e.what());
-    return false;
+      guard.subscription = node_->create_generic_subscription(topic, msg_type, qos, callback, sub_options);
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(node_->get_logger(), "Failed to create subscription for '%s': %s", topic.c_str(), e.what());
+      // guard destructor unwinds callback_group under the lock before returning.
+      return false;
+    }
   }
 
-  // Use a local executor with the local callback group (both destroyed together on exit)
+  // Use a local executor with the local callback group (both destroyed together on exit).
+  // The executor holds a raw pointer to the callback group; guard outlives it.
   rclcpp::executors::SingleThreadedExecutor executor;
-  executor.add_callback_group(local_callback_group, node_->get_node_base_interface());
+  executor.add_callback_group(guard.callback_group, node_->get_node_base_interface());
 
   // Wait for message with timeout
   const auto timeout = std::chrono::duration<double>(config_.timeout_sec);
@@ -340,10 +402,18 @@ std::vector<std::string> SnapshotCapture::collect_all_configured_topics() const 
 }
 
 std::string SnapshotCapture::get_topic_type(const std::string & topic) const {
-  auto topic_names_and_types = node_->get_topic_names_and_types();
-  auto it = topic_names_and_types.find(topic);
-  if (it != topic_names_and_types.end() && !it->second.empty()) {
-    return it->second[0];
+  // node_->get_topic_names_and_types() throws if the rcl context is
+  // invalidated mid-call (e.g. SIGINT fires between the check and the rcl
+  // call). During shutdown this is expected and not actionable - treat it
+  // as "no topic info available right now".
+  try {
+    auto topic_names_and_types = node_->get_topic_names_and_types();
+    auto it = topic_names_and_types.find(topic);
+    if (it != topic_names_and_types.end() && !it->second.empty()) {
+      return it->second[0];
+    }
+  } catch (const std::runtime_error &) {
+    // context invalid - caller handles empty return
   }
   return "";
 }
