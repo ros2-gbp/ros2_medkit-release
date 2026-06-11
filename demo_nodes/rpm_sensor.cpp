@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <mutex>
+
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float32.hpp>
+
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
 
 class RPMSensor : public rclcpp::Node {
  public:
@@ -27,10 +31,19 @@ class RPMSensor : public rclcpp::Node {
 
   ~RPMSensor() {
     timer_->cancel();
+    // Wait for any in-flight callback to finish before destroying members.
+    // Humble's timer cancel() does not wait for running callbacks.
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    timer_.reset();
+    rpm_pub_.reset();
   }
 
  private:
   void publish_data() {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!rpm_pub_) {
+      return;
+    }
     current_rpm_ += 50.0;
     if (current_rpm_ > 3000.0) {
       current_rpm_ = 1000.0;
@@ -44,14 +57,14 @@ class RPMSensor : public rclcpp::Node {
     RCLCPP_INFO(this->get_logger(), "RPM: %.0f", current_rpm_);
   }
 
+  std::mutex callback_mutex_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr rpm_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   double current_rpm_ = 1000.0;
 };
 
 int main(int argc, char ** argv) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<RPMSensor>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<RPMSensor>();
+  });
 }
