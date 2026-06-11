@@ -14,10 +14,10 @@
 
 #pragma once
 
-#include "ros2_medkit_gateway/discovery/discovery_layer.hpp"
-#include "ros2_medkit_gateway/discovery/manifest/manifest.hpp"
+#include "ros2_medkit_gateway/core/discovery/discovery_layer.hpp"
+#include "ros2_medkit_gateway/core/discovery/manifest/manifest.hpp"
+#include "ros2_medkit_gateway/core/discovery/merge_types.hpp"
 #include "ros2_medkit_gateway/discovery/manifest/runtime_linker.hpp"
-#include "ros2_medkit_gateway/discovery/merge_types.hpp"
 
 #include <rclcpp/logger.hpp>
 #include <rclcpp/logging.hpp>
@@ -65,6 +65,9 @@ class MergePipeline {
 
   /**
    * @brief Get the last merge report (returned by value for thread safety)
+   * @warning NOT thread-safe on its own. In production, access only through
+   * DiscoveryManager which holds a mutex around the cached pipeline result.
+   * Direct calls from multiple threads are a data race.
    */
   MergeReport get_last_report() const {
     return last_report_;
@@ -79,6 +82,8 @@ class MergePipeline {
 
   /**
    * @brief Get the last linking result (returned by value for thread safety)
+   * @warning NOT thread-safe on its own. In production, access only through
+   * DiscoveryManager which holds a mutex around the cached pipeline result.
    */
   LinkingResult get_linking_result() const {
     return linking_result_;
