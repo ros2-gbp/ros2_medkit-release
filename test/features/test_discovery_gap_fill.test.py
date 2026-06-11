@@ -17,8 +17,10 @@
 Integration tests for hybrid mode gap-fill configuration.
 
 Tests that gap-fill controls restrict which heuristic entities the
-runtime layer can create when a manifest is present. Also tests
-namespace blacklist/whitelist filtering.
+runtime layer can create when a manifest is present.
+
+Note: Areas and Components are never created by runtime discovery.
+Gap-fill only controls heuristic Apps and Functions.
 """
 
 import os
@@ -41,16 +43,13 @@ def generate_test_description():
         pkg_share, 'config', 'examples', 'demo_nodes_manifest.yaml'
     )
 
-    # Hybrid mode with restrictive gap-fill:
-    # - No heuristic areas (only manifest areas)
-    # - No heuristic components (only manifest components)
-    # - Apps still allowed (for linking)
+    # Hybrid mode with gap-fill:
+    # - Apps allowed (for linking)
+    # - Areas and Components come from manifest only (runtime never creates them)
     gateway_node = create_gateway_node(extra_params={
         'discovery.mode': 'hybrid',
         'discovery.manifest_path': manifest_path,
         'discovery.manifest_strict_validation': False,
-        'discovery.merge_pipeline.gap_fill.allow_heuristic_areas': False,
-        'discovery.merge_pipeline.gap_fill.allow_heuristic_components': False,
         'discovery.merge_pipeline.gap_fill.allow_heuristic_apps': True,
     })
 
@@ -75,7 +74,11 @@ class TestGapFillConfig(GatewayTestCase):
     """Test gap-fill restrictions in hybrid mode."""
 
     def test_only_manifest_areas_present(self):
-        """With allow_heuristic_areas=false, only manifest areas should exist."""
+        """Areas come from manifest only - no heuristic areas from runtime.
+
+        GET /areas only returns top-level areas; subareas are filtered
+        and accessible via GET /areas/{id}/subareas.
+        """
         data = self.poll_endpoint_until(
             '/areas',
             lambda d: d if len(d.get('items', [])) >= 1 else None,
@@ -83,18 +86,18 @@ class TestGapFillConfig(GatewayTestCase):
         )
         area_ids = [a['id'] for a in data['items']]
 
-        # Manifest defines: powertrain, chassis, body, perception
-        # No heuristic areas from runtime namespaces should appear
+        # Only top-level manifest areas should appear in GET /areas
+        # Subareas (engine, brakes, lidar, door, lights, front-left-door)
+        # are filtered from the top-level listing
         for area_id in area_ids:
             self.assertIn(area_id, [
                 'powertrain', 'chassis', 'body', 'perception',
-                # Subareas defined in manifest
-                'engine', 'brakes', 'lidar', 'door', 'lights',
-                'front-left-door',
-            ], f"Unexpected heuristic area found: {area_id}")
+                # HATEOAS edge-case fixture, manifest-only.
+                'hateoas-edge-area',
+            ], f"Unexpected area found in top-level listing: {area_id}")
 
     def test_only_manifest_components_present(self):
-        """With allow_heuristic_components=false, only manifest components exist."""
+        """Components come from manifest only - runtime never creates components."""
         data = self.poll_endpoint_until(
             '/components',
             lambda d: d if len(d.get('items', [])) >= 1 else None,
@@ -108,6 +111,8 @@ class TestGapFillConfig(GatewayTestCase):
             'brake-ecu', 'brake-pressure-sensor-hw', 'brake-actuator-hw',
             'door-sensor-hw', 'light-module',
             'lidar-unit',
+            # HATEOAS edge-case fixture (component without area assignment).
+            'hateoas-component-no-area',
         ]
         for comp_id in component_ids:
             self.assertIn(
@@ -115,8 +120,29 @@ class TestGapFillConfig(GatewayTestCase):
                 f"Unexpected heuristic component found: {comp_id}",
             )
 
-    def test_health_shows_gap_fill_filtering(self):
-        """Health endpoint should show filtered_by_gap_fill count."""
+    def test_manifest_apps_present_and_linked(self):
+        """With allow_heuristic_apps=true, manifest apps matching launched nodes are present."""
+        # 4 demo nodes launched: temp_sensor, rpm_sensor, pressure_sensor, calibration
+        # These match manifest apps: engine-temp-sensor, engine-rpm-sensor,
+        # brake-pressure-sensor, engine-calibration-service
+        expected_linked = {
+            'engine-temp-sensor', 'engine-rpm-sensor',
+            'brake-pressure-sensor', 'engine-calibration-service',
+        }
+        data = self.poll_endpoint_until(
+            '/apps',
+            lambda d: d if len(d.get('items', [])) >= len(expected_linked) else None,
+            timeout=30.0,
+        )
+        app_ids = {a['id'] for a in data['items']}
+        for app_id in expected_linked:
+            self.assertIn(
+                app_id, app_ids,
+                f"Expected manifest app {app_id} not found in apps list",
+            )
+
+    def test_health_shows_discovery_info(self):
+        """Health endpoint should show discovery information."""
         health = self.poll_endpoint_until(
             '/health',
             lambda data: data if 'discovery' in data else None,
@@ -125,8 +151,8 @@ class TestGapFillConfig(GatewayTestCase):
         discovery = health.get('discovery', {})
         pipeline = discovery.get('pipeline', {})
 
-        # Should have filtered some entities
-        self.assertIn('filtered_by_gap_fill', pipeline)
+        # Pipeline info should be present in hybrid mode
+        self.assertIn('total_entities', pipeline)
 
 
 @launch_testing.post_shutdown_test()
