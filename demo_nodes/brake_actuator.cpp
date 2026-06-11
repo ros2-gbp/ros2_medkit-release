@@ -23,8 +23,11 @@
  */
 
 #include <chrono>
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float32.hpp>
+
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
 
 using namespace std::chrono_literals;
 
@@ -46,10 +49,18 @@ class BrakeActuator : public rclcpp::Node {
 
   ~BrakeActuator() {
     timer_->cancel();
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    cmd_sub_.reset();
+    timer_.reset();
+    pressure_pub_.reset();
   }
 
  private:
   void command_callback(const std_msgs::msg::Float32::SharedPtr msg) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!pressure_pub_) {
+      return;
+    }
     target_pressure_ = msg->data;
 
     // Clamp to valid range (0-100 bar)
@@ -60,10 +71,14 @@ class BrakeActuator : public rclcpp::Node {
       target_pressure_ = 100.0f;
     }
 
-    RCLCPP_INFO(this->get_logger(), "Received command: %.2f bar", target_pressure_);
+    RCLCPP_INFO(this->get_logger(), "Received command: %.2f bar", static_cast<double>(target_pressure_));
   }
 
   void timer_callback() {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!pressure_pub_) {
+      return;
+    }
     // Simulate gradual pressure change (5 bar/sec = 0.5 bar per 100ms)
     const float step = 0.5f;
 
@@ -81,6 +96,7 @@ class BrakeActuator : public rclcpp::Node {
     pressure_pub_->publish(msg);
   }
 
+  std::mutex callback_mutex_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr cmd_sub_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pressure_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
@@ -89,8 +105,7 @@ class BrakeActuator : public rclcpp::Node {
 };
 
 int main(int argc, char * argv[]) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<BrakeActuator>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<BrakeActuator>();
+  });
 }
