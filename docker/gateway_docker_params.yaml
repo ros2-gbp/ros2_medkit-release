@@ -1,0 +1,9 @@
+# Default gateway configuration for Docker deployment.
+# Override by mounting your own file at /etc/ros2_medkit/params.yaml
+# or passing --ros-args --params-file <path> to the container.
+ros2_medkit_gateway:
+  ros__parameters:
+    server:
+      host: "0.0.0.0"
+      port: 8080
+    refresh_interval_ms: 2000
