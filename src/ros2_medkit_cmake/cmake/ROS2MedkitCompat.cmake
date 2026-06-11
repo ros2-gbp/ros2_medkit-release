@@ -17,7 +17,7 @@
 # =============================================================================
 #
 # Centralizes all dependency resolution workarounds for supporting multiple
-# ROS 2 distributions (Humble, Jazzy, Rolling) in a single place.
+# ROS 2 distributions (Humble, Jazzy, Lyrical) in a single place.
 #
 # Usage (in each package's CMakeLists.txt):
 #   find_package(ros2_medkit_cmake REQUIRED)
@@ -31,7 +31,7 @@
 #   medkit_target_dependencies(target ...) - Drop-in ament_target_dependencies replacement
 #
 # Variables set by medkit_detect_compat_defs():
-#   MEDKIT_RCLCPP_VERSION_MAJOR     — integer (e.g., 16 for Humble, 28 for Jazzy)
+#   MEDKIT_RCLCPP_VERSION_MAJOR     — integer (16=Humble, 28=Jazzy, 32+=Lyrical)
 #   MEDKIT_ROSBAG2_OLD_TIMESTAMP    — ON if rosbag2_storage < 0.22.0 (Humble)
 #
 
@@ -40,9 +40,11 @@ include_guard(GLOBAL)
 # ---------------------------------------------------------------------------
 # medkit_find_yaml_cpp()
 # ---------------------------------------------------------------------------
-# Jazzy's yaml_cpp_vendor exports a namespaced yaml-cpp::yaml-cpp cmake target.
-# Humble's yaml_cpp_vendor bundles yaml-cpp but does NOT export the cmake target.
-# This macro creates an IMPORTED INTERFACE target when find_package doesn't.
+# Jazzy's and Lyrical's yaml_cpp_vendor export a namespaced yaml-cpp::yaml-cpp
+# cmake target (Jazzy directly; Lyrical via its Findyaml-cpp.cmake module that
+# aliases the upstream yaml-cpp 0.8+ target). Humble's yaml_cpp_vendor bundles
+# yaml-cpp but does NOT export the cmake target. This macro creates an IMPORTED
+# INTERFACE target when find_package doesn't.
 #
 # Prerequisite: find_package(yaml_cpp_vendor REQUIRED) must be called before.
 # ---------------------------------------------------------------------------
@@ -72,43 +74,65 @@ endmacro()
 # ---------------------------------------------------------------------------
 # medkit_find_cpp_httplib()
 # ---------------------------------------------------------------------------
-# On Jazzy/Noble, libcpp-httplib-dev is available via apt and provides a
-# pkg-config .pc file.  On Humble/Jammy, cpp-httplib must be built from
-# source, which installs a CMake config file (httplibConfig.cmake).
+# Finds cpp-httplib in the [0.14, 0.20) range through a multi-tier fallback chain:
+#   1. pkg-config (Jazzy/Noble system package)
+#   2. cmake find_package(httplib) (source builds, Pixi)
+#   3. VENDORED_DIR parameter (bundled header-only copy, currently 0.14.3)
 #
-# Requires cpp-httplib >= 0.14 (StatusCode enum, std::string overloads).
-# Older system packages (e.g. 0.10.x on Jammy) are rejected by pkg-config
-# so the fallback cmake/source path is used instead.
+# On Humble/Jammy the system package is 0.10.x (too old); the vendored
+# fallback in ros2_medkit_gateway handles this automatically.
+#
+# On Lyrical/Resolute the system package is 0.26.x which removed the
+# multipart `Request::has_file` / `get_file_value` API used by
+# BulkDataHandlers, so we cap pkg-config at < 0.20 and fall back to the
+# vendored copy until the handler is migrated to the newer API (see #409).
 #
 # Creates a unified alias target `cpp_httplib_target` for consumers.
 # ---------------------------------------------------------------------------
 macro(medkit_find_cpp_httplib)
+  cmake_parse_arguments(_mfch "" "VENDORED_DIR" "" ${ARGN})
   find_package(PkgConfig QUIET)
   if(PkgConfig_FOUND)
     pkg_check_modules(cpp_httplib IMPORTED_TARGET cpp-httplib>=0.14)
+    if(cpp_httplib_FOUND AND cpp_httplib_VERSION VERSION_GREATER_EQUAL "0.20")
+      message(STATUS "[MedkitCompat] cpp-httplib: system package ${cpp_httplib_VERSION} removes the multipart Request::has_file API; falling back to vendored 0.14")
+      # `unset` in a macro does not clear caller-scope variables set by
+      # pkg_check_modules, so explicitly mask FOUND to redirect through the
+      # find_package / VENDORED_DIR fallback chain below.
+      set(cpp_httplib_FOUND FALSE)
+    endif()
   endif()
   if(cpp_httplib_FOUND)
     add_library(cpp_httplib_target ALIAS PkgConfig::cpp_httplib)
     message(STATUS "[MedkitCompat] cpp-httplib: using pkg-config (${cpp_httplib_VERSION})")
   else()
     find_package(httplib QUIET)
-    if(TARGET httplib::httplib)
+    # Cap this tier at [0.14, 0.20) like the pkg-config tier above: a future
+    # distro shipping httplibConfig.cmake for 0.26 would otherwise resolve here
+    # and skip the vendored fallback, even though 0.26 dropped the multipart
+    # Request::has_file API. An unversioned config (deliberate source build) is
+    # trusted and passes through.
+    if(TARGET httplib::httplib AND DEFINED httplib_VERSION AND NOT httplib_VERSION VERSION_LESS "0.20")
+      message(STATUS "[MedkitCompat] cpp-httplib: cmake config ${httplib_VERSION} removes the multipart Request::has_file API; falling back to vendored 0.14")
+    endif()
+    if(TARGET httplib::httplib AND (NOT DEFINED httplib_VERSION OR httplib_VERSION VERSION_LESS "0.20"))
       add_library(cpp_httplib_target ALIAS httplib::httplib)
-      message(STATUS "[MedkitCompat] cpp-httplib: using cmake config (source build)")
+      message(STATUS "[MedkitCompat] cpp-httplib: using cmake config (source build, version '${httplib_VERSION}')")
+    elseif(_mfch_VENDORED_DIR AND EXISTS "${_mfch_VENDORED_DIR}/httplib.h")
+      add_library(cpp_httplib_vendored INTERFACE)
+      target_include_directories(cpp_httplib_vendored SYSTEM INTERFACE "${_mfch_VENDORED_DIR}")
+      add_library(cpp_httplib_target ALIAS cpp_httplib_vendored)
+      message(STATUS "[MedkitCompat] cpp-httplib: using vendored header (${_mfch_VENDORED_DIR}/httplib.h)")
     else()
       message(FATAL_ERROR
         "[MedkitCompat] Could not find cpp-httplib >= 0.14.\n"
-        "  The system libcpp-httplib-dev package on Ubuntu 22.04 provides 0.10.x which is too old.\n"
-        "  ros2_medkit requires cpp-httplib >= 0.14 for httplib::StatusCode and std::string overloads.\n"
-        "  Fix: remove the old system package and install from source:\n"
-        "    sudo apt remove libcpp-httplib-dev\n"
-        "    git clone --depth 1 --branch v0.14.3 https://github.com/yhirose/cpp-httplib.git /tmp/cpp-httplib\n"
-        "    cd /tmp/cpp-httplib && mkdir build && cd build\n"
-        "    cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DHTTPLIB_REQUIRE_OPENSSL=ON\n"
-        "    sudo make install\n"
+        "  Tried: pkg-config, cmake find_package(httplib), VENDORED_DIR.\n"
+        "  ros2_medkit_gateway vendors cpp-httplib 0.14.3 - ensure ros2_medkit_gateway\n"
+        "  is built first, or pass VENDORED_DIR to medkit_find_cpp_httplib().\n"
         "  See: https://selfpatch.github.io/ros2_medkit/installation.html")
     endif()
   endif()
+  unset(_mfch_VENDORED_DIR)
 endmacro()
 
 # ---------------------------------------------------------------------------
@@ -118,7 +142,7 @@ endmacro()
 # Call AFTER find_package(rclcpp) and optionally find_package(rosbag2_storage).
 #
 # Sets:
-#   MEDKIT_RCLCPP_VERSION_MAJOR  — integer (16=Humble, 21+=Iron, 28+=Jazzy)
+#   MEDKIT_RCLCPP_VERSION_MAJOR  — integer (16=Humble, 21+=Iron, 28+=Jazzy, 32+=Lyrical)
 #   MEDKIT_ROSBAG2_OLD_TIMESTAMP — ON if rosbag2_storage < 0.22.0 (Humble)
 # ---------------------------------------------------------------------------
 macro(medkit_detect_compat_defs)
@@ -164,11 +188,14 @@ endfunction()
 # ---------------------------------------------------------------------------
 # medkit_target_dependencies(target [PUBLIC|PRIVATE|INTERFACE] dep1 dep2 ...)
 # ---------------------------------------------------------------------------
-# Drop-in replacement for ament_target_dependencies that works on Rolling
-# (where ament_target_dependencies was removed from ament_cmake).
+# Drop-in replacement for ament_target_dependencies that works on Lyrical
+# (ament_target_dependencies was deprecated in Kilted / ament_cmake 2.7.3
+# and removed in ament_cmake 2.8.5+, which Lyrical ships).
 #
 # On Humble/Jazzy: delegates to ament_target_dependencies (available).
-# On Rolling:      uses target_link_libraries with ${dep_TARGETS}.
+# On Lyrical:      uses target_link_libraries with ${dep_TARGETS}.
+# The branch is selected at runtime via if(COMMAND ament_target_dependencies)
+# so any future distro keeps working regardless of where the removal lands.
 #
 # When no visibility keyword (PUBLIC/PRIVATE/INTERFACE) is passed, the macro
 # uses the plain target_link_libraries signature. This avoids conflicts with
@@ -183,7 +210,7 @@ macro(medkit_target_dependencies target)
   if(COMMAND ament_target_dependencies)
     ament_target_dependencies(${target} ${ARGN})
   else()
-    # Rolling fallback: resolve dependency targets explicitly.
+    # Lyrical fallback: resolve dependency targets explicitly.
     #
     # CMake forbids mixing the "plain" and "keyword" (PUBLIC/PRIVATE/INTERFACE)
     # signatures of target_link_libraries on the same target.
