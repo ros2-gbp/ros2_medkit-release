@@ -17,7 +17,7 @@
 #include <thread>
 #include <vector>
 
-#include "ros2_medkit_gateway/resource_sampler.hpp"
+#include "ros2_medkit_gateway/core/resource_sampler.hpp"
 
 using namespace ros2_medkit_gateway;
 
@@ -134,7 +134,7 @@ TEST(ResourceSamplerRegistryTest, UpdatesSamplerRegisteredAsBuiltin) {
         if (resource_path == "known-pkg") {
           return nlohmann::json{{"status", "inProgress"}, {"progress", 42}};
         }
-        return tl::make_unexpected(std::string("Update not found: " + resource_path));
+        return tl::make_unexpected("Update not found: " + resource_path);
       },
       true);
 

@@ -12,8 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/float32.hpp>
+
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
 
 class BrakePressureSensor : public rclcpp::Node {
  public:
@@ -28,10 +31,17 @@ class BrakePressureSensor : public rclcpp::Node {
 
   ~BrakePressureSensor() {
     timer_->cancel();
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    timer_.reset();
+    pressure_pub_.reset();
   }
 
  private:
   void publish_data() {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!pressure_pub_) {
+      return;
+    }
     current_pressure_ += 5.0;
     if (current_pressure_ > 100.0) {
       current_pressure_ = 0.0;
@@ -45,14 +55,14 @@ class BrakePressureSensor : public rclcpp::Node {
     RCLCPP_INFO(this->get_logger(), "Brake Pressure: %.1f bar", current_pressure_);
   }
 
+  std::mutex callback_mutex_;
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr pressure_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   double current_pressure_ = 0.0;
 };
 
 int main(int argc, char ** argv) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<BrakePressureSensor>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<BrakePressureSensor>();
+  });
 }

@@ -20,6 +20,13 @@ Plugins implement the ``GatewayPlugin`` C++ base class plus one or more typed pr
 - **ScriptProvider** - replaces or augments the default filesystem-based script backend.
   Plugins can provide script listings, create custom scripts, and execute them using
   alternative runtimes. See the ``/scripts`` endpoints in :doc:`/api/rest`.
+- **DataProvider** - per-entity data resource backend (list, read, write data). Plugins
+  that create entities via IntrospectionProvider can serve data for those entities.
+  Entity requests are routed to the owning plugin automatically.
+- **OperationProvider** - per-entity operation backend (list operations, execute). Uses
+  the same per-entity routing model as DataProvider.
+- **FaultProvider** - per-entity fault backend (list faults, get fault details, clear
+  faults). Uses the same per-entity routing model as DataProvider.
 
 A single plugin can implement multiple provider interfaces. For example, a "systemd" plugin
 could provide both introspection (discover systemd units) and updates (manage service restarts).
@@ -68,9 +75,9 @@ Writing a Plugin
 
 .. code-block:: cpp
 
-   #include "ros2_medkit_gateway/plugins/gateway_plugin.hpp"
-   #include "ros2_medkit_gateway/plugins/plugin_types.hpp"
-   #include "ros2_medkit_gateway/providers/update_provider.hpp"
+   #include "ros2_medkit_gateway/core/plugins/gateway_plugin.hpp"
+   #include "ros2_medkit_gateway/core/plugins/plugin_types.hpp"
+   #include "ros2_medkit_gateway/core/providers/update_provider.hpp"
 
    using namespace ros2_medkit_gateway;
 
@@ -91,7 +98,7 @@ Writing a Plugin
      tl::expected<std::vector<std::string>, UpdateBackendErrorInfo>
        list_updates(const UpdateFilter& filter) override { /* ... */ }
 
-     tl::expected<nlohmann::json, UpdateBackendErrorInfo>
+     tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo>
        get_update(const std::string& id) override { /* ... */ }
 
      tl::expected<void, UpdateBackendErrorInfo>
@@ -129,7 +136,7 @@ Writing a Plugin
      return static_cast<MyPlugin*>(p);
    }
 
-The ``get_update_provider`` (and ``get_introspection_provider``, ``get_log_provider``, ``get_script_provider``) functions use ``extern "C"``
+The ``get_update_provider`` (and ``get_introspection_provider``, ``get_log_provider``, ``get_script_provider``, ``get_data_provider``, ``get_operation_provider``, ``get_fault_provider``) functions use ``extern "C"``
 to avoid RTTI issues across shared library boundaries. The ``static_cast`` is safe because
 these functions execute inside the plugin's own ``.so`` where the type hierarchy is known.
 
@@ -141,7 +148,26 @@ implements the provider interface, even if the class inherits from it.
 .. code-block:: cmake
 
    add_library(my_plugin MODULE src/my_plugin.cpp)
-   target_link_libraries(my_plugin gateway_lib)
+
+   # Pull in include directories for the gateway plugin headers. Plugins
+   # do NOT link the gateway static libraries directly - PluginManager
+   # loads the plugin via dlopen and symbols from gateway_ros2 (and
+   # gateway_core transitively) resolve from the host gateway process at
+   # runtime.
+   medkit_target_dependencies(my_plugin
+     ros2_medkit_gateway
+   )
+
+   # Allow gateway-provided symbols to remain unresolved at link time;
+   # they bind to the host process when the plugin is loaded.
+   target_link_options(my_plugin PRIVATE
+     -Wl,--unresolved-symbols=ignore-all
+   )
+
+   # Link only third-party libraries the plugin needs at link time
+   # (e.g. nlohmann_json). Avoid target_link_libraries(my_plugin
+   # gateway_ros2) - it would embed gateway objects into the plugin .so
+   # and risk ODR / static-state duplication.
 
 4. Install the ``.so`` and add its path to ``gateway_params.yaml``.
 
@@ -153,11 +179,10 @@ A self-contained plugin implementing UpdateProvider (copy-paste starting point):
 .. code-block:: cpp
 
    // my_ota_plugin.cpp
-   #include "ros2_medkit_gateway/plugins/gateway_plugin.hpp"
-   #include "ros2_medkit_gateway/plugins/plugin_types.hpp"
-   #include "ros2_medkit_gateway/providers/update_provider.hpp"
+   #include "ros2_medkit_gateway/core/plugins/gateway_plugin.hpp"
+   #include "ros2_medkit_gateway/core/plugins/plugin_types.hpp"
+   #include "ros2_medkit_gateway/core/providers/update_provider.hpp"
 
-   #include <httplib.h>
    #include <nlohmann/json.hpp>
 
    using namespace ros2_medkit_gateway;
@@ -176,7 +201,7 @@ A self-contained plugin implementing UpdateProvider (copy-paste starting point):
        return std::vector<std::string>{};
      }
 
-     tl::expected<nlohmann::json, UpdateBackendErrorInfo>
+     tl::expected<dto::UpdateDetail, UpdateBackendErrorInfo>
      get_update(const std::string& id) override {
        return tl::make_unexpected(
          UpdateBackendErrorInfo{UpdateBackendError::NotFound, "not found: " + id});
@@ -225,10 +250,10 @@ Plugin Lifecycle
 1. ``dlopen`` loads the ``.so`` with ``RTLD_NOW | RTLD_LOCAL``
 2. ``plugin_api_version()`` is checked against the gateway's ``PLUGIN_API_VERSION``
 3. ``create_plugin()`` factory function creates the plugin instance
-4. Provider interfaces are queried via ``get_update_provider()`` / ``get_introspection_provider()`` / ``get_log_provider()`` / ``get_script_provider()``
+4. Provider interfaces are queried via ``get_update_provider()`` / ``get_introspection_provider()`` / ``get_log_provider()`` / ``get_script_provider()`` / ``get_data_provider()`` / ``get_operation_provider()`` / ``get_fault_provider()``
 5. ``configure()`` is called with per-plugin JSON config
 6. ``set_context()`` provides ``PluginContext`` with ROS 2 node, entity cache, faults, and HTTP utilities
-7. ``register_routes()`` allows registering custom REST endpoints
+7. ``get_routes()`` returns custom REST endpoint definitions as ``vector<PluginRoute>``
 8. Runtime: subsystem managers call provider methods as needed
 9. ``shutdown()`` is called before the plugin is destroyed
 
@@ -238,12 +263,34 @@ PluginContext
 After ``configure()``, the gateway calls ``set_context()`` with a ``PluginContext`` reference
 providing access to gateway data and utilities:
 
-- ``node()`` - ROS 2 node pointer for subscriptions, service clients, timers, etc.
+- ``node()`` - ROS 2 node pointer for service clients, timers, and parameter access.
+
+  .. warning::
+
+     Do **not** call ``node()->create_subscription<T>()``,
+     ``create_generic_subscription()``, or ``create_callback_group()``
+     directly on this node. Issue #375 showed that concurrent rcl
+     mutations on the gateway node race its internal hash map and
+     SIGSEGV under load on Rolling/Lyrical. The regression gate in
+     ``scripts/check_no_naked_subscriptions.sh`` is run in CI and will
+     fail PRs that add such calls outside the allowlist. Use
+     ``ros2_medkit_gateway::ros2_common::Ros2SubscriptionSlot::create_typed``
+     or ``create_generic`` via the executor that already serializes all
+     subscription lifecycle calls. See
+     :doc:`/design/ros2_medkit_gateway/ros2_subscription_architecture`
+     for the allowed pattern and the rationale.
+
 - ``get_entity(id)`` - look up any entity (area, component, app, function) from the discovery cache
 - ``list_entity_faults(entity_id)`` - query faults for an entity
 - ``validate_entity_for_route(req, res, entity_id)`` - validate entity exists and matches the route type, auto-sending SOVD errors on failure
-- ``send_error()`` / ``send_json()`` - SOVD-compliant HTTP response helpers (static methods)
 - ``register_capability()`` / ``register_entity_capability()`` - register custom capabilities on entities
+
+.. note::
+
+   SOVD-compliant HTTP response helpers (``send_json()``, ``send_error()``) are instance
+   methods on ``PluginResponse``, not static methods on ``PluginContext``. Use
+   ``res.send_json(data)`` and ``res.send_error(status, code, msg)`` inside route handlers.
+
 - ``check_lock(entity_id, client_id, collection)`` - verify lock access before mutating operations; returns ``LockAccessResult`` with ``allowed`` flag and denial details
 - ``acquire_lock()`` / ``release_lock()`` - acquire and release entity locks with optional scope and TTL
 - ``get_entity_snapshot()`` - returns an ``IntrospectionInput`` populated from the current entity cache
@@ -302,13 +349,14 @@ for the lower-level registry API.
    still required because ``plugin_api_version()`` must return the current version
    (exact-match check).
 
-PluginContext API (v4)
+PluginContext API (v5)
 ----------------------
 
-Version 4 of the plugin API introduced several new methods on ``PluginContext``.
-These methods have default no-op implementations, so existing plugins continue to
-compile without changes (though a rebuild is required to match the new
-``PLUGIN_API_VERSION``).
+Version 5 of the plugin API replaced ``register_routes()`` with ``get_routes()``
+and moved ``send_json``/``send_error`` from ``PluginContext`` static methods to
+``PluginResponse`` instance methods. Plugins that implement custom REST routes
+require source changes to adapt to the new API. Plugins that do not implement
+routes only need a rebuild to match the new ``PLUGIN_API_VERSION``.
 
 **check_lock(entity_id, client_id, collection)**
 
@@ -320,7 +368,7 @@ should call this before proceeding:
 
    auto result = ctx_->check_lock(entity_id, client_id, "configurations");
    if (!result.allowed) {
-     PluginContext::send_error(res, 409, result.denied_code, result.denied_reason);
+     res.send_error(409, result.denied_code, result.denied_reason);
      return;
    }
 
@@ -378,30 +426,36 @@ API described in `Cyclic Subscription Extensions`_.
 Custom REST Endpoints
 ---------------------
 
-Any plugin can register vendor-specific endpoints via ``register_routes()``.
-Use ``PluginContext`` utilities for entity validation and SOVD-compliant responses:
+Any plugin can expose vendor-specific endpoints by overriding ``get_routes()``, which
+returns a ``vector<PluginRoute>``. Each route specifies an HTTP method, a URL pattern
+relative to the API prefix (no leading slash), and a handler. Use ``PluginRequest`` and
+``PluginResponse`` for path parameters and SOVD-compliant responses:
 
 .. code-block:: cpp
 
-   void register_routes(httplib::Server& server, const std::string& api_prefix) override {
-     // Global vendor endpoint
-     server.Get(api_prefix + "/x-myvendor/status",
-       [this](const httplib::Request&, httplib::Response& res) {
-         PluginContext::send_json(res, get_status_json());
-       });
+   std::vector<PluginRoute> get_routes() override {
+     return {
+         // Global vendor endpoint
+         {"GET", "x-myvendor/status",
+          [this](const PluginRequest& /*req*/, PluginResponse& res) {
+            res.send_json(get_status_json());
+          }},
 
-     // Entity-scoped endpoint (matches a registered capability)
-     server.Get((api_prefix + R"(/apps/([^/]+)/x-medkit-traces)").c_str(),
-       [this](const httplib::Request& req, httplib::Response& res) {
-         auto entity = ctx_->validate_entity_for_route(req, res, req.matches[1]);
-         if (!entity) return;  // Error already sent
+         // Entity-scoped endpoint (matches a registered capability)
+         {"GET", R"(apps/([^/]+)/x-medkit-traces)",
+          [this](const PluginRequest& req, PluginResponse& res) {
+            auto entity_id = req.path_param(1);
+            auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
+            if (!entity) return;  // Error already sent
 
-         auto faults = ctx_->list_entity_faults(entity->id);
-         PluginContext::send_json(res, {{"entity", entity->id}, {"faults", faults}});
-       });
+            auto faults = ctx_->list_entity_faults(entity->id);
+            res.send_json({{"entity", entity->id}, {"faults", faults}});
+          }},
+     };
    }
 
-Use the ``x-`` prefix for vendor-specific endpoints per SOVD convention.
+Use the ``x-`` prefix for vendor-specific endpoints per SOVD convention. Patterns are
+relative to the API prefix and must not include a leading slash.
 
 For entity-scoped endpoints, register a matching capability via ``register_capability()``
 or ``register_entity_capability()`` in ``set_context()`` so the endpoint appears in the
@@ -458,8 +512,8 @@ subscribes to ``/ros2_medkit/discovery``, stores incoming
 
 .. code-block:: cpp
 
-   #include "ros2_medkit_gateway/plugins/gateway_plugin.hpp"
-   #include "ros2_medkit_gateway/providers/introspection_provider.hpp"
+   #include "ros2_medkit_gateway/core/plugins/gateway_plugin.hpp"
+   #include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
 
    using namespace ros2_medkit_gateway;
 
@@ -530,8 +584,8 @@ execute, and control executions:
 
 .. code-block:: cpp
 
-   #include "ros2_medkit_gateway/plugins/gateway_plugin.hpp"
-   #include "ros2_medkit_gateway/providers/script_provider.hpp"
+   #include "ros2_medkit_gateway/core/plugins/gateway_plugin.hpp"
+   #include "ros2_medkit_gateway/core/providers/script_provider.hpp"
 
    using namespace ros2_medkit_gateway;
 
@@ -639,6 +693,77 @@ The ``scripts.scripts_dir`` parameter must be set for the scripts subsystem to
 initialize, even when using a plugin backend. The plugin replaces how scripts are
 stored and executed, but the subsystem must be enabled first.
 
+Per-Entity Provider Example (DataProvider)
+-------------------------------------------
+
+A plugin that creates entities via ``IntrospectionProvider`` and serves data for them
+via ``DataProvider``. OperationProvider and FaultProvider follow the same pattern.
+
+.. code-block:: cpp
+
+   #include "ros2_medkit_gateway/core/plugins/gateway_plugin.hpp"
+   #include "ros2_medkit_gateway/core/plugins/plugin_types.hpp"
+   #include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
+   #include "ros2_medkit_gateway/core/providers/data_provider.hpp"
+
+   using namespace ros2_medkit_gateway;
+
+   class MyDataPlugin : public GatewayPlugin, public IntrospectionProvider, public DataProvider {
+    public:
+     std::string name() const override { return "my_data_plugin"; }
+     void configure(const nlohmann::json &) override {}
+     void shutdown() override {}
+
+     // IntrospectionProvider: create entities owned by this plugin
+     IntrospectionResult introspect(const IntrospectionInput &) override {
+       IntrospectionResult result;
+       App ecu;
+       ecu.id = "my_ecu";
+       ecu.name = "My ECU";
+       result.new_entities.apps.push_back(std::move(ecu));
+       return result;
+     }
+
+     // DataProvider: serve data for owned entities
+     tl::expected<nlohmann::json, DataProviderErrorInfo> list_data(const std::string & entity_id) override {
+       return nlohmann::json{{"items", {{{"id", "temperature"}, {"name", "Temperature"}}}}};
+     }
+     tl::expected<nlohmann::json, DataProviderErrorInfo> read_data(
+         const std::string &, const std::string & resource_name) override {
+       if (resource_name == "temperature") {
+         return nlohmann::json{{"id", resource_name}, {"data", {{"temperature", 42.5}}}};
+       }
+       return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::ResourceNotFound, "Unknown resource", 404});
+     }
+     tl::expected<nlohmann::json, DataProviderErrorInfo> write_data(
+         const std::string &, const std::string &, const nlohmann::json &) override {
+       return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::ReadOnly, "Read-only data", 403});
+     }
+   };
+
+   // Plugin exports - both providers must be exported via extern "C"
+   extern "C" GATEWAY_PLUGIN_EXPORT GatewayPlugin* create_plugin() { return new MyDataPlugin(); }
+   extern "C" GATEWAY_PLUGIN_EXPORT int plugin_api_version() { return PLUGIN_API_VERSION; }
+   extern "C" GATEWAY_PLUGIN_EXPORT IntrospectionProvider* get_introspection_provider(GatewayPlugin* p) {
+     return static_cast<MyDataPlugin*>(p);
+   }
+   extern "C" GATEWAY_PLUGIN_EXPORT DataProvider* get_data_provider(GatewayPlugin* p) {
+     return static_cast<MyDataPlugin*>(p);
+   }
+
+The gateway automatically adds ``data`` capability to entities owned by a plugin that
+registers a ``DataProvider``. Similarly for ``operations`` (OperationProvider) and ``faults``
+(FaultProvider). There is no need to call ``register_entity_capability()`` for these
+standard resource collections.
+
+.. warning::
+
+   All provider methods may be called concurrently from multiple HTTP handler
+   threads. Implementations that access shared state must provide their own
+   synchronization (e.g., ``std::mutex``). Plugin responses are passed through
+   verbatim to the API consumer - match the SOVD response format for consistency
+   with native entities.
+
 Multiple Plugins
 ----------------
 
@@ -653,7 +778,30 @@ Multiple plugins can be loaded simultaneously:
 - **LogProvider**: Only the first plugin's LogProvider is used for queries (same as UpdateProvider).
   All LogProvider plugins receive ``on_log_entry()`` calls as observers.
 - **ScriptProvider**: Only the first plugin's ScriptProvider is used (same as UpdateProvider).
+- **DataProvider / OperationProvider / FaultProvider**: These use per-entity routing based
+  on entity ownership. Entities created by a plugin's IntrospectionProvider are automatically
+  routed to that same plugin's DataProvider, OperationProvider, and FaultProvider. Multiple
+  plugins can each serve different entities concurrently - there is no "first wins" conflict
+  because each plugin only handles requests for its own entities.
 - **Custom routes**: All plugins can register endpoints (use unique path prefixes)
+
+Entity Ownership
+~~~~~~~~~~~~~~~~
+
+DataProvider, OperationProvider, and FaultProvider use an entity ownership model to
+route requests to the correct plugin.
+
+- ``IntrospectionProvider::introspect()`` determines ownership: entities returned in a
+  plugin's ``IntrospectionResult::new_entities`` are owned by that plugin.
+- Entity ownership is refreshed periodically during cache updates (each discovery cycle
+  re-evaluates ``introspect()`` results from all plugins).
+- The gateway maintains an internal map from entity ID to the plugin that created it.
+- When a data, operation, or fault request arrives for an entity, the handler looks up
+  the owning plugin and delegates to its corresponding provider. Entities not owned by
+  any plugin fall through to the default gateway behavior.
+
+This model allows multiple plugins to coexist without conflict - each plugin manages
+its own entities independently.
 
 Graph Provider Plugin (ros2_medkit_graph_provider)
 ---------------------------------------------------
@@ -750,7 +898,7 @@ Alternatively, simply do not install the ``ros2_medkit_graph_provider`` package 
 Error Handling
 --------------
 
-If a plugin throws during any lifecycle method (``configure``, ``set_context``, ``register_routes``,
+If a plugin throws during any lifecycle method (``configure``, ``set_context``, ``get_routes``,
 ``shutdown``), the exception is caught and logged. The plugin is disabled but the gateway continues
 operating. A failing plugin never crashes the gateway.
 
@@ -761,7 +909,7 @@ Plugins export ``plugin_api_version()`` which must return the gateway's ``PLUGIN
 If the version does not match, the plugin is rejected with a clear error message suggesting
 a rebuild against matching gateway headers.
 
-The current API version is **4**. It is incremented when the ``PluginContext`` vtable changes
+The current API version is **5**. It is incremented when the ``PluginContext`` vtable changes
 or breaking changes are made to ``GatewayPlugin`` or provider interfaces.
 
 Build Requirements
