@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
+
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
 
 class DoorStatusSensor : public rclcpp::Node {
  public:
@@ -29,10 +32,18 @@ class DoorStatusSensor : public rclcpp::Node {
 
   ~DoorStatusSensor() {
     timer_->cancel();
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    timer_.reset();
+    is_open_pub_.reset();
+    state_pub_.reset();
   }
 
  private:
   void publish_data() {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!is_open_pub_) {
+      return;
+    }
     // Toggle door state
     is_open_ = !is_open_;
 
@@ -47,6 +58,7 @@ class DoorStatusSensor : public rclcpp::Node {
     RCLCPP_INFO(this->get_logger(), "Door: %s", state_msg.data.c_str());
   }
 
+  std::mutex callback_mutex_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr is_open_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr state_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
@@ -54,8 +66,7 @@ class DoorStatusSensor : public rclcpp::Node {
 };
 
 int main(int argc, char ** argv) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<DoorStatusSensor>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<DoorStatusSensor>();
+  });
 }

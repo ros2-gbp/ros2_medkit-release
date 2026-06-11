@@ -32,7 +32,7 @@
 #include <rclcpp/rclcpp.hpp>
 
 // Detect whether rclcpp::GenericClient is available.
-// rclcpp/version.h exists in all supported distros (Humble, Jazzy, Rolling).
+// rclcpp/version.h exists in all supported distros (Humble, Jazzy, Lyrical).
 #include <rclcpp/version.h>
 
 #if defined(RCLCPP_VERSION_MAJOR) && RCLCPP_VERSION_MAJOR >= 21
@@ -206,6 +206,7 @@ class GenericServiceClient : public rclcpp::ClientBase {
     FutureAndRequestId(Future f, int64_t id) : future(std::move(f)), request_id(id) {
     }
 
+    ~FutureAndRequestId() = default;
     FutureAndRequestId(FutureAndRequestId && other) noexcept = default;
     FutureAndRequestId & operator=(FutureAndRequestId && other) noexcept = default;
     FutureAndRequestId(const FutureAndRequestId &) = delete;
