@@ -32,6 +32,17 @@ using ros2_medkit_gateway::PLUGIN_API_VERSION;
 using ros2_medkit_gateway::PluginContext;
 using ros2_medkit_gateway::SovdEntityType;
 
+TopicBeaconPlugin::~TopicBeaconPlugin() noexcept {
+  // On Lyrical (originally observed on Rolling), ~rclcpp::Subscription can throw
+  // graph_listener::NodeNotFoundError once rclcpp::shutdown() has invalidated
+  // the context. An exception escaping a destructor calls std::terminate(),
+  // so swallow it here.
+  try {
+    shutdown();
+  } catch (...) {
+  }
+}
+
 std::string TopicBeaconPlugin::name() const {
   return "topic_beacon";
 }
@@ -78,7 +89,7 @@ void TopicBeaconPlugin::configure(const nlohmann::json & config) {
 }
 
 void TopicBeaconPlugin::set_context(PluginContext & context) {
-  ctx_ = &context;
+  ctx_ = as_ros_plugin_context(context);
   auto node = ctx_->node();
 
   // Ensure store_ exists even if configure() was not called
@@ -100,37 +111,43 @@ void TopicBeaconPlugin::set_context(PluginContext & context) {
 }
 
 void TopicBeaconPlugin::shutdown() {
-  subscription_.reset();
-}
-
-std::vector<GatewayPlugin::RouteDescription> TopicBeaconPlugin::get_route_descriptions() const {
-  return {
-      {"GET", "apps/{app_id}/x-medkit-topic-beacon"},
-      {"GET", "components/{component_id}/x-medkit-topic-beacon"},
-  };
-}
-
-void TopicBeaconPlugin::register_routes(httplib::Server & server, const std::string & api_prefix) {
-  // Register beacon metadata endpoint for apps and components
-  for (const auto & entity_type : {"apps", "components"}) {
-    auto pattern = api_prefix + "/" + entity_type + R"(/([^/]+)/x-medkit-topic-beacon)";
-    server.Get(pattern.c_str(), [this](const httplib::Request & req, httplib::Response & res) {
-      auto entity_id = req.matches[1].str();
-
-      auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
-      if (!entity) {
-        return;
-      }
-
-      auto stored = store_->get(entity_id);
-      if (!stored) {
-        PluginContext::send_error(res, 404, "x-medkit-beacon-not-found", "No beacon data for entity");
-        return;
-      }
-
-      PluginContext::send_json(res, ros2_medkit_beacon::build_beacon_response(entity_id, *stored));
-    });
+  if (shutdown_requested_.exchange(true)) {
+    return;
   }
+  // ~rclcpp::Subscription can throw on Lyrical (and Rolling) when the rclcpp
+  // context was torn down before us; swallow so plugin_manager shutdown and
+  // the plugin destructor calling back into us do not abort the process.
+  try {
+    subscription_.reset();
+  } catch (...) {
+  }
+}
+
+std::vector<GatewayPlugin::PluginRoute> TopicBeaconPlugin::get_routes() {
+  std::vector<GatewayPlugin::PluginRoute> routes;
+  // Register beacon metadata endpoint for apps and components
+  for (const auto * entity_type : {"apps", "components"}) {
+    std::string pattern = std::string(entity_type) + R"(/([^/]+)/x-medkit-topic-beacon)";
+    routes.push_back(
+        {"GET", pattern,
+         [this](const ros2_medkit_gateway::PluginRequest & req, ros2_medkit_gateway::PluginResponse & res) {
+           auto entity_id = req.path_param(1);
+
+           auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
+           if (!entity) {
+             return;
+           }
+
+           auto stored = store_->get(entity_id);
+           if (!stored) {
+             res.send_error(404, "x-medkit-beacon-not-found", "No beacon data for entity");
+             return;
+           }
+
+           res.send_json(ros2_medkit_beacon::build_beacon_response(entity_id, *stored));
+         }});
+  }
+  return routes;
 }
 
 IntrospectionResult TopicBeaconPlugin::introspect(const IntrospectionInput & input) {
@@ -156,6 +173,9 @@ IntrospectionResult TopicBeaconPlugin::introspect(const IntrospectionInput & inp
 }
 
 void TopicBeaconPlugin::on_beacon(const ros2_medkit_msgs::msg::MedkitDiscoveryHint::SharedPtr & msg) {
+  if (shutdown_requested_.load()) {
+    return;
+  }
   // Rate limiting
   if (!rate_limiter_.try_consume()) {
     return;  // drop silently

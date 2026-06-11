@@ -40,6 +40,8 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <thread>
 
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
+
 class LongCalibrationAction : public rclcpp::Node {
  public:
   using Fibonacci = example_interfaces::action::Fibonacci;
@@ -62,6 +64,10 @@ class LongCalibrationAction : public rclcpp::Node {
       execution_thread_.join();
     }
     action_server_.reset();
+  }
+
+  ~LongCalibrationAction() {
+    prepare_shutdown();
   }
 
  private:
@@ -122,7 +128,8 @@ class LongCalibrationAction : public rclcpp::Node {
         }
 
         // Compute next Fibonacci number (simulating calibration step)
-        sequence.push_back(sequence[i] + sequence[i - 1]);
+        auto idx = static_cast<size_t>(i);
+        sequence.push_back(sequence[idx] + sequence[idx - 1]);
 
         // Publish feedback
         goal_handle->publish_feedback(feedback);
@@ -154,12 +161,7 @@ int main(int argc, char * argv[]) {
   std::set_terminate([]() {
     _exit(0);
   });
-
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<LongCalibrationAction>();
-  rclcpp::spin(node);
-  node->prepare_shutdown();
-  node.reset();
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<LongCalibrationAction>();
+  });
 }

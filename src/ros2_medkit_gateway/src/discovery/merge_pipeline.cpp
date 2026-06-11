@@ -14,10 +14,12 @@
 
 #include "ros2_medkit_gateway/discovery/merge_pipeline.hpp"
 
-#include "ros2_medkit_gateway/discovery/layers/runtime_layer.hpp"
-#include "ros2_medkit_gateway/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cassert>
+#include <set>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -93,9 +95,7 @@ void merge_bool(bool & target, bool source, MergeWinner winner) {
       break;
     case MergeWinner::BOTH:
       // OR semantics: once true, stays true. This is intentional for status flags
-      // like is_online (any layer reporting online = online). For classification
-      // bools like external, an incorrect true from a lower layer is sticky -
-      // use AUTHORITATIVE policy on the correcting layer to override.
+      // like is_online (any layer reporting online = online).
       target = target || source;
       break;
     case MergeWinner::TARGET:
@@ -186,6 +186,8 @@ void apply_field_group_merge(Entity & target, const Entity & source, FieldGroup 
       case FieldGroup::METADATA:
         merge_scalar(target.source, source.source, res.scalar);
         break;
+      case FieldGroup::LIVE_DATA:
+      case FieldGroup::STATUS:
       default:
         break;
     }
@@ -223,6 +225,7 @@ void apply_field_group_merge(Entity & target, const Entity & source, FieldGroup 
         merge_scalar(target.source, source.source, res.scalar);
         merge_scalar(target.variant, source.variant, res.scalar);
         break;
+      case FieldGroup::STATUS:
       default:
         break;
     }
@@ -256,11 +259,15 @@ void apply_field_group_merge(Entity & target, const Entity & source, FieldGroup 
       case FieldGroup::STATUS:
         merge_bool(target.is_online, source.is_online, res.scalar);
         merge_optional(target.bound_fqn, source.bound_fqn, res.scalar);
-        merge_bool(target.external, source.external, res.scalar);
         break;
       case FieldGroup::METADATA:
         merge_scalar(target.source, source.source, res.scalar);
         merge_optional(target.ros_binding, source.ros_binding, res.scalar);
+        // Use scalar semantics (not OR) - external is a classification, not a status flag
+        if (res.scalar == MergeWinner::SOURCE) {
+          target.external = source.external;
+        }
+        // TARGET and BOTH: keep target value (no OR semantics)
         break;
     }
   } else if constexpr (std::is_same_v<Entity, Function>) {
@@ -278,6 +285,8 @@ void apply_field_group_merge(Entity & target, const Entity & source, FieldGroup 
       case FieldGroup::METADATA:
         merge_scalar(target.source, source.source, res.scalar);
         break;
+      case FieldGroup::LIVE_DATA:
+      case FieldGroup::STATUS:
       default:
         break;
     }
@@ -414,14 +423,14 @@ MergeResult MergePipeline::execute() {
       continue;
     }
 
-    // Collect gap-fill filtering stats from RuntimeLayer
-    auto * runtime_layer = dynamic_cast<RuntimeLayer *>(layers_[i].get());
-    if (runtime_layer) {
-      report.filtered_by_gap_fill += runtime_layer->last_filtered_count();
-    }
-    // Save runtime apps for the linker BEFORE they are moved into app_layers below.
-    if (runtime_layer || layers_[i]->provides_runtime_apps()) {
-      runtime_apps = output.apps;
+    // Collect gap-fill filtering stats (virtual dispatch, no dynamic_cast)
+    report.filtered_by_gap_fill += layers_[i]->filtered_count();
+
+    // Save runtime apps for the linker. Use get_linking_apps() which returns
+    // the unfiltered set - gap-fill may exclude apps from output.apps, but
+    // the linker needs all runtime apps to bind manifest apps to live nodes.
+    if (layers_[i]->provides_runtime_apps()) {
+      runtime_apps = layers_[i]->get_linking_apps();
     }
 
     if (!output.areas.empty()) {
@@ -437,7 +446,7 @@ MergeResult MergePipeline::execute() {
       function_layers.emplace_back(i, std::move(output.functions));
     }
     // entity_metadata is not consumed here - plugins serve their metadata
-    // as SOVD vendor extension resources via register_routes() and register_capability().
+    // as SOVD vendor extension resources via get_routes() and register_capability().
   }
 
   MergeResult result;
@@ -478,6 +487,131 @@ MergeResult MergePipeline::execute() {
 
     linking_result_ = linker_->get_last_result();
     result.linking_result = linking_result_;
+
+    // Suppress runtime-origin entities that duplicate manifest entities (#307)
+    // In hybrid mode with a manifest, the manifest is the source of truth for entity
+    // structure. Heuristic entities from runtime discovery should be suppressed when
+    // their namespace is covered by manifest entities or linked apps.
+    //
+    // Suppression strategy (intentionally asymmetric):
+    // - Components/Areas: suppressed by NAMESPACE match. If any manifest app is linked
+    //   in a namespace (including "/"), all heuristic components/areas in that namespace
+    //   are removed. This means the manifest "takes over" the namespace entirely.
+    // - Apps: suppressed by ID match. Only heuristic apps whose ID matches a linked
+    //   manifest app are removed. Gap-fill apps (new nodes not in manifest) survive
+    //   regardless of namespace, since they fill intentional manifest gaps.
+
+    // Build set of namespaces covered by linked manifest apps
+    std::set<std::string> linked_namespaces;
+    for (const auto & [fqn, app_id] : linking_result_.node_to_app) {
+      std::string clean_fqn = fqn;
+      // Strip trailing slash if present (defensive - ROS 2 normalizes FQNs)
+      if (clean_fqn.size() > 1 && clean_fqn.back() == '/') {
+        clean_fqn.pop_back();
+      }
+      auto last_slash = clean_fqn.rfind('/');
+      if (last_slash != std::string::npos && last_slash > 0) {
+        linked_namespaces.insert(clean_fqn.substr(0, last_slash));
+      } else if (last_slash == 0) {
+        // Root namespace node (e.g., /fault_manager) - include "/" as covered
+        linked_namespaces.insert("/");
+      }
+    }
+
+    // Also track manifest component/area namespaces directly
+    std::set<std::string> manifest_comp_ns;
+    for (const auto & comp : result.components) {
+      if (comp.source == "manifest" && !comp.namespace_path.empty()) {
+        manifest_comp_ns.insert(comp.namespace_path);
+      }
+    }
+    std::set<std::string> manifest_area_ns;
+    for (const auto & area : result.areas) {
+      if (area.source == "manifest" && !area.namespace_path.empty()) {
+        manifest_area_ns.insert(area.namespace_path);
+      }
+    }
+
+    // Build set of orphan FQNs for policy-based filtering
+    std::set<std::string> orphan_fqns(linking.orphan_nodes.begin(), linking.orphan_nodes.end());
+
+    // Remove heuristic apps based on unmanifested_nodes policy and linking results.
+    std::set<std::string> manifest_app_ids;
+    for (const auto & app : result.apps) {
+      if (app.source == "manifest") {
+        manifest_app_ids.insert(app.id);
+      }
+    }
+    std::set<std::string> linked_app_ids(manifest_app_ids);
+    for (const auto & [fqn, app_id] : linking_result_.node_to_app) {
+      linked_app_ids.insert(app_id);
+    }
+
+    bool hide_orphans = manifest_config_.unmanifested_nodes == ManifestConfig::UnmanifestedNodePolicy::IGNORE;
+
+    auto app_it = std::remove_if(result.apps.begin(), result.apps.end(), [&](const App & app) {
+      // Whitelist: manifest and plugin sources are always preserved
+      if (is_protected_source(app.source)) {
+        return false;
+      }
+      // Suppress non-protected apps whose ID matches a linked manifest app (dedup)
+      if (linked_app_ids.count(app.id) > 0) {
+        return true;
+      }
+      // When unmanifested_nodes=ignore, suppress all non-linked, non-protected apps.
+      // This covers heuristic, topic, synthetic, node, runtime, and any other source.
+      if (hide_orphans) {
+        return true;
+      }
+      return false;
+    });
+    result.apps.erase(app_it, result.apps.end());
+
+    // Also collect orphan namespaces for component/area suppression
+    std::set<std::string> orphan_namespaces;
+    if (hide_orphans) {
+      for (const auto & fqn : orphan_fqns) {
+        auto last_slash = fqn.rfind('/');
+        if (last_slash != std::string::npos && last_slash > 0) {
+          orphan_namespaces.insert(fqn.substr(0, last_slash));
+        }
+      }
+    }
+
+    // Remove non-protected components whose namespace is covered by manifest or orphan suppression
+    auto comp_it = std::remove_if(result.components.begin(), result.components.end(), [&](const Component & comp) {
+      if (is_protected_source(comp.source)) {
+        return false;
+      }
+      if (manifest_comp_ns.count(comp.namespace_path) > 0 || linked_namespaces.count(comp.namespace_path) > 0) {
+        return true;
+      }
+      // When hiding orphans, also suppress components from orphan-only namespaces
+      if (hide_orphans && orphan_namespaces.count(comp.namespace_path) > 0) {
+        return true;
+      }
+      return false;
+    });
+    result.components.erase(comp_it, result.components.end());
+
+    // Remove non-protected areas whose namespace is covered
+    auto area_it = std::remove_if(result.areas.begin(), result.areas.end(), [&](const Area & area) {
+      if (is_protected_source(area.source)) {
+        return false;
+      }
+      if (manifest_area_ns.count(area.namespace_path) > 0 || linked_namespaces.count(area.namespace_path) > 0) {
+        return true;
+      }
+      if (hide_orphans && orphan_namespaces.count(area.namespace_path) > 0) {
+        return true;
+      }
+      return false;
+    });
+    result.areas.erase(area_it, result.areas.end());
+
+    // Recount after suppression
+    report.total_entities =
+        result.areas.size() + result.components.size() + result.apps.size() + result.functions.size();
   }
 
   RCLCPP_INFO(logger_, "MergePipeline: %zu entities from %zu layers, %zu enriched, %zu conflicts",
