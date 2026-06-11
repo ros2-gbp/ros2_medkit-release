@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <diagnostic_msgs/msg/key_value.hpp>
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <ros2_medkit_msgs/msg/medkit_discovery_hint.hpp>
 
@@ -21,6 +22,8 @@
 #include <chrono>
 #include <string>
 #include <vector>
+
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
 
 class BeaconPublisher : public rclcpp::Node {
  public:
@@ -45,8 +48,19 @@ class BeaconPublisher : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "BeaconPublisher started on '%s' at %.1f Hz", topic.c_str(), rate_hz);
   }
 
+  ~BeaconPublisher() {
+    timer_->cancel();
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    timer_.reset();
+    publisher_.reset();
+  }
+
  private:
   void publish_beacon() {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!publisher_) {
+      return;
+    }
     if (get_parameter("beacon_pause").as_bool()) {
       return;
     }
@@ -66,13 +80,13 @@ class BeaconPublisher : public rclcpp::Node {
     publisher_->publish(msg);
   }
 
+  std::mutex callback_mutex_;
   rclcpp::Publisher<ros2_medkit_msgs::msg::MedkitDiscoveryHint>::SharedPtr publisher_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
 int main(int argc, char * argv[]) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<BeaconPublisher>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, []() -> std::shared_ptr<rclcpp::Node> {
+    return std::make_shared<BeaconPublisher>();
+  });
 }

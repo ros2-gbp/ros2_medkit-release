@@ -25,7 +25,7 @@ Server Capabilities
 
       {
         "name": "ROS 2 Medkit Gateway",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "api_base": "/api/v1",
         "endpoints": [
           "GET /api/v1/health",
@@ -49,9 +49,21 @@ Server Capabilities
           "triggers": true,
           "updates": false,
           "authentication": false,
-          "tls": false
+          "tls": false,
+          "aggregation": false
         }
       }
+
+   The ``capabilities.aggregation`` flag is ``true`` when the aggregation
+   subsystem is enabled on this gateway (i.e. ``aggregation.enabled=true``
+   in config, which wires up an ``AggregationManager``). It does NOT
+   require peers to be present - a gateway with aggregation enabled but
+   zero peers still reports ``true`` and still emits the
+   aggregation-only response fields (``peers``, which may be an empty
+   array, and ``warnings`` on ``/health``; ``x-medkit.contributors`` on
+   entities, which will contain only ``"local"`` until a peer
+   contributes). Clients can feature-detect those fields using this
+   flag instead of probing for field presence.
 
 ``GET /api/v1/version-info``
    Get gateway version and status information.
@@ -66,7 +78,7 @@ Server Capabilities
             "version": "1.0.0",
             "base_uri": "/api/v1",
             "vendor_info": {
-              "version": "0.4.0",
+              "version": "0.5.0",
               "name": "ros2_medkit"
             }
           }
@@ -75,6 +87,80 @@ Server Capabilities
 
 ``GET /api/v1/health``
    Health check endpoint. Returns HTTP 200 if gateway is operational.
+
+   When aggregation is enabled (``capabilities.aggregation == true`` in
+   the root response), the body includes additional x-medkit extension
+   fields:
+
+   - ``peers`` - array of peer status objects (URL, name, reachability,
+     last-seen timestamp) for every configured or discovered peer.
+   - ``warnings`` - array of structured operator-actionable aggregation
+     warnings (always present when aggregation is active; empty when
+     there are no active anomalies). Each warning carries ``code``,
+     ``message``, ``entity_ids``, and ``peer_names``. See
+     :doc:`warning_codes` for the stable list of codes.
+   - ``warning_schema_version`` - integer contract version for the
+     ``warnings`` array. Clients key on this instead of string-matching
+     codes. See :doc:`warning_codes` ``Schema versioning``.
+
+   The body also always includes two subscription-pool vendor-extension
+   sections, populated from atomic reads so ``/health`` never blocks even
+   when the sampling pool is under load:
+
+   - ``x-medkit-subscription-executor`` - state of the single-writer
+     worker that owns the pool's subscription node. Fields:
+     ``worker_alive``, ``degraded``, ``queue_depth``,
+     ``queue_max_depth_observed``, ``queue_dropped``, ``tasks_completed``,
+     ``tasks_failed``, ``last_task_latency_us``, ``max_task_latency_us``,
+     ``current_task_age_ms``, ``watchdog_trips``, ``graph_events_received``.
+     External monitors (k8s liveness, Docker HEALTHCHECK, systemd watchdog)
+     should page on ``degraded == true``.
+   - ``x-medkit-data-provider`` - pool-level counters: ``pool_size``,
+     ``pool_cap``, ``pool_hits``, ``pool_misses``, ``evictions_total``,
+     ``type_change_events``, ``graph_events_received``,
+     ``concurrent_cold_waits``.
+
+   See :doc:`/design/ros2_medkit_gateway/ros2_subscription_architecture`
+   for the underlying pool design that produces these counters.
+
+   .. note::
+
+      Security: ``/health`` is currently reachable without
+      authentication by default (``auth.enabled`` defaults to
+      ``false``), and even with auth enabled the endpoint is readable
+      by the ``viewer``, ``operator``, and ``configurator`` roles. The
+      ``peers`` array enumerates every configured peer's name and URL,
+      which reveals deployment topology. This is by design for
+      operator observability in trusted LANs, but on shared-infra or
+      multi-tenant installs you should front the endpoint with an
+      authenticating reverse proxy or restrict the peer-name field to
+      admin-gated callers at the ingress.
+
+   **Example Response (aggregation enabled, one leaf collision):**
+
+   .. code-block:: json
+
+      {
+        "status": "healthy",
+        "timestamp": 1776185189048036615,
+        "discovery": {
+          "mode": "hybrid",
+          "strategy": "hybrid_discovery"
+        },
+        "peers": [
+          {"name": "peer_b", "url": "http://peer-b:8080", "healthy": true},
+          {"name": "peer_c", "url": "http://peer-c:8080", "healthy": true}
+        ],
+        "warning_schema_version": 1,
+        "warnings": [
+          {
+            "code": "leaf_id_collision",
+            "message": "Component 'ecu-x' is announced by multiple peers (peer_b, peer_c); routing falls back to last-writer-wins which is non-deterministic. Resolve by renaming the Component on one side or by modelling it as a hierarchical parent (declare a child Component with parentComponentId='ecu-x' on the owning peer).",
+            "entity_ids": ["ecu-x"],
+            "peer_names": ["peer_b", "peer_c"]
+          }
+        ]
+      }
 
 Discovery Endpoints
 -------------------
@@ -185,6 +271,49 @@ Apps
         },
         "_links": {
           "self": "/api/v1/apps/engine-temp-sensor/is-located-on",
+          "app": "/api/v1/apps/engine-temp-sensor"
+        }
+      }
+
+   Unknown apps return ``404 App not found`` with ``parameters.app_id``.
+
+``GET /api/v1/apps/{app_id}/belongs-to``
+   Return the area that contains this app via its parent component.
+
+   Per SOVD (ISO 17978-3 §7.6), the corresponding
+   ``belongs-to`` URI reference in ``GET /apps/{app_id}`` is only emitted when
+   the app has a parent component (i.e. is not standalone). Standalone apps do
+   not expose this subresource in HATEOAS and the endpoint will return an empty
+   ``items`` collection if called directly.
+
+   The response follows the standard ``items`` wrapper and returns:
+
+   - ``0`` items when the app has no associated host component (standalone app)
+   - ``0`` items when the parent component has no assigned area
+   - ``1`` item when the area is resolved
+   - ``1`` item with ``x-medkit.missing=true`` when the parent component references
+     an area that cannot currently be resolved
+   - ``1`` item with ``x-medkit.missing=true`` and ``x-medkit.unresolved_component``
+     set to the dangling component id when the app references a parent component
+     that cannot currently be resolved (manifest broken / component removed)
+
+   **Example Response:**
+
+   .. code-block:: json
+
+      {
+        "items": [
+          {
+            "id": "engine",
+            "name": "Engine",
+            "href": "/api/v1/areas/engine"
+          }
+        ],
+        "x-medkit": {
+          "total_count": 1
+        },
+        "_links": {
+          "self": "/api/v1/apps/engine-temp-sensor/belongs-to",
           "app": "/api/v1/apps/engine-temp-sensor"
         }
       }
@@ -452,14 +581,13 @@ Manage ROS 2 node parameters.
       {
         "items": [
           {
+            "id": "publish_rate",
             "name": "publish_rate",
-            "value": 10.0,
-            "type": "double",
-            "description": "Publishing rate in Hz"
+            "type": "double"
           },
           {
+            "id": "sensor_id",
             "name": "sensor_id",
-            "value": "sensor_001",
             "type": "string"
           }
         ],
@@ -486,7 +614,7 @@ Manage ROS 2 node parameters.
 
       curl -X PUT http://localhost:8080/api/v1/components/temp_sensor/configurations/publish_rate \
         -H "Content-Type: application/json" \
-        -d '{"value": 20.0}'
+        -d '{"data": 20.0}'
 
 ``DELETE /api/v1/components/{id}/configurations/{param_name}``
    Reset parameter to default value.
@@ -509,6 +637,23 @@ Query and manage faults.
 
    Faults are reported by ROS 2 nodes via the FaultReporter library, not via REST API.
    The gateway queries faults from the ros2_medkit_fault_manager node.
+
+.. note::
+
+   **Per-entity fault scope (``/{entity-path}/faults`` routes).** The gateway keys
+   faults by ``fault_code`` only, and a fault's ``reporting_sources`` set is the
+   union of every app that has reported that code. Per-entity routes apply a
+   strict all-sources scope check: a fault is in scope for an entity iff **every**
+   entry in ``reporting_sources`` is an app owned by that entity (exact FQN
+   match, or strict path-child).
+
+   This means a ``fault_code`` reported by apps in two different entities
+   (for example ``SENSOR_TIMEOUT`` reported by both the lidar and the
+   temperature sensor app) is **not** visible or clearable through either
+   entity's per-entity routes - per-fault routes return ``404``, collection
+   responses omit it, and per-entity ``DELETE`` skips it. To see, list, or
+   clear such shared faults use the global ``GET /api/v1/faults`` /
+   ``DELETE /api/v1/faults`` routes.
 
 ``GET /api/v1/faults``
    List all faults across the system.
@@ -622,11 +767,17 @@ Query and manage faults.
    - ``freeze_frame``: Topic data captured at fault confirmation
    - ``rosbag``: Recording file available via bulk-data endpoint
 
+   **Response codes:**
+
+   - **200:** Fault details
+   - **404:** Fault not found, or reported by an app outside this entity's scope
+   - **503:** Fault manager unavailable
+
 ``DELETE /api/v1/components/{id}/faults/{fault_code}``
    Clear a fault.
 
    - **204:** Fault cleared
-   - **404:** Fault not found
+   - **404:** Fault not found, or reported by an app outside this entity's scope
 
 ``DELETE /api/v1/components/{id}/faults``
    Clear all faults for an entity.
@@ -652,7 +803,8 @@ Logs Endpoints
 --------------
 
 Query and configure the /rosout ring buffer for an entity. Supported entity types:
-**areas** (namespace prefix match), **components** (namespace prefix match), **apps** (exact FQN match),
+**areas** (aggregated from hosted apps, namespace prefix fallback), **components** (aggregated from
+hosted apps, namespace prefix fallback for manifest-only deployments), **apps** (exact FQN match),
 and **functions** (aggregated from hosted apps).
 
 .. note::
@@ -663,7 +815,13 @@ and **functions** (aggregated from hosted apps).
    storage backend or take full ownership of the log pipeline (see plugin development docs).
 
 ``GET /api/v1/components/{id}/logs``
-   Query log entries for all nodes in the component namespace (prefix match).
+   Query log entries aggregated from the component's hosted apps. Resolves child apps via
+   the entity cache and queries each by exact FQN. Falls back to namespace prefix match only
+   when the component has no hosted apps but declares a non-empty namespace (manifest-only
+   deployments where the component groups topics rather than nodes). The response always
+   carries ``x-medkit.aggregation_level=component`` and ``aggregated=true``; the
+   ``app_count`` and ``aggregation_sources`` fields are populated only when hosted-app
+   aggregation is active and are omitted under the namespace-prefix fallback.
 
 ``GET /api/v1/apps/{id}/logs``
    Query log entries for the specific app node (exact match).
@@ -1073,10 +1231,24 @@ Without such a plugin, all endpoints return ``501 Not Implemented``.
         "sub_progress": [
           {"name": "download", "progress": 100},
           {"name": "verify", "progress": 30}
-        ]
+        ],
+        "x-medkit": {
+          "phase": "preparing"
+        }
       }
 
    **Status values:** ``pending``, ``inProgress``, ``completed``, ``failed``
+
+   A successful ``POST /api/v1/updates`` seeds a ``pending`` status for the package,
+   so this endpoint returns ``200`` with ``{"status": "pending", "x-medkit": {"phase": "none"}}``
+   immediately after registration, before any ``prepare`` or ``execute`` call.
+
+   **Vendor extension ``x-medkit.phase``** (non-standard, SOVD-compatible):
+   ``none``, ``preparing``, ``prepared``, ``executing``, ``executed``,
+   ``failed``, ``deleting``. Differentiates "prepare completed" (``status``
+   ``completed`` + ``x-medkit.phase`` ``prepared``) from "execute completed"
+   (``status`` ``completed`` + ``x-medkit.phase`` ``executed``). Clients that
+   only consume the standard ``status`` field continue to work unchanged.
 
    When ``status`` is ``failed``, an ``error`` object is included:
 
@@ -1090,7 +1262,7 @@ Without such a plugin, all endpoints return ``501 Not Implemented``.
         }
       }
 
-   - **404 Not Found:** No status available (package not found or no operation started)
+   - **404 Not Found:** Package is not registered
 
 Cyclic Subscriptions
 --------------------
@@ -2078,6 +2250,36 @@ Common Error Codes
    * - ``ERR_FORBIDDEN``
      - 403
      - Insufficient permissions for this operation
+   * - ``x-medkit-plugin-error``
+     - 400-599
+     - Plugin provider returned an error. Status varies by plugin. Message truncated to 512 chars.
+   * - ``x-medkit-gateway-shutdown``
+     - 503
+     - Gateway is in the process of shutting down. **Do not retry against the same
+       gateway instance** - the process is going away. Clients should fail over to
+       another gateway or surface the outage to the operator.
+   * - ``x-medkit-subscribe-failed``
+     - 500
+     - Could not create the underlying ROS 2 subscription (rcl error during slot
+       creation). Transient: retry once after a short backoff. Persistent failure
+       usually indicates a publisher type mismatch or a missing IDL package.
+   * - ``x-medkit-cold-wait-cap-exceeded``
+     - 503
+     - Too many concurrent /data callers are waiting on cold (publisher-but-no-data)
+       topics. Retry with exponential backoff. ``params.cold_wait_cap`` carries the
+       configured cap. Tune via ``data_provider.cold_wait_cap`` and
+       ``data_provider.max_parallel_samples`` if this fires under normal load.
+
+Plugin Entity Delegation
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Entities created by gateway plugins (via ``IntrospectionProvider``) have their
+data, operations, and faults requests transparently routed to the owning plugin's
+``DataProvider``, ``OperationProvider``, or ``FaultProvider``. The response format
+is determined by the plugin. If the plugin returns an error, the response uses the
+``x-medkit-plugin-error`` vendor code with an ``entity_id`` parameter identifying
+the affected entity. See :doc:`/tutorials/plugin-system` for details on per-entity
+provider routing.
 
 URL Encoding
 ------------
@@ -2193,12 +2395,41 @@ Other extensions beyond SOVD:
 
 - Vendor extension fields using ``x-medkit`` prefix (per SOVD extension mechanism)
 - ``DELETE /faults`` - Clear all faults globally
-- ``GET /faults/stream`` - SSE real-time fault notifications
+- ``GET /faults/stream`` - SSE real-time fault notifications. Each event payload carries an
+  optional ``x-medkit`` SOVD payload-extension object with ``entity_type`` and ``entity_id``
+  fields when the gateway can resolve the fault's first reporting source back to an entity,
+  so consumers can hit ``/{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}`` directly
+  without enumerating entities. Resolution is snapshotted at event arrival; the entire
+  ``x-medkit`` object is omitted when no entity can be resolved.
 - ``/health`` - Health check with discovery pipeline diagnostics
 - ``/version-info`` - Gateway version information
 - ``/docs`` - OpenAPI capability description
 - SSE fault streaming - Real-time fault notifications
 - ``x-medkit`` extension fields in responses
+
+**Cross-Gateway Resource Aggregation:**
+
+When aggregation is enabled, per-entity resource collection endpoints perform
+real-time fan-out to peer gateways. The affected endpoints are: data,
+operations, faults, configurations, logs, and the global ``GET /api/v1/faults``
+endpoint. The gateway sends the same request to all healthy peers, merges their
+``items`` arrays into the local response, and returns the combined result.
+
+If some peer requests fail during fan-out (peer unreachable or non-2xx
+response), the response includes vendor metadata indicating partial results:
+
+.. code-block:: json
+
+   {
+     "items": [],
+     "x-medkit": {
+       "partial": true,
+       "failed_peers": ["secondary_gateway"]
+     }
+   }
+
+When all peers respond successfully, these fields are omitted. See the
+:doc:`aggregation configuration guide </config/aggregation>` for setup details.
 
 Capability Description (OpenAPI Docs)
 --------------------------------------
