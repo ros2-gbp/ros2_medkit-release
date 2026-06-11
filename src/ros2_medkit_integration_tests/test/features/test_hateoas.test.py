@@ -61,7 +61,7 @@ class TestHateoas(GatewayTestCase):
 
     MIN_EXPECTED_APPS = 8
     REQUIRED_AREAS = {'powertrain', 'chassis', 'body'}
-    REQUIRED_APPS = {'temp_sensor'}
+    REQUIRED_APPS = {'engine-temp-sensor'}
 
     # ------------------------------------------------------------------
     # List hrefs (test_70-72)
@@ -167,11 +167,11 @@ class TestHateoas(GatewayTestCase):
 
         @verifies REQ_INTEROP_003
         """
-        data = self.get_json('/apps/temp_sensor')
+        data = self.get_json('/apps/engine-temp-sensor')
 
         # Verify required fields
         self.assertIn('id', data)
-        self.assertEqual(data['id'], 'temp_sensor')
+        self.assertEqual(data['id'], 'engine-temp-sensor')
         self.assertIn('name', data)
 
         # Verify SOVD capability URIs at top level
@@ -180,7 +180,7 @@ class TestHateoas(GatewayTestCase):
         self.assertIn('configurations', data, 'App should have configurations URI')
 
         # Verify URIs are correct format
-        base = '/api/v1/apps/temp_sensor'
+        base = '/api/v1/apps/engine-temp-sensor'
         self.assertEqual(data['data'], f'{base}/data')
         self.assertEqual(data['operations'], f'{base}/operations')
         self.assertEqual(data['configurations'], f'{base}/configurations')
@@ -238,10 +238,12 @@ class TestHateoas(GatewayTestCase):
     def test_subareas_list_has_href(self):
         """GET /areas/{id}/subareas returns items with href field.
 
+        Uses 'powertrain' area which has subareas defined in the manifest.
+
         @verifies REQ_INTEROP_004
         """
         response = requests.get(
-            f'{self.BASE_URL}/areas/root/subareas',
+            f'{self.BASE_URL}/areas/powertrain/subareas',
             timeout=10
         )
         self.assertEqual(response.status_code, 200)
@@ -292,10 +294,12 @@ class TestHateoas(GatewayTestCase):
     def test_contains_list_has_href(self):
         """GET /areas/{id}/contains returns items with href field.
 
+        Uses 'powertrain' area which contains components in the manifest.
+
         @verifies REQ_INTEROP_006
         """
         response = requests.get(
-            f'{self.BASE_URL}/areas/root/contains',
+            f'{self.BASE_URL}/areas/powertrain/contains',
             timeout=10
         )
         self.assertEqual(response.status_code, 200)
@@ -303,8 +307,8 @@ class TestHateoas(GatewayTestCase):
         data = response.json()
         self.assertIn('items', data)
         self.assertIn('_links', data)
-        self.assertEqual(data['_links']['self'], '/api/v1/areas/root/contains')
-        self.assertEqual(data['_links']['area'], '/api/v1/areas/root')
+        self.assertEqual(data['_links']['self'], '/api/v1/areas/powertrain/contains')
+        self.assertEqual(data['_links']['area'], '/api/v1/areas/powertrain')
 
         for comp in data.get('items', []):
             self.assertIn('id', comp, "Contained component should have 'id'")
@@ -321,7 +325,7 @@ class TestHateoas(GatewayTestCase):
         @verifies REQ_INTEROP_007
         """
         response = requests.get(
-            f'{self.BASE_URL}/components/powertrain/hosts',
+            f'{self.BASE_URL}/components/engine-ecu/hosts',
             timeout=10
         )
         self.assertEqual(response.status_code, 200)
@@ -329,8 +333,8 @@ class TestHateoas(GatewayTestCase):
         data = response.json()
         self.assertIn('items', data)
         self.assertIn('_links', data)
-        self.assertEqual(data['_links']['self'], '/api/v1/components/powertrain/hosts')
-        self.assertEqual(data['_links']['component'], '/api/v1/components/powertrain')
+        self.assertEqual(data['_links']['self'], '/api/v1/components/engine-ecu/hosts')
+        self.assertEqual(data['_links']['component'], '/api/v1/components/engine-ecu')
 
         for app in data.get('items', []):
             self.assertIn('id', app, "Hosted app should have 'id'")
@@ -378,7 +382,7 @@ class TestHateoas(GatewayTestCase):
         @verifies REQ_INTEROP_009
         """
         response = requests.get(
-            f'{self.BASE_URL}/apps/temp_sensor/depends-on',
+            f'{self.BASE_URL}/apps/engine-temp-sensor/depends-on',
             timeout=10
         )
         self.assertEqual(response.status_code, 200)
@@ -386,8 +390,8 @@ class TestHateoas(GatewayTestCase):
         data = response.json()
         self.assertIn('items', data)
         self.assertIn('_links', data)
-        self.assertEqual(data['_links']['self'], '/api/v1/apps/temp_sensor/depends-on')
-        self.assertEqual(data['_links']['app'], '/api/v1/apps/temp_sensor')
+        self.assertEqual(data['_links']['self'], '/api/v1/apps/engine-temp-sensor/depends-on')
+        self.assertEqual(data['_links']['app'], '/api/v1/apps/engine-temp-sensor')
 
         for dep in data.get('items', []):
             self.assertIn('id', dep, "Dependency should have 'id'")
@@ -411,25 +415,24 @@ class TestHateoas(GatewayTestCase):
 
         data = response.json()
         self.assertIn('error_code', data)
-        self.assertEqual(data['message'], 'App not found')
+        # validate_entity_for_route emits the generic Entity not found shape
+        # so the gateway can also forward unknown apps to peers when running
+        # in an aggregation cluster.
+        self.assertEqual(data['message'], 'Entity not found')
         self.assertIn('parameters', data)
-        self.assertIn('app_id', data['parameters'])
-        self.assertEqual(data['parameters'].get('app_id'), 'nonexistent_app')
+        self.assertEqual(data['parameters'].get('entity_id'), 'nonexistent_app')
 
     def test_is_located_on_apps_has_href(self):
         """GET /apps/{id}/is-located-on returns 0-or-1 component hrefs."""
         # @verifies REQ_INTEROP_105
-        response = requests.get(
-            f'{self.BASE_URL}/apps/temp_sensor/is-located-on',
-            timeout=10
-        )
-        self.assertEqual(response.status_code, 200)
+        # poll_endpoint adds retry under sanitizer/CI load - the gateway may
+        # take a moment to discover entities after launch.
+        data = self.poll_endpoint('/apps/engine-temp-sensor/is-located-on')
 
-        data = response.json()
         self.assertIn('items', data)
         self.assertIn('_links', data)
-        self.assertEqual(data['_links']['self'], '/api/v1/apps/temp_sensor/is-located-on')
-        self.assertEqual(data['_links']['app'], '/api/v1/apps/temp_sensor')
+        self.assertEqual(data['_links']['self'], '/api/v1/apps/engine-temp-sensor/is-located-on')
+        self.assertEqual(data['_links']['app'], '/api/v1/apps/engine-temp-sensor')
         self.assertLessEqual(len(data['items']), 1)
 
         if data['items']:
@@ -453,9 +456,87 @@ class TestHateoas(GatewayTestCase):
 
         data = response.json()
         self.assertIn('error_code', data)
-        self.assertEqual(data['message'], 'App not found')
+        self.assertEqual(data['message'], 'Entity not found')
         self.assertIn('parameters', data)
-        self.assertEqual(data['parameters'].get('app_id'), 'nonexistent_app')
+        self.assertEqual(data['parameters'].get('entity_id'), 'nonexistent_app')
+
+    def test_belongs_to_apps_returns_parent_area(self):
+        """GET /apps/{id}/belongs-to returns the parent area via component."""
+        # @verifies REQ_INTEROP_106
+        # poll_endpoint adds retry under sanitizer/CI load.
+        data = self.poll_endpoint('/apps/engine-temp-sensor/belongs-to')
+
+        self.assertIn('items', data)
+        self.assertIn('_links', data)
+        self.assertEqual(data['_links']['self'], '/api/v1/apps/engine-temp-sensor/belongs-to')
+        self.assertEqual(data['_links']['app'], '/api/v1/apps/engine-temp-sensor')
+        self.assertLessEqual(len(data['items']), 1)
+
+        # engine-temp-sensor -> temp-sensor-hw (component) -> engine (area)
+        self.assertEqual(len(data['items']), 1)
+        area = data['items'][0]
+        self.assertEqual(area['id'], 'engine')
+        self.assertIn('name', area)
+        self.assertEqual(area['href'], '/api/v1/areas/engine')
+
+    def test_belongs_to_apps_nonexistent(self):
+        """GET /apps/{id}/belongs-to returns 404 for unknown app."""
+        # @verifies REQ_INTEROP_106
+        response = requests.get(
+            f'{self.BASE_URL}/apps/nonexistent_app/belongs-to',
+            timeout=10
+        )
+        self.assertEqual(response.status_code, 404)
+
+        data = response.json()
+        self.assertIn('error_code', data)
+        self.assertEqual(data['message'], 'Entity not found')
+        self.assertIn('parameters', data)
+        self.assertEqual(data['parameters'].get('entity_id'), 'nonexistent_app')
+
+    # ------------------------------------------------------------------
+    # HATEOAS edge cases: standalone / broken-ref / missing-area apps.
+    # Fixtures defined in demo_nodes_manifest.yaml (hateoas-app-*).
+    # ------------------------------------------------------------------
+
+    def test_belongs_to_standalone_app_returns_empty(self):
+        """Standalone app (no parent component) returns 200 with empty items.
+
+        @verifies REQ_INTEROP_106
+        """
+        data = self.poll_endpoint('/apps/hateoas-app-standalone/belongs-to')
+        self.assertEqual(data['items'], [])
+        self.assertEqual(data['x-medkit']['total_count'], 0)
+
+    def test_belongs_to_app_on_area_less_component_returns_empty(self):
+        """Component without area assignment returns 200 with empty items.
+
+        @verifies REQ_INTEROP_106
+        """
+        data = self.poll_endpoint('/apps/hateoas-app-on-area-less-component/belongs-to')
+        self.assertEqual(data['items'], [])
+        self.assertEqual(data['x-medkit']['total_count'], 0)
+
+    # Note: the 'unresolved parent component' branch on /belongs-to and
+    # /is-located-on is covered by the unit tests
+    # AppBelongsToReturnsMissingItemWhenParentComponentUnresolved and
+    # AppIsLocatedOnReturnsMissingItemWhenHostComponentUnresolved instead -
+    # the manifest validator rejects an app that points at a non-existent
+    # component, so we can't seed that scenario as an integration fixture.
+
+    # Note: the 'dangling area reference' branch is covered by unit test
+    # AppBelongsToReturnsMissingItemWhenAreaUnresolved - manifest validator
+    # R006 rejects a component that points at a non-existent area, so we
+    # can't seed that scenario as an integration fixture without disabling
+    # manifest-driven discovery for the whole suite.
+
+    def test_is_located_on_standalone_app_returns_empty(self):
+        """Standalone app returns 200 with empty items on /is-located-on too.
+
+        @verifies REQ_INTEROP_105
+        """
+        data = self.poll_endpoint('/apps/hateoas-app-standalone/is-located-on')
+        self.assertEqual(data['items'], [])
 
     # ------------------------------------------------------------------
     # Functions (test_81)

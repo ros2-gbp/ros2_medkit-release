@@ -1,4 +1,4 @@
-// Copyright 2025 bburda
+// Copyright 2026 bburda
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,52 +20,124 @@
 #include <ctime>
 #include <set>
 #include <sstream>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
+#include <variant>
 #include <vector>
 
+#include "ros2_medkit_gateway/aggregation/aggregation_manager.hpp"
+#include "ros2_medkit_gateway/core/http/entity_path_utils.hpp"
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
+#include "ros2_medkit_gateway/core/http/fan_out_helpers.hpp"
+#include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
+#include "ros2_medkit_gateway/core/providers/fault_provider.hpp"
+#include "ros2_medkit_gateway/dto/faults.hpp"
+#include "ros2_medkit_gateway/dto/json_writer.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
-#include "ros2_medkit_gateway/http/entity_path_utils.hpp"
-#include "ros2_medkit_gateway/http/error_codes.hpp"
-#include "ros2_medkit_gateway/http/http_utils.hpp"
-#include "ros2_medkit_gateway/http/x_medkit.hpp"
-
-using json = nlohmann::json;
+#include "ros2_medkit_gateway/http/handlers/handler_support.hpp"
 
 namespace ros2_medkit_gateway {
 namespace handlers {
 
 namespace {
 
-/// Helper to filter faults JSON array by a set of namespace prefixes
-/// Keeps faults where any reporting_source starts with any of the given prefixes
-json filter_faults_by_sources(const json & faults_array, const std::set<std::string> & source_prefixes) {
+using json = nlohmann::json;
+
+// =============================================================================
+// Typed-handler helpers
+// =============================================================================
+
+/// Sanitize a plugin-supplied error into the standard `x-medkit-plugin-error`
+/// shape: clamp HTTP status to [400, 599] and truncate message at 512 chars.
+ErrorInfo make_plugin_error(int http_status, const std::string & message, json extra_params = {}) {
+  static constexpr size_t kMaxMessageLength = 512;
+  int status = http_status < 400 ? 400 : (http_status > 599 ? 599 : http_status);
+  std::string msg = message.size() > kMaxMessageLength ? message.substr(0, kMaxMessageLength) + "..." : message;
+  return make_error(status, ERR_PLUGIN_ERROR, std::move(msg), std::move(extra_params));
+}
+
+/// Read the first positional capture group (entity_id). cpp-httplib only invokes
+/// the route when the regex matches, so the `nullopt` branch is effectively
+/// unreachable; we surface it as 400 invalid-request to match the legacy
+/// handlers' explicit `req.matches.size() < N` guard.
+tl::expected<std::string, ErrorInfo> read_entity_id(const http::TypedRequest & req) {
+  auto raw = req.path_param("1");
+  if (raw) {
+    return *raw;
+  }
+  return tl::make_unexpected(make_error(400, ERR_INVALID_REQUEST, "Invalid request"));
+}
+
+/// Read the second positional capture group (fault_code).
+tl::expected<std::string, ErrorInfo> read_fault_code(const http::TypedRequest & req) {
+  auto raw = req.path_param("2");
+  if (raw) {
+    return *raw;
+  }
+  return tl::make_unexpected(make_error(400, ERR_INVALID_REQUEST, "Invalid request"));
+}
+
+/// Build a populated FaultStatusFilter from query params, surfacing an
+/// ErrorInfo when the `status` value is unknown.
+tl::expected<FaultStatusFilter, ErrorInfo> read_fault_status_filter(const http::TypedRequest & req,
+                                                                    const json & extra_params = {}) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  const auto & raw_req = req.raw_for_framework();
+#pragma GCC diagnostic pop
+  auto filter = parse_fault_status_param(raw_req);
+  if (filter.is_valid) {
+    return filter;
+  }
+  json params{{"allowed_values", "pending, confirmed, cleared, healed, all"},
+              {"parameter", "status"},
+              {"value", raw_req.get_param_value("status")}};
+  if (extra_params.is_object()) {
+    for (auto it = extra_params.begin(); it != extra_params.end(); ++it) {
+      params[it.key()] = it.value();
+    }
+  }
+  return tl::make_unexpected(make_error(400, ERR_INVALID_PARAMETER, "Invalid status parameter value", params));
+}
+
+// =============================================================================
+// SOVD-compliant response helpers (legacy free functions kept verbatim)
+// =============================================================================
+
+/// Check if a ROS node FQN falls within the entity's source FQN set.
+///
+/// A node is in scope iff it equals one of the entity's owned FQNs, OR is a
+/// strict path-child of one (i.e., `<owned-fqn>/<...>`). We deliberately do
+/// NOT use raw `rfind(prefix, 0)` because that would let `/ns/node_extra`
+/// pass for an entity owning `/ns/node`. Path boundary is enforced by
+/// requiring the byte after the prefix to be `/`.
+bool source_matches_scope(const std::string & src, const std::set<std::string> & scope_fqns) {
+  for (const auto & fqn : scope_fqns) {
+    if (src == fqn) {
+      return true;
+    }
+    if (src.size() > fqn.size() && src.compare(0, fqn.size(), fqn) == 0 && src[fqn.size()] == '/') {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Filter a faults JSON array down to faults whose every reporting source is
+/// in the entity's scope. Shares the same all-sources / path-boundary
+/// semantics as `FaultHandlers::fault_in_source_scope` so per-entity
+/// collection routes and per-fault routes agree on what counts as "in scope".
+json filter_faults_by_sources(const json & faults_array, const std::set<std::string> & source_fqns) {
   json filtered = json::array();
   for (const auto & fault : faults_array) {
-    if (!fault.contains("reporting_sources")) {
-      continue;
-    }
-    const auto & sources = fault["reporting_sources"];
-    bool matches = false;
-    for (const auto & src : sources) {
-      const std::string src_str = src.get<std::string>();
-      for (const auto & prefix : source_prefixes) {
-        if (src_str.rfind(prefix, 0) == 0) {
-          matches = true;
-          break;
-        }
-      }
-      if (matches) {
-        break;
-      }
-    }
-    if (matches) {
+    if (FaultHandlers::fault_in_source_scope(fault, source_fqns)) {
       filtered.push_back(fault);
     }
   }
   return filtered;
 }
-
-// ===== SOVD-compliant response helpers =====
 
 /// Build SOVD status object from fault status string
 /// Maps ROS 2 medkit status (PREFAILED, PREPASSED, CONFIRMED, HEALED, CLEARED)
@@ -111,19 +183,22 @@ std::string to_iso8601_ns(int64_t ns) {
   return ros2_medkit_gateway::format_timestamp_ns(ns);
 }
 
-/// Map fault severity level to human-readable label
+/// Map fault severity level to human-readable label.
+/// Values mirror ros2_medkit_msgs/msg/Fault.msg SEVERITY_* constants:
+///   SEVERITY_INFO = 0
+///   SEVERITY_WARN = 1
+///   SEVERITY_ERROR = 2
+///   SEVERITY_CRITICAL = 3
 std::string severity_to_label(uint8_t severity) {
   switch (severity) {
     case 0:
-      return "DEBUG";
-    case 1:
       return "INFO";
-    case 2:
+    case 1:
       return "WARN";
-    case 3:
+    case 2:
       return "ERROR";
-    case 4:
-      return "FATAL";
+    case 3:
+      return "CRITICAL";
     default:
       return "UNKNOWN";
   }
@@ -157,488 +232,804 @@ json extract_primary_value(const std::string & message_type, const json & full_d
   return full_data;
 }
 
+/// Wrap a built JSON list payload in a typed FaultListResult envelope.
+dto::FaultListResult wrap_list_result(json payload) {
+  dto::FaultListResult out;
+  out.content = std::move(payload);
+  return out;
+}
+
+/// Wrap a built JSON detail payload in a typed FaultDetailResult envelope.
+dto::FaultDetailResult wrap_detail_result(json payload) {
+  dto::FaultDetailResult out;
+  out.content = std::move(payload);
+  return out;
+}
+
 }  // namespace
 
-// Static method: Build SOVD-compliant fault response with environment data
-json FaultHandlers::build_sovd_fault_response(const ros2_medkit_msgs::msg::Fault & fault,
-                                              const ros2_medkit_msgs::msg::EnvironmentData & env_data,
-                                              const std::string & entity_path) {
-  json response;
+bool FaultHandlers::fault_in_source_scope(const json & fault, const std::set<std::string> & source_fqns) {
+  if (source_fqns.empty()) {
+    return false;
+  }
+  if (!fault.contains("reporting_sources") || !fault["reporting_sources"].is_array()) {
+    return false;
+  }
+  const auto & sources = fault["reporting_sources"];
+  if (sources.empty()) {
+    return false;
+  }
+  for (const auto & src : sources) {
+    if (!src.is_string()) {
+      return false;
+    }
+    if (!source_matches_scope(src.get<std::string>(), source_fqns)) {
+      return false;
+    }
+  }
+  return true;
+}
 
-  // === SOVD "item" structure ===
-  response["item"] = {{"code", fault.fault_code},
-                      {"fault_name", fault.description},
-                      {"severity", fault.severity},
-                      {"status", build_status_object(fault.status)}};
+// Static method: Build SOVD-compliant fault response from transport-supplied JSON.
+//
+// The transport adapter performs ros2_medkit_msgs -> JSON translation; the
+// handler post-processes the intermediate snapshot shape (freeze_frame parse,
+// rosbag bulk_data_uri) using the entity_path it has at request time.
+dto::FaultDetail FaultHandlers::build_sovd_fault_response(const json & fault_json, const json & env_data_json,
+                                                          const std::string & entity_path) {
+  const std::string fault_code = fault_json.value("fault_code", "");
+  const std::string status = fault_json.value("status", "");
+  const uint8_t severity = fault_json.value("severity", static_cast<uint8_t>(0));
+
+  // === Build dto::FaultItem ===
+  dto::FaultDetail detail;
+
+  detail.item.code = fault_code;
+  const std::string description = fault_json.value("description", "");
+  if (!description.empty()) {
+    detail.item.fault_name = description;
+  }
+  detail.item.severity = static_cast<int64_t>(severity);
+
+  // Build FaultStatus from raw status string
+  auto status_obj = build_status_object(status);
+  detail.item.status.aggregated_status = status_obj.value("aggregatedStatus", "cleared");
+  detail.item.status.test_failed = status_obj.value("testFailed", std::string{});
+  detail.item.status.confirmed_dtc = status_obj.value("confirmedDTC", std::string{});
+  detail.item.status.pending_dtc = status_obj.value("pendingDTC", std::string{});
 
   // === SOVD "environment_data" ===
   json snapshots = json::array();
+  if (env_data_json.contains("snapshots") && env_data_json["snapshots"].is_array()) {
+    for (const auto & s : env_data_json["snapshots"]) {
+      json snap;
+      const std::string type = s.value("type", "");
+      // Prefer the explicit "snapshot_type" discriminator emitted by the
+      // conversion layer; fall back to "type" for backward compatibility with
+      // older transports that did not yet emit it.
+      const std::string snapshot_type = s.value("snapshot_type", type);
+      snap["type"] = type;
+      snap["name"] = s.value("name", "");
 
-  for (const auto & s : env_data.snapshots) {
-    json snap;
-    snap["type"] = s.type;
-    snap["name"] = s.name;
-
-    if (s.type == "freeze_frame") {
-      // Parse JSON data and extract primary value
-      try {
-        json full_data = json::parse(s.data);
-        snap["data"] = extract_primary_value(s.message_type, full_data);
-        snap["x-medkit"] = {{"topic", s.topic},
-                            {"message_type", s.message_type},
-                            {"full_data", full_data},
-                            {"captured_at", to_iso8601_ns(s.captured_at_ns)}};
-      } catch (const json::exception & e) {
-        // Invalid JSON - include raw data
-        snap["data"] = s.data;
-        snap["x-medkit"] = {{"topic", s.topic}, {"message_type", s.message_type}, {"parse_error", e.what()}};
+      if (snapshot_type == "freeze_frame") {
+        // Parse JSON data string and extract primary value.
+        const std::string raw_data = s.value("data", "");
+        const std::string topic = s.value("topic", "");
+        const std::string message_type = s.value("message_type", "");
+        const int64_t captured_at_ns = s.value("captured_at_ns", static_cast<int64_t>(0));
+        try {
+          json full_data = json::parse(raw_data);
+          snap["data"] = extract_primary_value(message_type, full_data);
+          snap["x-medkit"] = {{"topic", topic},
+                              {"message_type", message_type},
+                              {"full_data", full_data},
+                              {"captured_at", to_iso8601_ns(captured_at_ns)}};
+        } catch (const json::exception & e) {
+          snap["data"] = raw_data;
+          snap["x-medkit"] = {{"topic", topic}, {"message_type", message_type}, {"parse_error", e.what()}};
+        }
+      } else if (snapshot_type == "rosbag") {
+        // Build absolute URI using entity path + fault_code as the bulk-data ID.
+        // This must match the download handler which looks up rosbags by fault_code,
+        // and list_descriptors which also uses fault_code as the descriptor ID.
+        // A malformed rosbag snapshot missing fault_code is a transport-side
+        // bug: we still fall back to the parent fault's code to preserve a
+        // usable bulk-data URI, but we log a WARN so operators notice.
+        std::string snap_fault_code;
+        if (s.contains("fault_code") && s["fault_code"].is_string()) {
+          snap_fault_code = s["fault_code"].get<std::string>();
+        } else {
+          RCLCPP_WARN(HandlerContext::logger(),
+                      "Rosbag snapshot missing 'fault_code' field; falling back to parent fault code '%s' for entity "
+                      "'%s'",
+                      fault_code.c_str(), entity_path.c_str());
+          snap_fault_code = fault_code;
+        }
+        std::string bulk_data_uri = entity_path;
+        bulk_data_uri += "/bulk-data/rosbags/";
+        bulk_data_uri += snap_fault_code;
+        snap["bulk_data_uri"] = std::move(bulk_data_uri);
+        if (s.contains("size_bytes")) {
+          snap["size_bytes"] = s["size_bytes"];
+        }
+        if (s.contains("duration_sec")) {
+          snap["duration_sec"] = s["duration_sec"];
+        }
+        if (s.contains("format")) {
+          snap["format"] = s["format"];
+        }
       }
-    } else if (s.type == "rosbag") {
-      // Build absolute URI using entity path + fault_code as the bulk-data ID.
-      // This must match the download handler which looks up rosbags by fault_code,
-      // and handle_list_descriptors which also uses fault_code as the descriptor ID.
-      snap["bulk_data_uri"] = entity_path + "/bulk-data/rosbags/" + fault.fault_code;
-      snap["size_bytes"] = s.size_bytes;
-      snap["duration_sec"] = s.duration_sec;
-      snap["format"] = s.format;
-    }
 
-    snapshots.push_back(snap);
+      snapshots.push_back(snap);
+    }
   }
 
-  response["environment_data"] = {
-      {"extended_data_records",
-       {{"first_occurrence", to_iso8601_ns(env_data.extended_data_records.first_occurrence_ns)},
-        {"last_occurrence", to_iso8601_ns(env_data.extended_data_records.last_occurrence_ns)}}},
-      {"snapshots", snapshots}};
+  if (env_data_json.contains("extended_data_records")) {
+    detail.environment_data.extended_data_records = env_data_json["extended_data_records"];
+  } else {
+    detail.environment_data.extended_data_records = json{{"first_occurrence", ""}, {"last_occurrence", ""}};
+  }
+  detail.environment_data.snapshots = snapshots;
 
   // === x-medkit extensions ===
-  json reporting_sources = json::array();
-  for (const auto & src : fault.reporting_sources) {
-    reporting_sources.push_back(src);
+  std::vector<std::string> reporting_sources;
+  if (fault_json.contains("reporting_sources") && fault_json["reporting_sources"].is_array()) {
+    for (const auto & src : fault_json["reporting_sources"]) {
+      reporting_sources.push_back(src.get<std::string>());
+    }
   }
 
-  response["x-medkit"] = {{"occurrence_count", fault.occurrence_count},
-                          {"reporting_sources", reporting_sources},
-                          {"severity_label", severity_to_label(fault.severity)},
-                          {"status_raw", fault.status}};
+  dto::FaultXMedkit xm;
+  xm.occurrence_count = static_cast<int64_t>(fault_json.value("occurrence_count", static_cast<uint64_t>(0)));
+  if (!reporting_sources.empty()) {
+    xm.reporting_sources = std::move(reporting_sources);
+  }
+  xm.severity_label = severity_to_label(severity);
+  xm.status_raw = status;
+  detail.x_medkit = std::move(xm);
 
-  return response;
+  return detail;
 }
 
-void FaultHandlers::handle_list_all_faults(const httplib::Request & req, httplib::Response & res) {
+// =============================================================================
+// GET /faults - list all faults globally
+// =============================================================================
+
+http::Result<dto::FaultListResult> FaultHandlers::list_all_faults(const http::TypedRequest & req) {
   try {
-    auto filter = parse_fault_status_param(req);
-    if (!filter.is_valid) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER, "Invalid status parameter value",
-                                 {{"allowed_values", "pending, confirmed, cleared, healed, all"},
-                                  {"parameter", "status"},
-                                  {"value", req.get_param_value("status")}});
-      return;
+    auto filter_result = read_fault_status_filter(req);
+    if (!filter_result) {
+      return tl::make_unexpected(filter_result.error());
     }
+    const auto filter = *filter_result;
 
     // Parse correlation query parameters
-    bool include_muted = req.get_param_value("include_muted") == "true";
-    bool include_clusters = req.get_param_value("include_clusters") == "true";
+    const bool include_muted = req.query_param("include_muted").value_or(std::string{}) == "true";
+    const bool include_clusters = req.query_param("include_clusters").value_or(std::string{}) == "true";
 
     auto fault_mgr = ctx_.node()->get_fault_manager();
     // Empty source_id = no filtering, return all faults
     auto result = fault_mgr->list_faults("", filter.include_pending, filter.include_confirmed, filter.include_cleared,
                                          filter.include_healed, include_muted, include_clusters);
-
-    if (result.success) {
-      // Format: items array at top level
-      json response = {{"items", result.data["faults"]}};
-
-      // x-medkit extension for ros2_medkit-specific fields
-      XMedkit ext;
-      ext.add("count", result.data["count"]);
-      ext.add("muted_count", result.data["muted_count"]);
-      ext.add("cluster_count", result.data["cluster_count"]);
-
-      // Include detailed correlation data if requested and present
-      if (result.data.contains("muted_faults")) {
-        ext.add("muted_faults", result.data["muted_faults"]);
-      }
-      if (result.data.contains("clusters")) {
-        ext.add("clusters", result.data["clusters"]);
-      }
-
-      if (!ext.empty()) {
-        response["x-medkit"] = ext.build();
-      }
-
-      res.status = 200;
-      HandlerContext::send_json(res, response);
-    } else {
-      HandlerContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, "Failed to get faults",
-                                 {{"details", result.error_message}});
+    if (!result.success) {
+      return tl::make_unexpected(
+          make_error(503, ERR_SERVICE_UNAVAILABLE, "Failed to get faults", json{{"details", result.error_message}}));
     }
+
+    // Format: items array at top level
+    json response = {{"items", result.data["faults"]}};
+
+    // x-medkit extension for ros2_medkit-specific fields (typed DTO)
+    dto::FaultListXMedkit xm;
+    xm.count = result.data.value("count", static_cast<int64_t>(0));
+    xm.muted_count = result.data.value("muted_count", static_cast<int64_t>(0));
+    xm.cluster_count = result.data.value("cluster_count", static_cast<int64_t>(0));
+
+    // Include detailed correlation data if requested and present
+    if (result.data.contains("muted_faults")) {
+      xm.muted_faults = result.data["muted_faults"];
+    }
+    if (result.data.contains("clusters")) {
+      xm.clusters = result.data["clusters"];
+    }
+
+    // Fan-out to peers: faults are managed by FaultManager, not cached, so we
+    // need to query each peer's /faults endpoint and merge results. The legacy
+    // path used the raw `fan_out_get` here (not the typed `fan_out_collection`)
+    // because the per-item shape on the global list includes vendor extensions
+    // that JsonReader<FaultListItem> would drop; preserve that behaviour.
+    if (auto * agg = ctx_.aggregation_manager()) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+      const auto & raw_req = req.raw_for_framework();
+#pragma GCC diagnostic pop
+      auto fan_result = agg->fan_out_get(raw_req.path, raw_req.get_header_value("Authorization"));
+      if (fan_result.merged_items.is_array()) {
+        for (const auto & item : fan_result.merged_items) {
+          response["items"].push_back(item);
+        }
+      }
+      if (fan_result.is_partial) {
+        xm.partial = true;
+        xm.failed_peers = fan_result.failed_peers;
+      }
+    }
+
+    response["x-medkit"] = dto::JsonWriter<dto::FaultListXMedkit>::write(xm);
+    return wrap_list_result(std::move(response));
   } catch (const std::exception & e) {
-    HandlerContext::send_error(res, 500, ERR_INTERNAL_ERROR, "Failed to list faults", {{"details", e.what()}});
-    RCLCPP_ERROR(HandlerContext::logger(), "Error in handle_list_all_faults: %s", e.what());
+    RCLCPP_ERROR(HandlerContext::logger(), "Error in list_all_faults: %s", e.what());
+    return tl::make_unexpected(
+        make_error(500, ERR_INTERNAL_ERROR, "Failed to list faults", json{{"details", e.what()}}));
   }
 }
 
-void FaultHandlers::handle_list_faults(const httplib::Request & req, httplib::Response & res) {
-  std::string entity_id;
+// =============================================================================
+// GET /{entity-path}/faults - list faults for entity
+// =============================================================================
+
+http::Result<dto::FaultListResult> FaultHandlers::list_faults(const http::TypedRequest & req) {
+  auto id_result = read_entity_id(req);
+  if (!id_result) {
+    return tl::make_unexpected(id_result.error());
+  }
+  const std::string entity_id = *id_result;
+
   try {
-    if (req.matches.size() < 2) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_REQUEST, "Invalid request");
-      return;
+    auto entity_result = ctx_.validate_entity_for_route(req, entity_id);
+    if (!entity_result) {
+      return tl::make_unexpected(flatten_validator_error(entity_result.error()));
+    }
+    const auto entity_info = *entity_result;
+
+    // Delegate to plugin FaultProvider if entity is plugin-owned
+    if (entity_info.is_plugin) {
+      auto * pmgr = ctx_.node()->get_plugin_manager();
+      auto * fault_prov = pmgr ? pmgr->get_fault_provider_for_entity(entity_id) : nullptr;
+      if (fault_prov == nullptr) {
+        return tl::make_unexpected(
+            make_error(404, ERR_RESOURCE_NOT_FOUND, "No fault provider for plugin entity '" + entity_id + "'"));
+      }
+      try {
+        auto result = fault_prov->list_faults(entity_id);
+        if (!result) {
+          return tl::make_unexpected(
+              make_plugin_error(result.error().http_status, result.error().message, json{{"entity_id", entity_id}}));
+        }
+        return std::move(*result);
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(HandlerContext::logger(), "Plugin FaultProvider threw for entity '%s': %s", entity_id.c_str(),
+                     e.what());
+        return tl::make_unexpected(make_plugin_error(500, "Plugin threw exception", json{{"entity_id", entity_id}}));
+      } catch (...) {
+        RCLCPP_ERROR(HandlerContext::logger(), "Plugin FaultProvider threw unknown exception for entity '%s'",
+                     entity_id.c_str());
+        return tl::make_unexpected(
+            make_plugin_error(500, "Plugin threw unknown exception", json{{"entity_id", entity_id}}));
+      }
     }
 
-    entity_id = req.matches[1];
-
-    // Validate entity ID and type for this route
-    auto entity_opt = ctx_.validate_entity_for_route(req, res, entity_id);
-    if (!entity_opt) {
-      return;  // Error response already sent
-    }
-    auto entity_info = *entity_opt;
-
-    auto filter = parse_fault_status_param(req);
-    if (!filter.is_valid) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER, "Invalid status parameter value",
-                                 {{"allowed_values", "pending, confirmed, cleared, healed, all"},
-                                  {"parameter", "status"},
-                                  {"value", req.get_param_value("status")},
-                                  {entity_info.id_field, entity_id}});
-      return;
+    // Validate entity type supports faults collection (SOVD Table 8)
+    if (auto access = HandlerContext::validate_collection_access_typed(entity_info, ResourceCollection::FAULTS);
+        !access) {
+      ErrorInfo err = access.error();
+      err.code = ERR_COLLECTION_NOT_SUPPORTED;
+      return tl::make_unexpected(err);
     }
 
-    // Parse correlation query parameters
-    bool include_muted = req.get_param_value("include_muted") == "true";
-    bool include_clusters = req.get_param_value("include_clusters") == "true";
+    auto filter_result = read_fault_status_filter(req, json{{entity_info.id_field, entity_id}});
+    if (!filter_result) {
+      return tl::make_unexpected(filter_result.error());
+    }
+    const auto filter = *filter_result;
+
+    // Note: include_muted / include_clusters URL params are intentionally
+    // ignored on per-entity routes - the underlying service returns
+    // correlation metadata computed across the entire fault manager, so
+    // emitting it on a scoped response would leak cross-entity data
+    // (review finding N1). The global `GET /faults` route is the only place
+    // these flags are honored.
 
     auto fault_mgr = ctx_.node()->get_fault_manager();
 
-    // For Functions, aggregate faults from all host apps
-    // Functions don't have a single namespace_path - they host apps from potentially different namespaces
-    if (entity_info.type == EntityType::FUNCTION) {
+    // For Functions, aggregate faults from all host apps.
+    // Functions don't have a single namespace_path (it is always empty in EntityInfo)
+    // because they host apps from potentially different namespaces.
+    // Instead, we collect the FQNs of all host apps and filter by reporting_source.
+    if (entity_info.type == EntityType::FUNCTION || entity_info.type == EntityType::COMPONENT) {
       // Get all faults (no namespace filter)
       auto result = fault_mgr->list_faults("", filter.include_pending, filter.include_confirmed, filter.include_cleared,
-                                           filter.include_healed, include_muted, include_clusters);
+                                           filter.include_healed, /*include_muted=*/false, /*include_clusters=*/false);
 
       if (!result.success) {
-        HandlerContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, "Failed to get faults",
-                                   {{"details", result.error_message}, {entity_info.id_field, entity_id}});
-        return;
+        return tl::make_unexpected(
+            make_error(503, ERR_SERVICE_UNAVAILABLE, "Failed to get faults",
+                       json{{"details", result.error_message}, {entity_info.id_field, entity_id}}));
       }
 
-      // Collect host app FQNs for filtering
+      // Resolve FQN set via the shared helper so subareas (Areas) and
+      // component-hosted Functions are handled the same way as the per-fault
+      // routes.
       const auto & cache = ctx_.node()->get_thread_safe_cache();
-      auto agg_configs = cache.get_entity_configurations(entity_id);
-      std::set<std::string> host_fqns;
-      for (const auto & node : agg_configs.nodes) {
-        if (!node.node_fqn.empty()) {
-          host_fqns.insert(node.node_fqn);
-        }
-      }
+      auto source_fqns = HandlerContext::resolve_entity_source_fqns(cache, entity_info);
 
-      // Filter faults to only those from function's host apps
-      json filtered_faults = filter_faults_by_sources(result.data["faults"], host_fqns);
-
-      // Build response
+      json filtered_faults = filter_faults_by_sources(result.data["faults"], source_fqns);
       json response = {{"items", filtered_faults}};
 
-      XMedkit ext;
-      ext.entity_id(entity_id);
-      ext.add("aggregation_level", "function");
-      ext.add("count", filtered_faults.size());
-      ext.add("host_count", host_fqns.size());
-
-      response["x-medkit"] = ext.build();
-      HandlerContext::send_json(res, response);
-      return;
-    }
-
-    // For Components, aggregate faults from all hosted apps
-    // Components group Apps, so we filter by the apps' FQNs rather than namespace (which is too broad)
-    if (entity_info.type == EntityType::COMPONENT) {
-      // Get all faults (no namespace filter)
-      auto result = fault_mgr->list_faults("", filter.include_pending, filter.include_confirmed, filter.include_cleared,
-                                           filter.include_healed, include_muted, include_clusters);
-
-      if (!result.success) {
-        HandlerContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, "Failed to get faults",
-                                   {{"details", result.error_message}, {entity_info.id_field, entity_id}});
-        return;
+      // x-medkit extension (typed DTO)
+      dto::FaultListAggXMedkit xm;
+      xm.entity_id = entity_id;
+      const bool is_function = entity_info.type == EntityType::FUNCTION;
+      xm.aggregation_level = is_function ? "function" : "component";
+      xm.aggregated = true;
+      if (is_function) {
+        xm.host_count = static_cast<int64_t>(source_fqns.size());
+      } else {
+        xm.app_count = static_cast<int64_t>(source_fqns.size());
       }
-
-      // Collect hosted app FQNs for filtering
-      const auto & cache = ctx_.node()->get_thread_safe_cache();
-      auto app_ids = cache.get_apps_for_component(entity_id);
-      std::set<std::string> app_fqns;
-      for (const auto & app_id : app_ids) {
-        auto app = cache.get_app(app_id);
-        if (app) {
-          auto fqn = app->effective_fqn();
-          if (!fqn.empty()) {
-            app_fqns.insert(std::move(fqn));
-          }
+      {
+        std::vector<std::string> sources(source_fqns.begin(), source_fqns.end());
+        if (!sources.empty()) {
+          xm.aggregation_sources = std::move(sources);
         }
       }
 
-      // Filter faults to only those from component's hosted apps
+      auto xm_json = dto::JsonWriter<dto::FaultListAggXMedkit>::write(xm);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+      const auto & raw_req = req.raw_for_framework();
+#pragma GCC diagnostic pop
+      merge_peer_items(ctx_.aggregation_manager(), raw_req, response, xm_json);
+      xm_json["count"] = static_cast<int64_t>(response["items"].size());
+      response["x-medkit"] = std::move(xm_json);
+      return wrap_list_result(std::move(response));
+    }
+
+    // For Areas, aggregate faults from all apps in all components within the area
+    // This is an x-medkit extension - SOVD spec does not define fault collections for Areas
+    if (entity_info.type == EntityType::AREA) {
+      auto result = fault_mgr->list_faults("", filter.include_pending, filter.include_confirmed, filter.include_cleared,
+                                           filter.include_healed, /*include_muted=*/false, /*include_clusters=*/false);
+
+      if (!result.success) {
+        return tl::make_unexpected(
+            make_error(503, ERR_SERVICE_UNAVAILABLE, "Failed to get faults",
+                       json{{"details", result.error_message}, {entity_info.id_field, entity_id}}));
+      }
+
+      const auto & cache = ctx_.node()->get_thread_safe_cache();
+      auto app_fqns = HandlerContext::resolve_entity_source_fqns(cache, entity_info);
+
       json filtered_faults = filter_faults_by_sources(result.data["faults"], app_fqns);
-
-      // Build response
       json response = {{"items", filtered_faults}};
 
-      XMedkit ext;
-      ext.entity_id(entity_id);
-      ext.add("aggregation_level", "component");
-      ext.add("count", filtered_faults.size());
-      ext.add("app_count", app_fqns.size());
-
-      response["x-medkit"] = ext.build();
-      HandlerContext::send_json(res, response);
-      return;
-    }
-
-    // For other entity types (App, Area), use namespace_path filtering
-    std::string namespace_path = entity_info.namespace_path;
-    auto result =
-        fault_mgr->list_faults(namespace_path, filter.include_pending, filter.include_confirmed, filter.include_cleared,
-                               filter.include_healed, include_muted, include_clusters);
-
-    if (result.success) {
-      // Format: items array at top level
-      json response = {{"items", result.data["faults"]}};
-
-      // x-medkit extension for ros2_medkit-specific fields
-      XMedkit ext;
-      ext.entity_id(entity_id);
-      ext.add("source_id", namespace_path);
-      ext.add("count", result.data["count"]);
-      ext.add("muted_count", result.data["muted_count"]);
-      ext.add("cluster_count", result.data["cluster_count"]);
-
-      // Include detailed correlation data if requested and present
-      if (result.data.contains("muted_faults")) {
-        ext.add("muted_faults", result.data["muted_faults"]);
-      }
-      if (result.data.contains("clusters")) {
-        ext.add("clusters", result.data["clusters"]);
+      dto::FaultListAggXMedkit xm;
+      xm.entity_id = entity_id;
+      xm.aggregation_level = "area";
+      xm.aggregated = true;
+      xm.component_count = static_cast<int64_t>(cache.get_components_for_area(entity_id).size());
+      xm.app_count = static_cast<int64_t>(app_fqns.size());
+      {
+        std::vector<std::string> sources(app_fqns.begin(), app_fqns.end());
+        if (!sources.empty()) {
+          xm.aggregation_sources = std::move(sources);
+        }
       }
 
-      response["x-medkit"] = ext.build();
-      HandlerContext::send_json(res, response);
-    } else {
-      HandlerContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, "Failed to get faults",
-                                 {{"details", result.error_message}, {entity_info.id_field, entity_id}});
+      auto xm_json = dto::JsonWriter<dto::FaultListAggXMedkit>::write(xm);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+      const auto & raw_req = req.raw_for_framework();
+#pragma GCC diagnostic pop
+      merge_peer_items(ctx_.aggregation_manager(), raw_req, response, xm_json);
+      xm_json["count"] = static_cast<int64_t>(response["items"].size());
+      response["x-medkit"] = std::move(xm_json);
+      return wrap_list_result(std::move(response));
     }
+
+    // For Apps, scope by the app's effective FQN set.
+    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    auto app_fqns = HandlerContext::resolve_entity_source_fqns(cache, entity_info);
+    auto result = fault_mgr->list_faults("", filter.include_pending, filter.include_confirmed, filter.include_cleared,
+                                         filter.include_healed,
+                                         /*include_muted=*/false, /*include_clusters=*/false);
+    if (!result.success) {
+      return tl::make_unexpected(
+          make_error(503, ERR_SERVICE_UNAVAILABLE, "Failed to get faults",
+                     json{{"details", result.error_message}, {entity_info.id_field, entity_id}}));
+    }
+
+    json filtered_faults = filter_faults_by_sources(result.data["faults"], app_fqns);
+    json response = {{"items", filtered_faults}};
+
+    // x-medkit extension for ros2_medkit-specific fields (typed DTO)
+    dto::FaultListXMedkit xm;
+    xm.entity_id = entity_id;
+    xm.source_id = entity_info.namespace_path;
+
+    if (result.data.contains("muted_faults")) {
+      xm.muted_faults = result.data["muted_faults"];
+    }
+    if (result.data.contains("clusters")) {
+      xm.clusters = result.data["clusters"];
+    }
+
+    auto xm_json = dto::JsonWriter<dto::FaultListXMedkit>::write(xm);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    const auto & raw_req = req.raw_for_framework();
+#pragma GCC diagnostic pop
+    merge_peer_items(ctx_.aggregation_manager(), raw_req, response, xm_json);
+    xm_json["count"] = static_cast<int64_t>(response["items"].size());
+    xm_json["muted_count"] = result.data.value("muted_count", static_cast<int64_t>(0));
+    xm_json["cluster_count"] = result.data.value("cluster_count", static_cast<int64_t>(0));
+    response["x-medkit"] = std::move(xm_json);
+    return wrap_list_result(std::move(response));
   } catch (const std::exception & e) {
-    HandlerContext::send_error(res, 500, ERR_INTERNAL_ERROR, "Failed to list faults",
-                               {{"details", e.what()}, {"entity_id", entity_id}});
-    RCLCPP_ERROR(HandlerContext::logger(), "Error in handle_list_faults for entity '%s': %s", entity_id.c_str(),
-                 e.what());
+    RCLCPP_ERROR(HandlerContext::logger(), "Error in list_faults for entity '%s': %s", entity_id.c_str(), e.what());
+    return tl::make_unexpected(make_error(500, ERR_INTERNAL_ERROR, "Failed to list faults",
+                                          json{{"details", e.what()}, {"entity_id", entity_id}}));
   }
 }
 
-void FaultHandlers::handle_get_fault(const httplib::Request & req, httplib::Response & res) {
-  std::string entity_id;
-  std::string fault_code;
+// =============================================================================
+// GET /{entity-path}/faults/{fault_code} - get specific fault
+// =============================================================================
+
+http::Result<dto::FaultDetailResult> FaultHandlers::get_fault(const http::TypedRequest & req) {
+  auto id_result = read_entity_id(req);
+  if (!id_result) {
+    return tl::make_unexpected(id_result.error());
+  }
+  const std::string entity_id = *id_result;
+
+  auto code_result = read_fault_code(req);
+  if (!code_result) {
+    return tl::make_unexpected(code_result.error());
+  }
+  const std::string fault_code = *code_result;
+
   try {
-    if (req.matches.size() < 3) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_REQUEST, "Invalid request");
-      return;
-    }
-
-    entity_id = req.matches[1];
-    fault_code = req.matches[2];
-
     // Parse entity path from URL to get entity_path for bulk_data_uri
-    auto entity_path_info = parse_entity_path(req.path);
+    auto entity_path_info = parse_entity_path(req.path());
     if (!entity_path_info) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_REQUEST, "Invalid entity path");
-      return;
+      return tl::make_unexpected(make_error(400, ERR_INVALID_REQUEST, "Invalid entity path"));
     }
 
-    // Validate entity ID and type for this route
-    auto entity_opt = ctx_.validate_entity_for_route(req, res, entity_id);
-    if (!entity_opt) {
-      return;  // Error response already sent
+    auto entity_result = ctx_.validate_entity_for_route(req, entity_id);
+    if (!entity_result) {
+      return tl::make_unexpected(flatten_validator_error(entity_result.error()));
     }
-    auto entity_info = *entity_opt;
+    const auto entity_info = *entity_result;
+
+    // Delegate to plugin FaultProvider if entity is plugin-owned
+    if (entity_info.is_plugin) {
+      auto * pmgr = ctx_.node()->get_plugin_manager();
+      auto * fault_prov = pmgr ? pmgr->get_fault_provider_for_entity(entity_id) : nullptr;
+      if (fault_prov == nullptr) {
+        return tl::make_unexpected(
+            make_error(404, ERR_RESOURCE_NOT_FOUND, "No fault provider for plugin entity '" + entity_id + "'"));
+      }
+      try {
+        auto result = fault_prov->get_fault(entity_id, fault_code);
+        if (!result) {
+          return tl::make_unexpected(
+              make_plugin_error(result.error().http_status, result.error().message, json{{"entity_id", entity_id}}));
+        }
+        return std::move(*result);
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(HandlerContext::logger(), "Plugin FaultProvider threw for entity '%s': %s", entity_id.c_str(),
+                     e.what());
+        return tl::make_unexpected(make_plugin_error(500, "Plugin threw exception", json{{"entity_id", entity_id}}));
+      } catch (...) {
+        RCLCPP_ERROR(HandlerContext::logger(), "Plugin FaultProvider threw unknown exception for entity '%s'",
+                     entity_id.c_str());
+        return tl::make_unexpected(
+            make_plugin_error(500, "Plugin threw unknown exception", json{{"entity_id", entity_id}}));
+      }
+    }
 
     // Fault codes may contain dots and underscores, validate basic constraints
     if (fault_code.empty() || fault_code.length() > 256) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER, "Invalid fault code",
-                                 {{"details", "Fault code must be between 1 and 256 characters"}});
-      return;
+      return tl::make_unexpected(make_error(400, ERR_INVALID_PARAMETER, "Invalid fault code",
+                                            json{{"details", "Fault code must be between 1 and 256 characters"}}));
     }
-
-    std::string namespace_path = entity_info.namespace_path;
 
     auto fault_mgr = ctx_.node()->get_fault_manager();
 
-    // Use get_fault_with_env to get fault with environment data
-    auto result = fault_mgr->get_fault_with_env(fault_code, namespace_path);
-
-    if (result.success) {
-      // Build SOVD-compliant response with environment data
-      auto response = build_sovd_fault_response(result.fault, result.environment_data, entity_path_info->entity_path);
-
-      HandlerContext::send_json(res, response);
-    } else {
-      // Check if it's a "not found" error
+    auto result = fault_mgr->get_fault_with_env(fault_code, "");
+    if (!result.success) {
       if (result.error_message.find("not found") != std::string::npos ||
           result.error_message.find("Fault not found") != std::string::npos) {
-        HandlerContext::send_error(
-            res, 404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
-            {{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}});
-      } else {
-        HandlerContext::send_error(
-            res, 503, ERR_SERVICE_UNAVAILABLE, "Failed to get fault",
-            {{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}});
+        return tl::make_unexpected(make_error(
+            404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
+            json{{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
       }
+      return tl::make_unexpected(make_error(
+          503, ERR_SERVICE_UNAVAILABLE, "Failed to get fault",
+          json{{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
     }
+
+    // Build SOVD-compliant response from the transport-supplied JSON shape.
+    const auto & fault_json = result.data.value("fault", json::object());
+
+    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    auto source_fqns = HandlerContext::resolve_entity_source_fqns(cache, entity_info);
+    if (!FaultHandlers::fault_in_source_scope(fault_json, source_fqns)) {
+      return tl::make_unexpected(
+          make_error(404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
+                     json{{"details",
+                           "Fault is not in scope for this entity: every reporting source must be one of the entity's "
+                           "owned apps, and a mixed-source fault that includes any out-of-entity reporter is rejected "
+                           "to prevent cross-entity disclosure"},
+                          {entity_info.id_field, entity_id},
+                          {"fault_code", fault_code}}));
+    }
+
+    const auto & env_data_json = result.data.value("environment_data", json::object());
+    auto detail = build_sovd_fault_response(fault_json, env_data_json, entity_path_info->entity_path);
+
+    return wrap_detail_result(dto::JsonWriter<dto::FaultDetail>::write(detail));
   } catch (const std::exception & e) {
-    HandlerContext::send_error(res, 500, ERR_INTERNAL_ERROR, "Failed to get fault",
-                               {{"details", e.what()}, {"entity_id", entity_id}, {"fault_code", fault_code}});
-    RCLCPP_ERROR(HandlerContext::logger(), "Error in handle_get_fault for entity '%s', fault '%s': %s",
-                 entity_id.c_str(), fault_code.c_str(), e.what());
+    RCLCPP_ERROR(HandlerContext::logger(), "Error in get_fault for entity '%s', fault '%s': %s", entity_id.c_str(),
+                 fault_code.c_str(), e.what());
+    return tl::make_unexpected(
+        make_error(500, ERR_INTERNAL_ERROR, "Failed to get fault",
+                   json{{"details", e.what()}, {"entity_id", entity_id}, {"fault_code", fault_code}}));
   }
 }
 
-void FaultHandlers::handle_clear_fault(const httplib::Request & req, httplib::Response & res) {
-  std::string entity_id;
-  std::string fault_code;
+// =============================================================================
+// DELETE /{entity-path}/faults/{fault_code} - clear specific fault
+// =============================================================================
+
+http::Result<std::variant<http::NoContent, dto::FaultClearResult>>
+FaultHandlers::clear_fault(const http::TypedRequest & req) {
+  using Outcome = std::variant<http::NoContent, dto::FaultClearResult>;
+  auto id_result = read_entity_id(req);
+  if (!id_result) {
+    return tl::make_unexpected(id_result.error());
+  }
+  const std::string entity_id = *id_result;
+
+  auto code_result = read_fault_code(req);
+  if (!code_result) {
+    return tl::make_unexpected(code_result.error());
+  }
+  const std::string fault_code = *code_result;
+
   try {
-    if (req.matches.size() < 3) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_REQUEST, "Invalid request");
-      return;
+    auto entity_result = ctx_.validate_entity_for_route(req, entity_id);
+    if (!entity_result) {
+      return tl::make_unexpected(flatten_validator_error(entity_result.error()));
+    }
+    const auto entity_info = *entity_result;
+
+    // Check lock access for faults (before plugin delegation - locks apply to all entities)
+    if (auto lock_err = ctx_.validate_lock_access(req, entity_info, "faults"); !lock_err) {
+      return tl::make_unexpected(lock_err.error());
     }
 
-    entity_id = req.matches[1];
-    fault_code = req.matches[2];
-
-    // Validate entity ID and type for this route
-    auto entity_opt = ctx_.validate_entity_for_route(req, res, entity_id);
-    if (!entity_opt) {
-      return;  // Error response already sent
-    }
-    auto entity_info = *entity_opt;
-
-    // Check lock access for faults
-    if (ctx_.validate_lock_access(req, res, entity_info, "faults")) {
-      return;
+    // Delegate to plugin FaultProvider if entity is plugin-owned. Plugin clear
+    // succeeds with the plugin's acknowledgement payload at HTTP 200 (legacy
+    // wire shape via `send_dto`); the typed alternates variant maps
+    // `FaultClearResult` -> 200 via the default `dto_alternate_status<T>`.
+    if (entity_info.is_plugin) {
+      auto * pmgr = ctx_.node()->get_plugin_manager();
+      auto * fault_prov = pmgr ? pmgr->get_fault_provider_for_entity(entity_id) : nullptr;
+      if (fault_prov == nullptr) {
+        return tl::make_unexpected(
+            make_error(404, ERR_RESOURCE_NOT_FOUND, "No fault provider for plugin entity '" + entity_id + "'"));
+      }
+      try {
+        auto result = fault_prov->clear_fault(entity_id, fault_code);
+        if (!result) {
+          return tl::make_unexpected(
+              make_plugin_error(result.error().http_status, result.error().message, json{{"entity_id", entity_id}}));
+        }
+        return Outcome{std::move(*result)};
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(HandlerContext::logger(), "Plugin FaultProvider threw for entity '%s': %s", entity_id.c_str(),
+                     e.what());
+        return tl::make_unexpected(make_plugin_error(500, "Plugin threw exception", json{{"entity_id", entity_id}}));
+      } catch (...) {
+        RCLCPP_ERROR(HandlerContext::logger(), "Plugin FaultProvider threw unknown exception for entity '%s'",
+                     entity_id.c_str());
+        return tl::make_unexpected(
+            make_plugin_error(500, "Plugin threw unknown exception", json{{"entity_id", entity_id}}));
+      }
     }
 
     // Validate fault code
     if (fault_code.empty() || fault_code.length() > 256) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER, "Invalid fault code",
-                                 {{"details", "Fault code must be between 1 and 256 characters"}});
-      return;
+      return tl::make_unexpected(make_error(400, ERR_INVALID_PARAMETER, "Invalid fault code",
+                                            json{{"details", "Fault code must be between 1 and 256 characters"}}));
     }
 
     auto fault_mgr = ctx_.node()->get_fault_manager();
-    auto result = fault_mgr->clear_fault(fault_code);
 
-    if (result.success) {
-      // Format: return 204 No Content on successful delete
-      res.status = 204;
-    } else {
-      // Check if it's a "not found" error
+    // Verify the fault is in this entity's scope BEFORE clearing.
+    auto get_result = fault_mgr->get_fault_with_env(fault_code, "");
+    if (!get_result.success) {
+      if (get_result.error_message.find("not found") != std::string::npos ||
+          get_result.error_message.find("Fault not found") != std::string::npos) {
+        return tl::make_unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
+                                              json{{"details", get_result.error_message},
+                                                   {entity_info.id_field, entity_id},
+                                                   {"fault_code", fault_code}}));
+      }
+      return tl::make_unexpected(make_error(
+          503, ERR_SERVICE_UNAVAILABLE, "Failed to clear fault",
+          json{{"details", get_result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
+    }
+
+    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    auto source_fqns = HandlerContext::resolve_entity_source_fqns(cache, entity_info);
+    const auto & fault_json = get_result.data.value("fault", json::object());
+    if (!FaultHandlers::fault_in_source_scope(fault_json, source_fqns)) {
+      return tl::make_unexpected(
+          make_error(404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
+                     json{{"details",
+                           "Fault is not in scope for this entity: every reporting source must be one of the entity's "
+                           "owned apps, and a mixed-source fault that includes any out-of-entity reporter is rejected "
+                           "to prevent cross-entity disclosure"},
+                          {entity_info.id_field, entity_id},
+                          {"fault_code", fault_code}}));
+    }
+
+    auto result = fault_mgr->clear_fault(fault_code, /*skip_correlation_auto_clear=*/true);
+    if (!result.success) {
       if (result.error_message.find("not found") != std::string::npos ||
           result.error_message.find("Fault not found") != std::string::npos) {
-        HandlerContext::send_error(
-            res, 404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
-            {{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}});
-      } else {
-        HandlerContext::send_error(
-            res, 503, ERR_SERVICE_UNAVAILABLE, "Failed to clear fault",
-            {{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}});
+        return tl::make_unexpected(make_error(
+            404, ERR_RESOURCE_NOT_FOUND, "Fault not found",
+            json{{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
       }
+      return tl::make_unexpected(make_error(
+          503, ERR_SERVICE_UNAVAILABLE, "Failed to clear fault",
+          json{{"details", result.error_message}, {entity_info.id_field, entity_id}, {"fault_code", fault_code}}));
     }
+    return Outcome{http::NoContent{}};
   } catch (const std::exception & e) {
-    HandlerContext::send_error(res, 500, ERR_INTERNAL_ERROR, "Failed to clear fault",
-                               {{"details", e.what()}, {"entity_id", entity_id}, {"fault_code", fault_code}});
-    RCLCPP_ERROR(HandlerContext::logger(), "Error in handle_clear_fault for entity '%s', fault '%s': %s",
-                 entity_id.c_str(), fault_code.c_str(), e.what());
+    RCLCPP_ERROR(HandlerContext::logger(), "Error in clear_fault for entity '%s', fault '%s': %s", entity_id.c_str(),
+                 fault_code.c_str(), e.what());
+    return tl::make_unexpected(
+        make_error(500, ERR_INTERNAL_ERROR, "Failed to clear fault",
+                   json{{"details", e.what()}, {"entity_id", entity_id}, {"fault_code", fault_code}}));
   }
 }
 
-void FaultHandlers::handle_clear_all_faults(const httplib::Request & req, httplib::Response & res) {
-  std::string entity_id;
+// =============================================================================
+// DELETE /{entity-path}/faults - clear all faults for entity
+// =============================================================================
+
+http::Result<http::NoContent> FaultHandlers::clear_all_faults(const http::TypedRequest & req) {
+  auto id_result = read_entity_id(req);
+  if (!id_result) {
+    return tl::make_unexpected(id_result.error());
+  }
+  const std::string entity_id = *id_result;
+
   try {
-    if (req.matches.size() < 2) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_REQUEST, "Invalid request");
-      return;
+    auto entity_result = ctx_.validate_entity_for_route(req, entity_id);
+    if (!entity_result) {
+      return tl::make_unexpected(flatten_validator_error(entity_result.error()));
+    }
+    const auto entity_info = *entity_result;
+
+    // Check lock access for faults (before plugin delegation - locks apply to all entities)
+    if (auto lock_err = ctx_.validate_lock_access(req, entity_info, "faults"); !lock_err) {
+      return tl::make_unexpected(lock_err.error());
     }
 
-    entity_id = req.matches[1];
-
-    // Validate entity ID and type for this route
-    auto entity_opt = ctx_.validate_entity_for_route(req, res, entity_id);
-    if (!entity_opt) {
-      return;  // Error response already sent
-    }
-    auto entity_info = *entity_opt;
-
-    // Check lock access for faults
-    if (ctx_.validate_lock_access(req, res, entity_info, "faults")) {
-      return;
-    }
-
-    // Get all faults for this entity
-    auto fault_mgr = ctx_.node()->get_fault_manager();
-    auto faults_result = fault_mgr->list_faults(entity_info.namespace_path);
-
-    if (!faults_result.success) {
-      HandlerContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, "Failed to retrieve faults",
-                                 {{"details", faults_result.error_message}, {entity_info.id_field, entity_id}});
-      return;
-    }
-
-    // Clear each fault
-    if (faults_result.data.contains("faults") && faults_result.data["faults"].is_array()) {
-      for (const auto & fault : faults_result.data["faults"]) {
-        if (fault.contains("fault_code")) {
-          std::string fault_code = fault["fault_code"].get<std::string>();
-          auto clear_result = fault_mgr->clear_fault(fault_code);
-          if (!clear_result.success) {
-            RCLCPP_WARN(HandlerContext::logger(), "Failed to clear fault '%s' for entity '%s': %s", fault_code.c_str(),
-                        entity_id.c_str(), clear_result.error_message.c_str());
+    // Delegate to plugin FaultProvider if entity is plugin-owned
+    if (entity_info.is_plugin) {
+      auto * pmgr = ctx_.node()->get_plugin_manager();
+      auto * fault_prov = pmgr ? pmgr->get_fault_provider_for_entity(entity_id) : nullptr;
+      if (fault_prov == nullptr) {
+        return tl::make_unexpected(
+            make_error(404, ERR_RESOURCE_NOT_FOUND, "No fault provider for plugin entity '" + entity_id + "'"));
+      }
+      try {
+        auto list_result = fault_prov->list_faults(entity_id);
+        if (!list_result) {
+          return tl::make_unexpected(make_plugin_error(list_result.error().http_status, list_result.error().message,
+                                                       json{{"entity_id", entity_id}}));
+        }
+        if (list_result->content.contains("items") && list_result->content["items"].is_array()) {
+          std::vector<std::string> failed_codes;
+          for (const auto & fault : list_result->content["items"]) {
+            auto code = fault.value("code", "");
+            if (code.empty()) {
+              continue;
+            }
+            auto clear_result = fault_prov->clear_fault(entity_id, code);
+            if (!clear_result) {
+              failed_codes.push_back(code);
+            }
           }
+          if (!failed_codes.empty()) {
+            return tl::make_unexpected(
+                make_plugin_error(500, "Failed to clear " + std::to_string(failed_codes.size()) + " fault(s)",
+                                  json{{"entity_id", entity_id}, {"failed_codes", failed_codes}}));
+          }
+        }
+        return http::NoContent{};
+      } catch (const std::exception & e) {
+        RCLCPP_ERROR(HandlerContext::logger(), "Plugin FaultProvider threw for entity '%s': %s", entity_id.c_str(),
+                     e.what());
+        return tl::make_unexpected(make_plugin_error(500, "Plugin threw exception", json{{"entity_id", entity_id}}));
+      } catch (...) {
+        RCLCPP_ERROR(HandlerContext::logger(), "Plugin FaultProvider threw unknown exception for entity '%s'",
+                     entity_id.c_str());
+        return tl::make_unexpected(
+            make_plugin_error(500, "Plugin threw unknown exception", json{{"entity_id", entity_id}}));
+      }
+    }
+
+    auto fault_mgr = ctx_.node()->get_fault_manager();
+
+    // Same scope rules as `list_faults` and `get_fault`: every entity type
+    // resolves through `HandlerContext::resolve_entity_source_fqns` so the
+    // area BFS, function-hosting-component expansion, and wildcard-app
+    // empty-set behavior stay consistent across all four fault routes.
+    auto result = fault_mgr->list_faults("");
+    if (!result.success) {
+      return tl::make_unexpected(
+          make_error(503, ERR_SERVICE_UNAVAILABLE, "Failed to retrieve faults",
+                     json{{"details", result.error_message}, {entity_info.id_field, entity_id}}));
+    }
+    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    auto entity_fqns = HandlerContext::resolve_entity_source_fqns(cache, entity_info);
+    json faults_to_clear = filter_faults_by_sources(result.data["faults"], entity_fqns);
+
+    // Clear each matching fault. Use `skip_correlation_auto_clear=true` for
+    // the same reason as the single-fault DELETE: keep this entity's clear
+    // from cascading into correlated symptoms reported by other entities.
+    if (faults_to_clear.is_array()) {
+      for (const auto & fault : faults_to_clear) {
+        if (!fault.contains("fault_code")) {
+          continue;
+        }
+        std::string code = fault["fault_code"].get<std::string>();
+        auto clear_result = fault_mgr->clear_fault(code, /*skip_correlation_auto_clear=*/true);
+        if (!clear_result.success) {
+          RCLCPP_WARN(HandlerContext::logger(), "Failed to clear fault '%s' for entity '%s': %s", code.c_str(),
+                      entity_id.c_str(), clear_result.error_message.c_str());
         }
       }
     }
-
-    // Format: return 204 No Content on successful delete
-    res.status = 204;
-
+    return http::NoContent{};
   } catch (const std::exception & e) {
-    HandlerContext::send_error(res, 500, ERR_INTERNAL_ERROR, "Failed to clear faults",
-                               {{"details", e.what()}, {"entity_id", entity_id}});
-    RCLCPP_ERROR(HandlerContext::logger(), "Error in handle_clear_all_faults for entity '%s': %s", entity_id.c_str(),
+    RCLCPP_ERROR(HandlerContext::logger(), "Error in clear_all_faults for entity '%s': %s", entity_id.c_str(),
                  e.what());
+    return tl::make_unexpected(make_error(500, ERR_INTERNAL_ERROR, "Failed to clear faults",
+                                          json{{"details", e.what()}, {"entity_id", entity_id}}));
   }
 }
 
-void FaultHandlers::handle_clear_all_faults_global(const httplib::Request & req, httplib::Response & res) {
+// =============================================================================
+// DELETE /faults - clear all faults globally (extension, not SOVD)
+// =============================================================================
+
+http::Result<std::pair<http::NoContent, http::ResponseAttachments>>
+FaultHandlers::clear_all_faults_global(const http::TypedRequest & req) {
   try {
-    auto filter = parse_fault_status_param(req);
-    if (!filter.is_valid) {
-      HandlerContext::send_error(res, 400, ERR_INVALID_PARAMETER, "Invalid status parameter value",
-                                 {{"allowed_values", "pending, confirmed, cleared, healed, all"},
-                                  {"parameter", "status"},
-                                  {"value", req.get_param_value("status")}});
-      return;
+    auto filter_result = read_fault_status_filter(req);
+    if (!filter_result) {
+      return tl::make_unexpected(filter_result.error());
     }
+    const auto filter = *filter_result;
 
     auto fault_mgr = ctx_.node()->get_fault_manager();
-    // Global clear is the "nuclear option" — always include muted (correlated) faults,
-    // unlike per-entity clear which respects the default include_muted=false.
+    // Global clear is the "nuclear option" - always include muted (correlated)
+    // faults, unlike per-entity clear which respects the default
+    // include_muted=false.
     auto faults_result = fault_mgr->list_faults("", filter.include_pending, filter.include_confirmed,
                                                 filter.include_cleared, filter.include_healed, true);
-
     if (!faults_result.success) {
-      HandlerContext::send_error(res, 503, ERR_SERVICE_UNAVAILABLE, "Failed to retrieve faults",
-                                 {{"details", faults_result.error_message}});
-      return;
+      return tl::make_unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, "Failed to retrieve faults",
+                                            json{{"details", faults_result.error_message}}));
     }
 
     // Build FQN-to-entity-ID map for lock checking
@@ -654,7 +1045,7 @@ void FaultHandlers::handle_clear_all_faults_global(const httplib::Request & req,
       }
     }
 
-    auto client_id = req.get_header_value("X-Client-Id");
+    auto client_id = req.header("X-Client-Id").value_or(std::string{});
 
     // Clear each fault, skipping those on locked entities
     if (faults_result.data.contains("faults") && faults_result.data["faults"].is_array()) {
@@ -680,24 +1071,34 @@ void FaultHandlers::handle_clear_all_faults_global(const httplib::Request & req,
         }
 
         if (blocked) {
-          continue;  // Skip faults on locked entities
+          continue;
         }
 
-        std::string fault_code = fault["fault_code"].get<std::string>();
-        auto clear_result = fault_mgr->clear_fault(fault_code);
+        std::string code = fault["fault_code"].get<std::string>();
+        auto clear_result = fault_mgr->clear_fault(code);
         if (!clear_result.success) {
-          RCLCPP_WARN(HandlerContext::logger(), "Failed to clear fault '%s': %s", fault_code.c_str(),
+          RCLCPP_WARN(HandlerContext::logger(), "Failed to clear fault '%s': %s", code.c_str(),
                       clear_result.error_message.c_str());
         }
       }
     }
 
-    // Return 204 No Content on successful delete
-    res.status = 204;
-
+    // Design limitation: this only clears faults on the local FaultManager.
+    // Peer faults visible via fan_out_get in `list_all_faults` are NOT cleared
+    // because that would require fan-out DELETE requests to each peer, which
+    // introduces distributed transaction semantics (partial failures, rollback)
+    // that are out of scope. Clients should clear peer faults by calling each
+    // peer's clear endpoint directly.
+    //
+    // The X-Medkit-Local-Only header signals this to clients. A 204 response
+    // cannot carry a JSON body per HTTP spec, so we use a header instead.
+    http::ResponseAttachments att;
+    att.with_header("X-Medkit-Local-Only", "true");
+    return std::pair{http::NoContent{}, std::move(att)};
   } catch (const std::exception & e) {
-    HandlerContext::send_error(res, 500, ERR_INTERNAL_ERROR, "Failed to clear faults", {{"details", e.what()}});
-    RCLCPP_ERROR(HandlerContext::logger(), "Error in handle_clear_all_faults_global: %s", e.what());
+    RCLCPP_ERROR(HandlerContext::logger(), "Error in clear_all_faults_global: %s", e.what());
+    return tl::make_unexpected(
+        make_error(500, ERR_INTERNAL_ERROR, "Failed to clear faults", json{{"details", e.what()}}));
   }
 }
 

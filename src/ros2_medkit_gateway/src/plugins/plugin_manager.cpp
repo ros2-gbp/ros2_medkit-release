@@ -12,11 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "ros2_medkit_gateway/plugins/plugin_manager.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 
 #include <dlfcn.h>
+#include <httplib.h>
 
 #include <rclcpp/rclcpp.hpp>
+
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_http_types.hpp"
 
 namespace ros2_medkit_gateway {
 
@@ -50,6 +54,7 @@ PluginManager::~PluginManager() {
   plugins_.clear();
 }
 
+// Called during init only (before HTTP server starts). No lock needed.
 void PluginManager::add_plugin(std::unique_ptr<GatewayPlugin> plugin) {
   LoadedPlugin lp;
   lp.config = nlohmann::json::object();
@@ -59,6 +64,9 @@ void PluginManager::add_plugin(std::unique_ptr<GatewayPlugin> plugin) {
   lp.introspection_provider = dynamic_cast<IntrospectionProvider *>(plugin.get());
   lp.log_provider = dynamic_cast<LogProvider *>(plugin.get());
   lp.script_provider = dynamic_cast<ScriptProvider *>(plugin.get());
+  lp.data_provider = dynamic_cast<DataProvider *>(plugin.get());
+  lp.operation_provider = dynamic_cast<OperationProvider *>(plugin.get());
+  lp.fault_provider = dynamic_cast<FaultProvider *>(plugin.get());
 
   // Cache first UpdateProvider, warn on duplicates
   if (lp.update_provider) {
@@ -92,6 +100,7 @@ void PluginManager::add_plugin(std::unique_ptr<GatewayPlugin> plugin) {
   plugins_.push_back(std::move(lp));
 }
 
+// Called during init only (before HTTP server starts). No lock needed.
 size_t PluginManager::load_plugins(const std::vector<PluginConfig> & configs) {
   size_t loaded = 0;
   for (const auto & cfg : configs) {
@@ -109,6 +118,9 @@ size_t PluginManager::load_plugins(const std::vector<PluginConfig> & configs) {
       // IntrospectionProvider mechanism - safe across the dlopen boundary).
       lp.log_provider = result->log_provider;
       lp.script_provider = result->script_provider;
+      lp.data_provider = result->data_provider;
+      lp.operation_provider = result->operation_provider;
+      lp.fault_provider = result->fault_provider;
 
       // Cache first UpdateProvider, warn on duplicates
       if (lp.update_provider) {
@@ -193,10 +205,16 @@ void PluginManager::disable_plugin(LoadedPlugin & lp) {
   lp.introspection_provider = nullptr;
   lp.log_provider = nullptr;
   lp.script_provider = nullptr;
+  lp.data_provider = nullptr;
+  lp.operation_provider = nullptr;
+  lp.fault_provider = nullptr;
   lp.load_result.update_provider = nullptr;
   lp.load_result.introspection_provider = nullptr;
   lp.load_result.log_provider = nullptr;
   lp.load_result.script_provider = nullptr;
+  lp.load_result.data_provider = nullptr;
+  lp.load_result.operation_provider = nullptr;
+  lp.load_result.fault_provider = nullptr;
   lp.load_result.plugin.reset();
 }
 
@@ -267,13 +285,49 @@ void PluginManager::register_routes(httplib::Server & server, const std::string 
       continue;
     }
     try {
-      lp.load_result.plugin->register_routes(server, api_prefix);
+      auto routes = lp.load_result.plugin->get_routes();
+      for (auto & route : routes) {
+        std::string full_pattern = api_prefix + "/" + route.pattern;
+        auto handler_fn = route.handler;  // capture by value for lambda
+        auto plugin_name = lp.load_result.plugin->name();
+        auto httplib_handler = [handler_fn, plugin_name, full_pattern](const httplib::Request & req,
+                                                                       httplib::Response & res) {
+          try {
+            PluginRequest plugin_req(&req);
+            PluginResponse plugin_res(&res);
+            handler_fn(plugin_req, plugin_res);
+          } catch (const std::exception & e) {
+            RCLCPP_ERROR(rclcpp::get_logger("plugin_manager"), "Plugin '%s' handler threw on %s: %s",
+                         plugin_name.c_str(), full_pattern.c_str(), e.what());
+            PluginResponse plugin_res(&res);
+            plugin_res.send_error(500, ERR_PLUGIN_ERROR, "Internal plugin error");
+          } catch (...) {
+            RCLCPP_ERROR(rclcpp::get_logger("plugin_manager"), "Plugin '%s' handler threw unknown exception on %s",
+                         plugin_name.c_str(), full_pattern.c_str());
+            PluginResponse plugin_res(&res);
+            plugin_res.send_error(500, ERR_PLUGIN_ERROR, "Internal plugin error");
+          }
+        };
+
+        if (route.method == "GET") {
+          server.Get(full_pattern, httplib_handler);
+        } else if (route.method == "POST") {
+          server.Post(full_pattern, httplib_handler);
+        } else if (route.method == "PUT") {
+          server.Put(full_pattern, httplib_handler);
+        } else if (route.method == "DELETE") {
+          server.Delete(full_pattern, httplib_handler);
+        } else {
+          RCLCPP_WARN(logger(), "Plugin '%s' registered route with unknown method '%s' - skipping",
+                      lp.load_result.plugin->name().c_str(), route.method.c_str());
+        }
+      }
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(logger(), "Plugin '%s' threw during register_routes(): %s - disabling",
+      RCLCPP_ERROR(logger(), "Plugin '%s' threw during get_routes(): %s - disabling",
                    lp.load_result.plugin->name().c_str(), e.what());
       disable_plugin(lp);
     } catch (...) {
-      RCLCPP_ERROR(logger(), "Plugin '%s' threw unknown exception during register_routes() - disabling",
+      RCLCPP_ERROR(logger(), "Plugin '%s' threw unknown exception during get_routes() - disabling",
                    lp.load_result.plugin->name().c_str());
       disable_plugin(lp);
     }
@@ -355,24 +409,6 @@ std::vector<std::pair<std::string, IntrospectionProvider *>> PluginManager::get_
   return result;
 }
 
-std::vector<GatewayPlugin::RouteDescription> PluginManager::get_all_route_descriptions() const {
-  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
-  std::vector<GatewayPlugin::RouteDescription> all;
-  for (const auto & lp : plugins_) {
-    if (!lp.load_result.plugin) {
-      continue;
-    }
-    try {
-      auto routes = lp.load_result.plugin->get_route_descriptions();
-      all.insert(all.end(), routes.begin(), routes.end());
-    } catch (const std::exception & e) {
-      RCLCPP_ERROR(rclcpp::get_logger("plugin_manager"), "Plugin '%s' threw in get_route_descriptions(): %s",
-                   lp.load_result.plugin->name().c_str(), e.what());
-    }
-  }
-  return all;
-}
-
 bool PluginManager::has_plugins() const {
   std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
   for (const auto & lp : plugins_) {
@@ -392,6 +428,81 @@ std::vector<std::string> PluginManager::plugin_names() const {
     }
   }
   return names;
+}
+
+void PluginManager::register_entity_ownership(const std::string & plugin_name,
+                                              const std::vector<std::string> & entity_ids) {
+  std::unique_lock<std::shared_mutex> lock(plugins_mutex_);
+  for (const auto & eid : entity_ids) {
+    auto it = entity_ownership_.find(eid);
+    if (it != entity_ownership_.end() && it->second != plugin_name) {
+      RCLCPP_WARN(logger(), "Entity '%s' ownership transferred from plugin '%s' to '%s'", eid.c_str(),
+                  it->second.c_str(), plugin_name.c_str());
+    }
+    entity_ownership_[eid] = plugin_name;
+  }
+}
+
+void PluginManager::clear_entity_ownership(const std::string & plugin_name) {
+  std::unique_lock<std::shared_mutex> lock(plugins_mutex_);
+  for (auto it = entity_ownership_.begin(); it != entity_ownership_.end();) {
+    if (it->second == plugin_name) {
+      it = entity_ownership_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+DataProvider * PluginManager::get_data_provider_for_entity(const std::string & entity_id) const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+  auto own_it = entity_ownership_.find(entity_id);
+  if (own_it == entity_ownership_.end()) {
+    return nullptr;
+  }
+  for (const auto & lp : plugins_) {
+    if (lp.load_result.plugin && lp.load_result.plugin->name() == own_it->second) {
+      return lp.data_provider;
+    }
+  }
+  return nullptr;
+}
+
+OperationProvider * PluginManager::get_operation_provider_for_entity(const std::string & entity_id) const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+  auto own_it = entity_ownership_.find(entity_id);
+  if (own_it == entity_ownership_.end()) {
+    return nullptr;
+  }
+  for (const auto & lp : plugins_) {
+    if (lp.load_result.plugin && lp.load_result.plugin->name() == own_it->second) {
+      return lp.operation_provider;
+    }
+  }
+  return nullptr;
+}
+
+FaultProvider * PluginManager::get_fault_provider_for_entity(const std::string & entity_id) const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+  auto own_it = entity_ownership_.find(entity_id);
+  if (own_it == entity_ownership_.end()) {
+    return nullptr;
+  }
+  for (const auto & lp : plugins_) {
+    if (lp.load_result.plugin && lp.load_result.plugin->name() == own_it->second) {
+      return lp.fault_provider;
+    }
+  }
+  return nullptr;
+}
+
+std::optional<std::string> PluginManager::get_entity_owner(const std::string & entity_id) const {
+  std::shared_lock<std::shared_mutex> lock(plugins_mutex_);
+  auto it = entity_ownership_.find(entity_id);
+  if (it != entity_ownership_.end()) {
+    return it->second;
+  }
+  return std::nullopt;
 }
 
 std::vector<openapi::RouteDescriptions> PluginManager::collect_route_descriptions() const {

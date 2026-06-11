@@ -162,33 +162,45 @@ Step 3: Discover Areas and Components
 
 ros2_medkit organizes ROS 2 nodes into a SOVD-aligned entity hierarchy:
 
-- **Areas** — Logical/physical domains (e.g., ``/powertrain``, ``/chassis``)
-- **Components** — Hardware or virtual units that group Apps
-- **Apps** — Individual ROS 2 nodes
-- **Functions** — Cross-cutting capabilities (requires manifest mode)
+- **Areas** - Logical/physical domains (e.g., ``/powertrain``, ``/chassis``)
+- **Components** - Hardware or virtual units that group Apps
+- **Apps** - Individual ROS 2 nodes
+- **Functions** - Cross-cutting capabilities (requires manifest mode)
 
 .. note::
 
    **Discovery Modes**
 
-   - **Runtime-only** (default): Each ROS 2 namespace becomes an Area, and
-     ROS 2 nodes within it are exposed as Apps. Synthetic Components are
-     created to group these Apps by namespace.
+   - **Runtime-only** (default): ROS 2 nodes are exposed as Apps. A single
+     host-level Component is created from system info. Namespace prefixes
+     create Functions that group related Apps.
    - **Hybrid**: Manifest defines Areas/Components/Apps/Functions, runtime
      links them to live ROS 2 nodes.
    - **Manifest-only**: Only manifest-declared entities are exposed.
 
+   Areas are created from manifest only - they are never auto-generated in
+   runtime mode. Omit the ``areas:`` section in the manifest for a flat tree.
+
    See :doc:`tutorials/manifest-discovery` for details on manifest mode.
+
+   .. important::
+
+      If you are upgrading from a previous version, the entity model has
+      changed significantly. Synthetic Areas and per-namespace Components
+      are no longer created. See
+      :ref:`Breaking Changes <aggregation-breaking-changes>` for details
+      and migration guidance.
 
    In this tutorial, we use runtime-only mode with ``demo_nodes.launch.py``.
 
-**List all areas:**
+**List all functions:**
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/areas
+   curl http://localhost:8080/api/v1/functions
 
-With ``demo_nodes.launch.py``, you'll see areas like ``powertrain``, ``chassis``, and ``body``.
+With ``demo_nodes.launch.py``, you'll see Functions like ``powertrain``, ``chassis``, and ``body``
+(created from the first namespace segment).
 
 **List all components:**
 
@@ -196,11 +208,16 @@ With ``demo_nodes.launch.py``, you'll see areas like ``powertrain``, ``chassis``
 
    curl http://localhost:8080/api/v1/components
 
-**List components in a specific area:**
+In runtime mode, you'll see a single host-level Component.
+
+**List all areas:**
 
 .. code-block:: bash
 
-   curl http://localhost:8080/api/v1/areas/powertrain/components
+   curl http://localhost:8080/api/v1/areas
+
+In runtime mode, this returns an empty list. Areas require a manifest definition
+(see :doc:`tutorials/manifest-discovery`).
 
 Step 4: Read Sensor Data
 ------------------------
@@ -309,8 +326,8 @@ Notice:
 
    You should see:
 
-   - Areas like ``powertrain``, ``chassis``, ``body``
-   - Components with ``temp_sensor``, ``brake_actuator``, etc.
+   - Functions like ``powertrain``, ``chassis``, ``body`` (from namespace segments)
+   - A single host-level Component (from system info)
    - Live topic data with actual sensor readings
 
 Step 5: Call Services and Actions

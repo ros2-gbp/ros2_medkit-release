@@ -12,38 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "ros2_medkit_gateway/plugins/plugin_context.hpp"
+#include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 
 #include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <vector>
 
-#include "ros2_medkit_gateway/condition_evaluator.hpp"
-#include "ros2_medkit_gateway/fault_manager.hpp"
+#include "ros2_medkit_gateway/core/entity_validation.hpp"
+
+#include "ros2_medkit_gateway/core/condition_evaluator.hpp"
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
+#include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/managers/fault_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/lock_manager.hpp"
+#include "ros2_medkit_gateway/core/resource_change_notifier.hpp"
+#include "ros2_medkit_gateway/core/resource_sampler.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
-#include "ros2_medkit_gateway/http/error_codes.hpp"
-#include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
-#include "ros2_medkit_gateway/http/http_utils.hpp"
-#include "ros2_medkit_gateway/lock_manager.hpp"
-#include "ros2_medkit_gateway/resource_change_notifier.hpp"
-#include "ros2_medkit_gateway/resource_sampler.hpp"
 
 namespace ros2_medkit_gateway {
 
-// ---- Static utility methods (delegate to HandlerContext) ----
-
-void PluginContext::send_error(httplib::Response & res, int status, const std::string & error_code,
-                               const std::string & message, const nlohmann::json & parameters) {
-  handlers::HandlerContext::send_error(res, status, error_code, message, parameters);
-}
-
-void PluginContext::send_json(httplib::Response & res, const nlohmann::json & data) {
-  handlers::HandlerContext::send_json(res, data);
-}
-
 // ---- Concrete implementation ----
 
-class GatewayPluginContext : public PluginContext {
+class GatewayPluginContext : public RosPluginContext {
  public:
   GatewayPluginContext(GatewayNode * node, FaultManager * fault_manager, ResourceSamplerRegistry * sampler_registry)
     : node_(node), fault_manager_(fault_manager), sampler_registry_(sampler_registry) {
@@ -110,27 +100,28 @@ class GatewayPluginContext : public PluginContext {
     return nlohmann::json::array();
   }
 
-  std::optional<PluginEntityInfo> validate_entity_for_route(const httplib::Request & req, httplib::Response & res,
+  std::optional<PluginEntityInfo> validate_entity_for_route(const PluginRequest & req, PluginResponse & res,
                                                             const std::string & entity_id) const override {
-    // Validate entity ID format
-    if (entity_id.empty() || entity_id.size() > 256) {
-      send_error(res, 400, ERR_INVALID_PARAMETER, "Invalid entity ID");
+    // Validate entity ID format (shared validation with HandlerContext)
+    if (auto err = validate_entity_id(entity_id); !err) {
+      res.send_error(400, ERR_INVALID_PARAMETER, err.error());
       return std::nullopt;
     }
 
     // Determine expected type from route path (segment-boundary-aware matching)
-    auto expected_type = extract_entity_type_from_path(req.path);
+    auto expected_type = extract_entity_type_from_path(req.path());
 
     auto entity = get_entity(entity_id);
     if (!entity) {
-      send_error(res, 404, ERR_ENTITY_NOT_FOUND, to_string(expected_type) + " not found: " + entity_id);
+      res.send_error(404, ERR_ENTITY_NOT_FOUND, to_string(expected_type) + " not found: " + entity_id);
       return std::nullopt;
     }
 
     // Check type matches route
     if (expected_type != SovdEntityType::UNKNOWN && entity->type != expected_type) {
-      send_error(res, 400, ERR_INVALID_PARAMETER,
-                 "Entity '" + entity_id + "' is a " + to_string(entity->type) + ", not a " + to_string(expected_type));
+      res.send_error(400, ERR_INVALID_PARAMETER,
+                     "Entity '" + entity_id + "' is a " + to_string(entity->type) + ", not a " +
+                         to_string(expected_type));
       return std::nullopt;
     }
 
@@ -245,6 +236,17 @@ class GatewayPluginContext : public PluginContext {
     return node_->get_condition_registry();
   }
 
+  // ---- Entity surface notifications (plugin API v7) ----
+
+  void notify_entities_changed(const EntityChangeScope & scope) override {
+    // Forward the notification directly to GatewayNode for immediate
+    // handling. This call is synchronous at this layer - the caller's
+    // thread runs the full discovery refresh before returning. Any
+    // serialization across concurrent plugin notifications is performed by
+    // GatewayNode itself via its internal refresh mutex.
+    node_->handle_entity_change_notification(scope);
+  }
+
  private:
   GatewayNode * node_;
   FaultManager * fault_manager_;
@@ -255,8 +257,8 @@ class GatewayPluginContext : public PluginContext {
   std::unordered_map<std::string, std::vector<std::string>> entity_capabilities_;
 };
 
-std::unique_ptr<PluginContext> make_gateway_plugin_context(GatewayNode * node, FaultManager * fault_manager,
-                                                           ResourceSamplerRegistry * sampler_registry) {
+std::unique_ptr<RosPluginContext> make_gateway_plugin_context(GatewayNode * node, FaultManager * fault_manager,
+                                                              ResourceSamplerRegistry * sampler_registry) {
   return std::make_unique<GatewayPluginContext>(node, fault_manager, sampler_registry);
 }
 
