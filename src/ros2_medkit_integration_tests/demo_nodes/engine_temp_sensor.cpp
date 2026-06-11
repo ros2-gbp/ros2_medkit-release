@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <mutex>
 #include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/temperature.hpp>
+
+#include "ros2_medkit_integration_tests/demo_node_main.hpp"
 
 class EngineTempSensor : public rclcpp::Node {
  public:
@@ -62,11 +65,19 @@ class EngineTempSensor : public rclcpp::Node {
   }
 
   ~EngineTempSensor() {
+    param_callback_handle_.reset();
     timer_->cancel();
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    timer_.reset();
+    temp_pub_.reset();
   }
 
  private:
   rcl_interfaces::msg::SetParametersResult on_parameter_change(const std::vector<rclcpp::Parameter> & parameters) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!temp_pub_) {
+      return rcl_interfaces::msg::SetParametersResult();
+    }
     rcl_interfaces::msg::SetParametersResult result;
     result.successful = true;
 
@@ -80,6 +91,7 @@ class EngineTempSensor : public rclcpp::Node {
         }
         publish_rate_ = new_rate;
         // Recreate timer with new rate
+        timer_->cancel();
         int period_ms = static_cast<int>(1000.0 / publish_rate_);
         timer_ = this->create_wall_timer(std::chrono::milliseconds(period_ms),
                                          std::bind(&EngineTempSensor::publish_data, this));
@@ -100,6 +112,10 @@ class EngineTempSensor : public rclcpp::Node {
   }
 
   void publish_data() {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    if (!temp_pub_) {
+      return;
+    }
     current_temp_ += temp_step_;
     if (current_temp_ > max_temp_) {
       current_temp_ = min_temp_;
@@ -116,6 +132,7 @@ class EngineTempSensor : public rclcpp::Node {
     RCLCPP_INFO(this->get_logger(), "Temperature: %.1f°C", current_temp_);
   }
 
+  std::mutex callback_mutex_;
   rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr temp_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
@@ -128,8 +145,7 @@ class EngineTempSensor : public rclcpp::Node {
 };
 
 int main(int argc, char ** argv) {
-  rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<EngineTempSensor>());
-  rclcpp::shutdown();
-  return 0;
+  return ros2_medkit_integration_tests::run_demo_node(argc, argv, [] {
+    return std::make_shared<EngineTempSensor>();
+  });
 }
