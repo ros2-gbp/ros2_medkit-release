@@ -6,6 +6,45 @@ This section contains design documentation for the ros2_medkit_gateway project.
 Architecture
 ------------
 
+Build Layers
+~~~~~~~~~~~~
+
+The package compiles into two layered static libraries with a strict
+dependency direction:
+
+* ``gateway_core`` - middleware-neutral business logic. Sources live under
+  ``src/core/`` and headers under ``include/ros2_medkit_gateway/core/``.
+  Links only header-only and C-level externals (cpp-httplib,
+  nlohmann/json, yaml-cpp, tl::expected, jwt-cpp, OpenSSL, SQLite, dl).
+  Carries no rclcpp / rcl_interfaces / message-package dependency.
+  Hosts the neutral HTTP request handlers, JWT authentication,
+  fault model (debounce, storage, cache, correlation), peer aggregation,
+  manifest parsing, the entity cache, the neutral managers (lock,
+  bulk-data, subscription, script, update, plugin), and every provider
+  interface contract.
+* ``gateway_ros2`` - ROS adapter layer. Compiles the remaining sources
+  under ``src/`` and links ``gateway_core`` publicly via
+  ``medkit_target_dependencies``. Hosts ``GatewayNode`` (the
+  ``rclcpp::Node`` entry point), the ROS-coupled managers (data access,
+  operation, configuration, fault facade, log, trigger), runtime
+  discovery, the native topic sampler, and the ROS-specific provider
+  default implementations.
+
+The ``gateway_node`` executable and existing test targets link
+``gateway_ros2``, so they transitively get both layers from a single
+dependency. The neutral contract is enforced by two CTest checks:
+
+* ``gateway_core_purity`` (linter label) - greps ``core/`` for any
+  ROS-package include and fails on any match.
+* ``test_gateway_core_smoke`` (unit label) - compiles a translation unit
+  including a sampling of ``core/`` headers and links exclusively against
+  ``gateway_core`` + GTest with no ``ament_target_dependencies``. Build
+  failure indicates a transitive ROS coupling that the grep guard might
+  miss when an include is reached through a third-party header.
+
+Class Diagram
+~~~~~~~~~~~~~
+
 The following diagram shows the relationships between the main components of the gateway.
 
 .. plantuml::
@@ -27,6 +66,23 @@ The following diagram shows the relationships between the main components of the
    }
 
    package "ros2_medkit_gateway" {
+
+   note as N_layer_split
+   This package compiles into two layered static libraries:
+   * gateway_core - middleware-neutral business logic (handlers,
+     auth, fault model, aggregation, all SOVD managers including
+     DataAccessManager, OperationManager, ConfigurationManager,
+     FaultManager, LogManager, TriggerManager, providers, entity
+     model). Does not link rclcpp. Managers consume neutral
+     Transport interfaces (TopicTransport, ServiceTransport,
+     ActionTransport, ParameterTransport, FaultServiceTransport,
+     LogSource, TopicSubscriptionTransport).
+   * gateway_ros2 - ROS-binding adapters (GatewayNode plus the
+     Ros2*Transport implementations, TriggerTopicSubscriber,
+     Ros2RuntimeIntrospection, NativeTopicSampler). Publicly links
+     gateway_core. Class associations on this diagram remain valid;
+     the boundary affects build-time only.
+   end note
 
        class GatewayNode {
            + get_entity_cache(): EntityCache
@@ -57,22 +113,11 @@ The following diagram shows the relationships between the main components of the
            + get_name(): string
        }
 
-       class RuntimeDiscoveryStrategy {
-           + discover_synthetic_components(): vector<Component>
-           + discover_topic_components(): vector<Component>
+       class Ros2RuntimeIntrospection {
+           + introspect(IntrospectionInput): IntrospectionResult
+           + discover_apps(): vector<App>
+           + discover_functions(): vector<Function>
            - config_: RuntimeConfig
-       }
-
-       class ManifestDiscoveryStrategy {
-           + load_manifest(): void
-           - manifest_: Manifest
-       }
-
-       class HybridDiscoveryStrategy {
-           - pipeline_: MergePipeline
-           + refresh(): void
-           + add_layer(): void
-           + get_merge_report(): MergeReport
        }
 
        class MergePipeline {
@@ -94,7 +139,7 @@ The following diagram shows the relationships between the main components of the
        }
 
        class RuntimeLayer {
-           - strategy_: RuntimeDiscoveryStrategy*
+           - runtime_introspection_: Ros2RuntimeIntrospection*
            - gap_fill_config_: GapFillConfig
        }
 
@@ -161,11 +206,24 @@ The following diagram shows the relationships between the main components of the
            + delete_execution(): expected<void, Error>
        }
 
-       class NativeTopicSampler {
-           + discover_all_topics(): vector<TopicInfo>
-           + discover_topics(): vector<TopicInfo>
-           + sample_topic(): TopicSampleResult
-           + sample_topics_parallel(): vector<TopicSampleResult>
+       interface TopicDataProvider <<interface>> {
+           + sample(): expected<TopicSampleResult, ErrorInfo>
+           + sample_parallel(): expected<vector<TopicSampleResult>, ErrorInfo>
+           + discover_all(): vector<TopicInfo>
+           + has_publishers(): bool
+       }
+
+       class Ros2TopicDataProvider {
+           + sample(): expected<TopicSampleResult, ErrorInfo>
+           + sample_parallel(): expected<vector<TopicSampleResult>, ErrorInfo>
+           + discover_all(): vector<TopicInfo>
+           + x_medkit_stats(): json
+       }
+
+       class Ros2SubscriptionExecutor {
+           + run_sync(): expected<R, string>
+           + post(): bool
+           + on_graph_change(): void
        }
 
        class JsonSerializer {
@@ -258,8 +316,9 @@ The following diagram shows the relationships between the main components of the
        }
 
        class TriggerTopicSubscriber {
-           + subscribe_topic(): void
-           + unsubscribe_topic(): void
+           + subscribe(topic, type, handle_key, cb): void
+           + unsubscribe(handle_key): void
+           + set_retry_callback(cb): void
        }
 
        class EntityCache {
@@ -300,19 +359,22 @@ The following diagram shows the relationships between the main components of the
    RESTServer --> ConfigurationManager : uses
    RESTServer --> ScriptManager : uses
 
-   ' OperationManager uses DiscoveryManager and native serialization
+   ' OperationManager routes via Service/Action transports
    OperationManager --> DiscoveryManager : uses
-   OperationManager *--> JsonSerializer : owns
+   OperationManager --> ServiceTransport : uses (via transport port)
+   OperationManager --> ActionTransport : uses (via transport port)
 
-   ' DataAccessManager owns utility classes and uses native publishing
-   DataAccessManager *--> JsonSerializer : owns (serialization)
-   DataAccessManager *--> NativeTopicSampler : owns
+   ' DataAccessManager routes via TopicTransport; serialization moves to the transport
+   DataAccessManager --> TopicTransport : uses (via transport port)
+   DataAccessManager ..> TopicDataProvider : uses (non-owning)
 
-   ' NativeTopicSampler uses Node interface
-   NativeTopicSampler --> "rclcpp::Node" : uses
+   ' Ros2TopicDataProvider is the default implementation of TopicDataProvider
+   Ros2TopicDataProvider ..|> TopicDataProvider
+   Ros2TopicDataProvider *--> Ros2SubscriptionExecutor : uses
+   Ros2SubscriptionExecutor --> "rclcpp::Node" : uses (subscription node)
 
-   ' ConfigurationManager uses Node interface for parameter clients
-   ConfigurationManager --> "rclcpp::Node" : uses
+   ' ConfigurationManager routes parameter CRUD via ParameterTransport
+   ConfigurationManager --> ParameterTransport : uses (via transport port)
 
    ' Entity Cache aggregates entities
    EntityCache o-right-> Area : contains many
@@ -331,11 +393,9 @@ The following diagram shows the relationships between the main components of the
    DiscoveryManager ..> ActionInfo : creates
 
    ' Discovery strategy hierarchy
-   DiscoveryManager --> DiscoveryStrategy : uses
-   RuntimeDiscoveryStrategy .up.|> DiscoveryStrategy : implements
-   ManifestDiscoveryStrategy .up.|> DiscoveryStrategy : implements
-   HybridDiscoveryStrategy .up.|> DiscoveryStrategy : implements
-   HybridDiscoveryStrategy *--> MergePipeline : owns
+   DiscoveryManager *--> Ros2RuntimeIntrospection : owns
+   DiscoveryManager *--> MergePipeline : owns (hybrid mode)
+   Ros2RuntimeIntrospection .up.|> IntrospectionProvider : implements
 
    ' MergePipeline layer architecture
    MergePipeline o--> DiscoveryLayer : ordered layers
@@ -343,7 +403,7 @@ The following diagram shows the relationships between the main components of the
    ManifestLayer .up.|> DiscoveryLayer : implements
    RuntimeLayer .up.|> DiscoveryLayer : implements
    PluginLayer .up.|> DiscoveryLayer : implements
-   RuntimeLayer --> RuntimeDiscoveryStrategy : delegates
+   RuntimeLayer --> Ros2RuntimeIntrospection : delegates
 
    ' REST Server uses HTTP library
    RESTServer *--> HTTPLibServer : owns
@@ -361,7 +421,7 @@ The following diagram shows the relationships between the main components of the
    TriggerManager --> ResourceChangeNotifier : subscribes to
    TriggerManager --> ConditionRegistry : evaluates with
    TriggerManager --> TriggerStore : persists via
-   TriggerManager --> TriggerTopicSubscriber : manages data subscriptions
+   TriggerManager --> "TopicSubscriptionTransport" : data subscriptions via transport
    SqliteTriggerStore .up.|> TriggerStore : implements
    ConditionRegistry o--> ConditionEvaluator : contains many
    RESTServer --> TriggerManager : uses
@@ -369,38 +429,91 @@ The following diagram shows the relationships between the main components of the
 
    @enduml
 
+Testing with Mock Transports
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Transport ports under ``core/transports/`` are abstract interfaces. A
+manager unit test injects a mock implementation and links only against
+``gateway_core`` + GTest, with no ``rclcpp`` on the link line. This is the
+pattern used by the ``test_*_manager_routing.cpp`` tests:
+
+.. code-block:: cpp
+
+   class MockTopicTransport : public TopicTransport {
+    public:
+     nlohmann::json publish(const std::string &, const std::string &,
+                            const nlohmann::json &,
+                            std::chrono::duration<double>) override {
+       return nlohmann::json::object();
+     }
+     TopicSample sample(const std::string & topic,
+                        std::chrono::duration<double>) override {
+       TopicSample s;
+       s.success = true;
+       s.status = "data";
+       s.topic = topic;
+       s.data = next_sample_;
+       return s;
+     }
+     std::pair<uint64_t, uint64_t>
+     count_publishers_subscribers(const std::string &) const override {
+       return {1, 0};
+     }
+     ros2_medkit_serialization::TypeIntrospection *
+     get_type_introspection() const override { return nullptr; }
+
+     nlohmann::json next_sample_ = nlohmann::json::object();
+   };
+
+   TEST(DataAccessManagerRouting, ReadRoutesThroughTransport) {
+     MockTopicTransport transport;
+     transport.next_sample_["value"] = 42;
+     DataAccessManager mgr(&transport, /* other neutral deps */);
+
+     auto result = mgr.get_topic_sample_with_fallback("/sensor", "");
+     ASSERT_EQ(result["data"]["value"], 42);
+   }
+
+The mock is purely C++; no ROS context, executor, or domain ID is needed.
+
 Main Components
 ---------------
 
-1. **GatewayNode** - The main ROS 2 node that orchestrates the system
+Each entry below is tagged with the static library it compiles into:
+``[gateway_core]`` (middleware-neutral, no ROS dependency) or
+``[gateway_ros2]`` (links rclcpp / message packages).
+
+1. **GatewayNode** ``[gateway_ros2]`` - The main ROS 2 node that orchestrates the system
    - Extends ``rclcpp::Node``
    - Manages periodic discovery and cache refresh
    - Runs the REST server in a separate thread
    - Provides thread-safe access to the entity cache
    - Manages periodic cleanup of old action goals (60s interval)
 
-2. **DiscoveryManager** - Discovers ROS 2 entities and maps them to the SOVD hierarchy
+2. **DiscoveryManager** ``[gateway_ros2]`` - Discovers ROS 2 entities and maps them to the SOVD hierarchy
    - Discovers Areas from node namespaces or manifest definitions
    - Discovers Components (synthetic groups from runtime, or explicit from manifest)
    - Discovers Apps from ROS 2 nodes (individual running processes)
    - Discovers Services and Actions using native rclcpp APIs
    - Attaches operations (services/actions) to their parent Apps and Components
-   - Uses pluggable strategy pattern: Runtime, Manifest, or Hybrid
+   - Routes built-in graph queries through the same ``IntrospectionProvider`` chain used by plugins
    - Uses O(n+m) algorithm with hash maps for efficient service/action attachment
 
-   **Discovery Strategies:**
+   **Discovery providers and layers:**
 
-   - **RuntimeDiscoveryStrategy** - Heuristic discovery via ROS 2 graph introspection
+   - **Ros2RuntimeIntrospection** ``[gateway_ros2]`` - IntrospectionProvider wrapping ROS 2 graph queries
      - Maps nodes to Apps with ``source: "heuristic"``
-     - Creates synthetic Components grouped by namespace
-     - Handles topic-only namespaces (Isaac Sim, bridges) via TopicOnlyPolicy
-   - **ManifestDiscoveryStrategy** - Static discovery from YAML manifest
-     - Provides stable, semantic entity IDs
+     - Creates Functions from namespace grouping
+     - Never creates Areas or Components (those come from manifest/HostInfoProvider)
+     - Same interface as plugin-provided IntrospectionProviders, so the merge pipeline treats built-in graph queries identically to plugin contributions
+   - **ManifestLayer** ``[gateway_core]`` - Static layer fed by ``ManifestManager``
+     - Provides stable, semantic entity IDs from declarative YAML
      - Supports offline detection of failed components
-   - **HybridDiscoveryStrategy** - Combines manifest + runtime via MergePipeline
-     - Delegates to ``MergePipeline`` which orchestrates ordered discovery layers
-     - Supports dynamic plugin layers added at runtime
-     - Thread-safe: mutex protects cached results, returns by value
+     - ``manifest_only`` mode bypasses the merge pipeline and routes directly through ``ManifestManager``
+   - **Hybrid mode (DiscoveryManager + MergePipeline)** - Combines manifest + runtime + plugins
+     - DiscoveryManager constructs a ``MergePipeline`` with the configured layers
+     - Supports dynamic plugin layers added at runtime via ``add_plugin_layer()``
+     - Thread-safe: a mutex protects the cached merged result, all reads return by value
 
    **Merge Pipeline:**
 
@@ -410,30 +523,31 @@ Main Components
    - Executes all layers, collects entities by ID, and merges them per-field-group
    - Each layer declares a ``MergePolicy`` per ``FieldGroup``: AUTHORITATIVE (wins), ENRICHMENT (fills empty), FALLBACK (last resort)
    - Runs ``RuntimeLinker`` post-merge to bind manifest apps to live ROS 2 nodes
+   - Suppresses runtime-origin entities that duplicate manifest entities: components/areas
+     by namespace match, apps by ID match (gap-fill apps in uncovered namespaces survive)
    - Produces a ``MergeReport`` with conflict diagnostics, enrichment counts, and ID collision detection
 
    **Built-in Layers:**
 
    - ``ManifestLayer`` - Wraps ManifestManager; IDENTITY/HIERARCHY/METADATA are AUTHORITATIVE,
      LIVE_DATA is ENRICHMENT (runtime wins for topics/services), STATUS is FALLBACK
-   - ``RuntimeLayer`` - Wraps RuntimeDiscoveryStrategy; LIVE_DATA/STATUS are AUTHORITATIVE,
+   - ``RuntimeLayer`` - Wraps Ros2RuntimeIntrospection; LIVE_DATA/STATUS are AUTHORITATIVE,
      METADATA is ENRICHMENT, IDENTITY/HIERARCHY are FALLBACK.
      Supports ``GapFillConfig`` to control which heuristic entities are allowed when manifest is present
    - ``PluginLayer`` - Wraps IntrospectionProvider; all fields ENRICHMENT (plugins enrich, they don't override).
      Before each layer's ``discover()`` call, the pipeline populates ``IntrospectionInput`` with entities
      from all previous layers, so plugins see the current manifest + runtime entity set
 
-3. **OperationManager** - Executes ROS 2 operations (services and actions) using native APIs
-   - Calls ROS 2 services via ``rclcpp::GenericClient`` with native serialization
-   - Sends action goals via native action client interfaces
+3. **OperationManager** ``[gateway_core]`` - Routes SOVD operation execution through ``ServiceTransport`` and ``ActionTransport`` ports
+   - Manager body is middleware-neutral; ``Ros2ServiceTransport`` and ``Ros2ActionTransport`` adapters perform the actual ``rclcpp::GenericClient`` / action-client calls
    - Tracks active action goals with status, feedback, and timestamps
-   - Subscribes to ``/_action/status`` topics for real-time goal status updates
-   - Supports goal cancellation via native cancel service calls
+   - Subscribes to ``/_action/status`` topics via the action transport for real-time goal status updates
+   - Supports goal cancellation via the action transport's cancel path
    - Supports SOVD capability-based control (stop maps to ROS 2 cancel)
    - Automatically cleans up completed goals older than 5 minutes
-   - Uses ``ros2_medkit_serialization`` for JSON ↔ ROS 2 message conversion
+   - JSON ↔ ROS 2 message conversion is performed inside the ROS-side transport adapter via ``ros2_medkit_serialization``
 
-4. **RESTServer** - Provides the HTTP/REST API
+4. **RESTServer** ``[gateway_ros2]`` - Provides the HTTP/REST API (route table couples to gateway lifecycle; the individual handlers it dispatches to live in ``gateway_core``)
    - Discovery endpoints: ``/health``, ``/areas``, ``/components``
    - Data endpoints: ``/components/{id}/data``, ``/components/{id}/data/{topic}``
    - Operations endpoints: ``/apps/{id}/operations``, ``/apps/{id}/operations/{op}/executions``
@@ -446,29 +560,30 @@ Main Components
    - Uses ScriptManager for script upload and execution
    - Runs on configurable host and port with CORS support
 
-5. **ConfigurationManager** - Manages ROS 2 node parameters
-   - Lists all parameters for a node via ``rclcpp::SyncParametersClient``
-   - Gets/sets individual parameter values with type conversion
+5. **ConfigurationManager** ``[gateway_core]`` - Routes SOVD configuration CRUD through ``ParameterTransport``
+   - Manager body is middleware-neutral; ``Ros2ParameterTransport`` adapter performs the ``rclcpp::SyncParametersClient`` calls
+   - Lists / gets / sets individual parameter values with type conversion
    - Provides parameter descriptors (description, constraints, read-only flag)
-   - Caches parameter clients per node for efficiency
-   - Converts between JSON and ROS 2 parameter types automatically
+   - The transport caches parameter clients per node for efficiency
+   - JSON ↔ ROS 2 parameter conversion happens inside the transport adapter
 
-6. **DataAccessManager** - Reads and writes runtime data from/to ROS 2 topics
-   - Uses native rclcpp APIs for fast topic discovery and sampling
+6. **DataAccessManager** ``[gateway_core]`` - Routes SOVD data read/write through ``TopicTransport``
+   - Manager body is middleware-neutral; ``Ros2TopicTransport`` adapter performs ``rclcpp::GenericPublisher``-backed publishing and CDR serialization
+   - Delegates topic sampling to the attached ``TopicDataProvider`` (pool-backed, race-free)
    - Checks publisher counts before sampling to skip idle topics instantly
    - Returns metadata (type, schema) for topics without publishers
-   - Uses native ``rclcpp::GenericPublisher`` for topic publishing with CDR serialization
    - Returns topic data as JSON with metadata (topic name, timestamp, type info)
-   - Parallel topic sampling with configurable concurrency limit (``max_parallel_topic_samples``, default: 10)
+   - Parallel topic sampling with configurable concurrency limit (``data_provider.max_parallel_samples`` on the TopicDataProvider, default: 8)
 
-7. **NativeTopicSampler** - Fast topic sampling using native rclcpp APIs
-   - Discovers topics via ``node->get_topic_names_and_types()``
-   - Uses ``rclcpp::GenericSubscription`` for type-agnostic message sampling
-   - Checks ``count_publishers()`` before sampling to skip idle topics
-   - Returns metadata instantly for topics without publishers (no timeout)
-   - Significantly improves UX when robot has many idle topics
+7. **TopicDataProvider** / **Ros2TopicDataProvider** ``[gateway_core / gateway_ros2]`` - The interface lives in the neutral layer (``core/providers/data_provider.hpp``); the pool-backed ROS 2 default implementation lives in the adapter layer
+   - ``TopicDataProvider`` is a pure C++ interface consumed by HTTP handlers and managers, with no rclcpp headers required on the consumer side
+   - ``Ros2TopicDataProvider`` keeps one shared subscription per topic and serves many sample calls from the cached latest message, avoiding the rcl hash-map race that short-lived per-sample subscriptions used to trigger
+   - All subscription / callback-group creation and destruction runs on ``Ros2SubscriptionExecutor``'s single worker thread
+   - LRU cap, idle safety-net sweep, graph-change eviction, cold-wait cap for cpp-httplib liveness, and publisher-matching QoS (reliable / transient_local)
+   - Exposes pool + executor stats on ``GET /health`` under the ``x-medkit-subscription-executor`` and ``x-medkit-data-provider`` vendor-extension keys
+   - See :doc:`ros2_subscription_architecture` for the full design
 
-8. **JsonSerializer** (ros2_medkit_serialization) - Converts between JSON and ROS 2 messages
+8. **JsonSerializer** (ros2_medkit_serialization) - Converts between JSON and ROS 2 messages (separate package, not part of the gateway layer split)
    - Uses ``dynmsg`` library for dynamic type introspection
    - Serializes JSON to CDR format for publishing via ``serialize()``
    - Deserializes CDR to JSON for subscriptions via ``deserialize()``
@@ -476,7 +591,7 @@ Main Components
    - Provides static ``yaml_to_json()`` utility for YAML to JSON conversion
    - Thread-safe and stateless design
 
-9. **LockManager** - SOVD resource locking (ISO 17978-3, Section 7.17)
+9. **LockManager** ``[gateway_core]`` - SOVD resource locking (ISO 17978-3, Section 7.17)
     - Transport-agnostic lock store with ``shared_mutex`` for thread safety
     - Acquire, release, extend locks on components and apps
     - Scoped locks restrict protection to specific resource collections
@@ -485,7 +600,7 @@ Main Components
     - Automatic expiry with cyclic subscription cleanup
     - Plugin access via ``PluginContext::check_lock/acquire_lock/release_lock``
 
-10. **Data Models** - Entity representations
+10. **Data Models** ``[gateway_core]`` - Entity representations
     - ``Area`` - Physical or logical domain (namespace grouping)
     - ``Component`` - Logical grouping of Apps; can be ``synthetic`` (auto-created from namespace), ``topic`` (from topic-only namespace), or ``manifest`` (explicitly defined)
     - ``App`` - Software application (ROS 2 node); individual running process linked to parent Component
@@ -493,7 +608,7 @@ Main Components
     - ``ActionInfo`` - Action metadata (path, name, type)
     - ``EntityCache`` - Thread-safe cache of discovered entities (areas, components, apps)
 
-10. **ScriptManager** - Manages diagnostic script upload, storage, and execution (SOVD 7.15)
+11. **ScriptManager** ``[gateway_ros2]`` - Manages diagnostic script upload, storage, and execution (SOVD 7.15)
     - Delegates to a pluggable ``ScriptProvider`` backend (set via ``set_backend()``)
     - Lists, uploads, and deletes scripts per entity
     - Starts script executions as POSIX subprocesses with timeout support
@@ -508,7 +623,7 @@ Triggers
 The trigger subsystem implements SOVD condition-based resource change notifications.
 It consists of five main components:
 
-1. **TriggerManager** - Central coordinator for trigger lifecycle (CRUD), condition
+1. **TriggerManager** ``[gateway_core]`` - Central coordinator for trigger lifecycle (CRUD), condition
    evaluation, and event dispatch.
 
    - Subscribes to ``ResourceChangeNotifier`` for resource change events
@@ -517,30 +632,46 @@ It consists of five main components:
    - Supports entity hierarchy matching (area-level triggers catch descendant changes)
    - Manages pending events for SSE stream pickup with per-trigger mutexes
    - Persists triggers via the ``TriggerStore`` interface
+   - Data-trigger ROS subscriptions are routed through ``TopicSubscriptionTransport`` (``Ros2TopicSubscriptionTransport`` adapter wraps ``TriggerTopicSubscriber``)
 
-2. **ResourceChangeNotifier** - Async notification hub for resource changes.
+2. **ResourceChangeNotifier** ``[gateway_core]`` - Async notification hub for resource changes.
 
    - Producers (FaultManager, DataAccessManager, UpdateManager, OperationManager, LogManager) call ``notify()``
    - Observers (TriggerManager) register callbacks with filters
    - ``notify()`` is non-blocking - pushes to an internal queue processed by a dedicated worker thread
    - Filters support collection, entity_id, and resource_path matching
 
-3. **ConditionRegistry** - Thread-safe registry for condition evaluators.
+3. **ConditionRegistry** ``[gateway_core]`` - Thread-safe registry for condition evaluators.
 
    - Built-in SOVD types: ``OnChange``, ``OnChangeTo``, ``EnterRange``, ``LeaveRange``
    - Plugins register custom evaluators with ``x-`` prefixed names
    - Uses ``shared_mutex`` for concurrent read access during evaluation
 
-4. **TriggerStore** / **SqliteTriggerStore** - Persistence backend for triggers.
+4. **TriggerStore** / **SqliteTriggerStore** ``[gateway_core]`` - Persistence backend for triggers.
 
    - Abstract ``TriggerStore`` interface allows plugin-provided backends
    - Default ``SqliteTriggerStore`` uses SQLite for persistent triggers
    - Stores trigger metadata, condition parameters, and evaluator state (previous values)
    - Supports partial updates for status changes and lifetime extensions
 
-5. **TriggerTopicSubscriber** - Manages ROS 2 topic subscriptions for data triggers.
+5. **TriggerTopicSubscriber** ``[gateway_ros2]`` - Generic per-handle subscription executor for data triggers.
 
-   - Creates ``rclcpp::GenericSubscription`` instances for monitored data topics
-   - Reference-counted: multiple triggers on the same topic share one subscription
-   - Publishes data changes to ``ResourceChangeNotifier`` for condition evaluation
-   - Automatically unsubscribes when the last trigger for a topic is removed
+   - Creates one ``rclcpp::GenericSubscription`` per ``handle_key`` provided by the caller
+   - Each trigger owns its own subscription handle - no reference-counting across triggers
+   - Wrapped by ``Ros2TopicSubscriptionTransport``, which exposes the neutral
+     ``TopicSubscriptionTransport`` interface to ``TriggerManager``
+   - Subscription lifetime is tied to the trigger entry: removing the trigger drops the
+     handle and tears down the underlying subscription
+   - Per-handle callbacks publish samples back to ``ResourceChangeNotifier`` for
+     condition evaluation
+
+Additional Design Documents
+----------------------------
+
+.. toctree::
+   :maxdepth: 1
+
+   aggregation
+   dto_contract
+   plugin_entity_notifications
+   ros2_subscription_architecture

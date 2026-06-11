@@ -12,12 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "ros2_medkit_gateway/plugins/plugin_loader.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_loader.hpp"
 
-#include "ros2_medkit_gateway/plugins/plugin_types.hpp"
-#include "ros2_medkit_gateway/providers/introspection_provider.hpp"
-#include "ros2_medkit_gateway/providers/script_provider.hpp"
-#include "ros2_medkit_gateway/providers/update_provider.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_types.hpp"
+#include "ros2_medkit_gateway/core/providers/data_provider.hpp"
+#include "ros2_medkit_gateway/core/providers/fault_provider.hpp"
+#include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/core/providers/operation_provider.hpp"
+#include "ros2_medkit_gateway/core/providers/script_provider.hpp"
+#include "ros2_medkit_gateway/core/providers/update_provider.hpp"
 
 #include <dlfcn.h>
 #include <rclcpp/rclcpp.hpp>
@@ -33,6 +36,9 @@ GatewayPluginLoadResult::~GatewayPluginLoadResult() {
   introspection_provider = nullptr;
   log_provider = nullptr;
   script_provider = nullptr;
+  data_provider = nullptr;
+  operation_provider = nullptr;
+  fault_provider = nullptr;
   plugin.reset();
   if (handle_) {
     dlclose(handle_);
@@ -45,11 +51,17 @@ GatewayPluginLoadResult::GatewayPluginLoadResult(GatewayPluginLoadResult && othe
   , introspection_provider(other.introspection_provider)
   , log_provider(other.log_provider)
   , script_provider(other.script_provider)
+  , data_provider(other.data_provider)
+  , operation_provider(other.operation_provider)
+  , fault_provider(other.fault_provider)
   , handle_(other.handle_) {
   other.update_provider = nullptr;
   other.introspection_provider = nullptr;
   other.log_provider = nullptr;
   other.script_provider = nullptr;
+  other.data_provider = nullptr;
+  other.operation_provider = nullptr;
+  other.fault_provider = nullptr;
   other.handle_ = nullptr;
 }
 
@@ -60,6 +72,9 @@ GatewayPluginLoadResult & GatewayPluginLoadResult::operator=(GatewayPluginLoadRe
     introspection_provider = nullptr;
     log_provider = nullptr;
     script_provider = nullptr;
+    data_provider = nullptr;
+    operation_provider = nullptr;
+    fault_provider = nullptr;
     plugin.reset();
     if (handle_) {
       dlclose(handle_);
@@ -71,12 +86,18 @@ GatewayPluginLoadResult & GatewayPluginLoadResult::operator=(GatewayPluginLoadRe
     introspection_provider = other.introspection_provider;
     log_provider = other.log_provider;
     script_provider = other.script_provider;
+    data_provider = other.data_provider;
+    operation_provider = other.operation_provider;
+    fault_provider = other.fault_provider;
     handle_ = other.handle_;
 
     other.update_provider = nullptr;
     other.introspection_provider = nullptr;
     other.log_provider = nullptr;
     other.script_provider = nullptr;
+    other.data_provider = nullptr;
+    other.operation_provider = nullptr;
+    other.fault_provider = nullptr;
     other.handle_ = nullptr;
   }
   return *this;
@@ -223,6 +244,48 @@ tl::expected<GatewayPluginLoadResult, std::string> PluginLoader::load(const std:
                   e.what());
     } catch (...) {
       RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_script_provider threw unknown exception in %s",
+                  plugin_path.c_str());
+    }
+  }
+
+  using DataProviderFn = DataProvider * (*)(GatewayPlugin *);
+  auto data_fn = reinterpret_cast<DataProviderFn>(dlsym(handle, "get_data_provider"));
+  if (data_fn) {
+    try {
+      result.data_provider = data_fn(raw_plugin);
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_data_provider threw in %s: %s", plugin_path.c_str(),
+                  e.what());
+    } catch (...) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_data_provider threw unknown exception in %s",
+                  plugin_path.c_str());
+    }
+  }
+
+  using OperationProviderFn = OperationProvider * (*)(GatewayPlugin *);
+  auto operation_fn = reinterpret_cast<OperationProviderFn>(dlsym(handle, "get_operation_provider"));
+  if (operation_fn) {
+    try {
+      result.operation_provider = operation_fn(raw_plugin);
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_operation_provider threw in %s: %s", plugin_path.c_str(),
+                  e.what());
+    } catch (...) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_operation_provider threw unknown exception in %s",
+                  plugin_path.c_str());
+    }
+  }
+
+  using FaultProviderFn = FaultProvider * (*)(GatewayPlugin *);
+  auto fault_fn = reinterpret_cast<FaultProviderFn>(dlsym(handle, "get_fault_provider"));
+  if (fault_fn) {
+    try {
+      result.fault_provider = fault_fn(raw_plugin);
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_fault_provider threw in %s: %s", plugin_path.c_str(),
+                  e.what());
+    } catch (...) {
+      RCLCPP_WARN(rclcpp::get_logger("plugin_loader"), "get_fault_provider threw unknown exception in %s",
                   plugin_path.c_str());
     }
   }

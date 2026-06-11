@@ -4,11 +4,11 @@ HTTP gateway node for the ros2_medkit diagnostics system.
 
 ## Overview
 
-The ROS 2 Medkit Gateway exposes ROS 2 system information and data through a RESTful HTTP API. It automatically discovers nodes in the ROS 2 system, organizes them into areas based on their namespaces, and provides endpoints to query and interact with them.
+The ROS 2 Medkit Gateway exposes ROS 2 system information and data through a RESTful HTTP API. It automatically discovers nodes in the ROS 2 system, organizes them into a SOVD-aligned entity hierarchy (Areas, Components, Apps, Functions), and provides endpoints to query and interact with them.
 
 **Key Features:**
 - **Auto-discovery**: Automatically detects ROS 2 nodes and topics
-- **Area-based organization**: Groups nodes by namespace (e.g., `/powertrain`, `/chassis`, `/body`)
+- **SOVD entity model**: Areas, Components (host-level), Apps (ROS 2 nodes), and Functions (namespace-based logical grouping)
 - **REST API**: Standard HTTP/JSON interface
 - **Real-time updates**: Configurable cache refresh for up-to-date system state
 - **Bulk Data Management**: Upload, download, list, and delete bulk data files (calibration, firmware, etc.)
@@ -33,7 +33,12 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 - `GET /api/v1/components/{component_id}/hosts` - List apps hosted on a component
 - `GET /api/v1/components/{component_id}/depends-on` - List component dependencies
 - `GET /api/v1/areas/{area_id}/components` - List components within a specific area
+- `GET /api/v1/apps` - List all discovered apps
+- `GET /api/v1/apps/{app_id}` - Get app capabilities
 - `GET /api/v1/apps/{app_id}/is-located-on` - Get the component hosting this app
+- `GET /api/v1/functions` - List all discovered functions
+- `GET /api/v1/functions/{function_id}` - Get function capabilities
+- `GET /api/v1/functions/{function_id}/hosts` - List apps grouped by this function
 
 ### Component Data Endpoints
 
@@ -131,18 +136,20 @@ curl http://localhost:8080/api/v1/areas
 
 **Response:**
 ```json
-[
-  {
-    "id": "powertrain",
-    "namespace": "/powertrain",
-    "type": "Area"
-  },
-  {
-    "id": "chassis",
-    "namespace": "/chassis",
-    "type": "Area"
-  }
-]
+{
+  "items": [
+    {
+      "id": "powertrain",
+      "name": "powertrain",
+      "href": "/api/v1/areas/powertrain"
+    },
+    {
+      "id": "chassis",
+      "name": "chassis",
+      "href": "/api/v1/areas/chassis"
+    }
+  ]
+}
 ```
 
 #### GET /api/v1/components
@@ -156,33 +163,21 @@ curl http://localhost:8080/api/v1/components
 
 **Response:**
 ```json
-[
-  {
-    "id": "temp_sensor",
-    "namespace": "/powertrain/engine",
-    "fqn": "/powertrain/engine/temp_sensor",
-    "type": "Component",
-    "area": "powertrain",
-    "source": "node"
-  },
-  {
-    "id": "carter1",
-    "namespace": "/carter1",
-    "fqn": "/carter1",
-    "type": "Component",
-    "area": "carter1",
-    "source": "topic"
-  }
-]
+{
+  "items": [
+    {
+      "id": "my_hostname",
+      "name": "my_hostname",
+      "href": "/api/v1/components/my_hostname"
+    }
+  ]
+}
 ```
 
 **Response Fields:**
-- `id` - Component name (node name or namespace for topic-based)
-- `namespace` - ROS 2 namespace where the component is running
-- `fqn` - Fully qualified name (namespace + node name)
-- `type` - Always "Component"
-- `source` - Discovery source: `"node"` (standard ROS 2 node) or `"topic"` (discovered from topic namespaces)
-- `area` - Parent area this component belongs to
+- `id` - Component identifier (hostname in runtime mode, or manifest-defined)
+- `name` - Human-readable name
+- `href` - URI to the component capabilities endpoint
 
 #### GET /api/v1/areas/{area_id}/components
 
@@ -195,24 +190,20 @@ curl http://localhost:8080/api/v1/areas/powertrain/components
 
 **Response (200 OK):**
 ```json
-[
-  {
-    "id": "temp_sensor",
-    "namespace": "/powertrain/engine",
-    "fqn": "/powertrain/engine/temp_sensor",
-    "type": "Component",
-    "area": "powertrain",
-    "source": "node"
-  },
-  {
-    "id": "rpm_sensor",
-    "namespace": "/powertrain/engine",
-    "fqn": "/powertrain/engine/rpm_sensor",
-    "type": "Component",
-    "area": "powertrain",
-    "source": "node"
-  }
-]
+{
+  "items": [
+    {
+      "id": "temp_sensor",
+      "name": "temp_sensor",
+      "href": "/api/v1/components/temp_sensor"
+    },
+    {
+      "id": "rpm_sensor",
+      "name": "rpm_sensor",
+      "href": "/api/v1/components/rpm_sensor"
+    }
+  ]
+}
 ```
 
 **Example (Error - Area Not Found):**
@@ -249,16 +240,18 @@ curl http://localhost:8080/api/v1/components/temp_sensor/data
 
 **Response (200 OK):**
 ```json
-[
-  {
-    "topic": "/powertrain/engine/temperature",
-    "timestamp": 1732377600000000000,
-    "data": {
-      "temperature": 85.5,
-      "variance": 0.0
+{
+  "items": [
+    {
+      "topic": "/powertrain/engine/temperature",
+      "timestamp": 1732377600000000000,
+      "data": {
+        "temperature": 85.5,
+        "variance": 0.0
+      }
     }
-  }
-]
+  ]
+}
 ```
 
 **Example (Error - Component Not Found):**
@@ -295,7 +288,7 @@ curl http://localhost:8080/api/v1/components/nonexistent/data
 
 **Performance Considerations:**
 - Topic sampling uses **parallel execution** with configurable concurrency
-- Default: up to 10 topics sampled in parallel (configurable via `max_parallel_topic_samples`)
+- Default: up to 8 topics sampled in parallel (configurable via `data_provider.max_parallel_samples`)
 - Response time scales with batch count: `ceil(topics / batch_size) × timeout`
 - 3-second timeout per topic to accommodate slow-publishing topics
 
@@ -393,18 +386,20 @@ curl http://localhost:8080/api/v1/components/calibration/operations
 
 **Response (200 OK):**
 ```json
-[
-  {
-    "name": "calibrate",
-    "path": "/powertrain/engine/calibrate",
-    "type": "std_srvs/srv/Trigger",
-    "kind": "service",
-    "type_info": {
-      "schema": "...",
-      "default_value": "..."
+{
+  "items": [
+    {
+      "name": "calibrate",
+      "path": "/powertrain/engine/calibrate",
+      "type": "std_srvs/srv/Trigger",
+      "kind": "service",
+      "type_info": {
+        "schema": "...",
+        "default_value": "..."
+      }
     }
-  }
-]
+  ]
+}
 ```
 
 #### POST /api/v1/components/{component_id}/operations/{operation_id}/executions
@@ -769,6 +764,7 @@ Real-time fault event stream using Server-Sent Events (SSE). Clients receive ins
 - **Automatic reconnection**: Supports `Last-Event-ID` header for seamless reconnection
 - **Keepalive**: Sends `:keepalive` comment every 30 seconds to prevent timeouts
 - **Event buffer**: Buffers up to 100 recent events for reconnecting clients
+- **Entity context (SOVD payload extension)**: When the gateway can resolve the fault's first reporting source back to an entity, the payload carries an `x-medkit` object with `entity_type` and `entity_id` fields so consumers can hit `/{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}` directly without enumerating entities
 
 **Event Types:**
 - `fault_confirmed` - Fault transitioned to CONFIRMED status
@@ -786,12 +782,14 @@ curl -N http://localhost:8080/api/v1/faults/stream
 
 id: 1
 event: fault_confirmed
-data: {"event_type":"fault_confirmed","fault":{"fault_code":"MOTOR_OVERHEAT",...},"timestamp":1735830000.123}
+data: {"event_type":"fault_confirmed","fault":{"fault_code":"MOTOR_OVERHEAT",...},"timestamp":1735830000.123,"x-medkit":{"entity_type":"apps","entity_id":"motor_controller"}}
 
 id: 2
 event: fault_cleared
-data: {"event_type":"fault_cleared","fault":{"fault_code":"MOTOR_OVERHEAT",...},"timestamp":1735830060.456}
+data: {"event_type":"fault_cleared","fault":{"fault_code":"MOTOR_OVERHEAT",...},"timestamp":1735830060.456,"x-medkit":{"entity_type":"apps","entity_id":"motor_controller"}}
 ```
+
+**SOVD payload extension `x-medkit.entity_*`** (non-standard, SOVD-compatible): Resolution is best-effort and snapshotted at event arrival. Manifest and hybrid discovery use the linking result; runtime-only discovery falls back to the FQN's last segment and only emits the fields when an App with that ID exists in the cache. When no entity can be resolved (no reporting sources, orphan source, etc.), the entire `x-medkit` object is omitted and the consumer must fall back to discovery.
 
 **Response (503 Service Unavailable - Client Limit Reached):**
 ```json
@@ -1161,15 +1159,16 @@ The gateway can be configured via parameters in `config/gateway_params.yaml` or 
 | ---------------------------- | ------ | ----------- | -------------------------------------------------------------------------------------- |
 | `server.host`                | string | `127.0.0.1` | Host to bind the REST server (`127.0.0.1` for localhost, `0.0.0.0` for all interfaces) |
 | `server.port`                | int    | `8080`      | Port for the REST API (range: 1024-65535)                                              |
-| `refresh_interval_ms`        | int    | `10000`     | Cache refresh interval in milliseconds (range: 100-60000)                              |
-| `max_parallel_topic_samples` | int    | `20`        | Max concurrent topic samples when fetching data (range: 1-50)                          |
+| `refresh_interval_ms`        | int    | `30000`     | Safety-backstop refresh interval in milliseconds. Primary refresh is graph-event driven; this controls only the periodic forced refresh (range: 100-60000) |
+| `data_provider.max_parallel_samples` | int | `8` | Max concurrent topic samples when fetching data (range: 1-256)                                |
 | `topic_sample_timeout_sec`   | float  | `2.0`       | Timeout for sampling topics with active publishers (range: 0.1-30.0)                   |
 | `fault_manager.namespace`    | string | `""`        | Optional namespace prefix for fault manager services and events (for example `robot1`)  |
 | `fault_manager.service_timeout_sec`  | float  | `5.0`       | Timeout for fault manager service calls such as `list_faults` and `get_snapshots`      |
 
 These defaults reflect the recommended values from `config/gateway_params.yaml`.
 If the gateway is run without those parameters, the `DataAccessManager` fallback
-defaults are `max_parallel_topic_samples=10` and `topic_sample_timeout_sec=1.0`.
+default is `topic_sample_timeout_sec=1.0`; the parallel-sample concurrency
+falls back to the `Ros2TopicDataProvider` default of 8.
 
 #### SSE (Server-Sent Events) Configuration
 
@@ -1271,6 +1270,22 @@ cors:
 ```
 
 > ⚠️ **Security Note:** Using `["*"]` as `allowed_origins` is not recommended for production. When `allow_credentials` is `true`, wildcard origins will cause the application to fail to start with an exception.
+
+**Use config from another package (`gateway.launch.py`):**
+
+```bash
+ros2 launch ros2_medkit_gateway gateway.launch.py \
+  config_file:=<your_package>/config/gateway_params.yaml
+```
+
+> **Parameter priority:** launch args > `config_file` > packaged defaults. `config_file` overrides only the keys it defines; `server_host`, `server_port`, and `refresh_interval_ms` are launch-arg only and always take precedence.
+
+| Launch Argument       | Default                               | Description                                                                                          |
+| --------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `config_file`         | packaged `config/gateway_params.yaml` | Path to a YAML parameter file applied on top of the packaged defaults.                               |
+| `server_host`         | `127.0.0.1`                           | Host to bind the REST server (`127.0.0.1` or `0.0.0.0`). Launch-arg only.                           |
+| `server_port`         | `8080`                                | Port for the REST API. Launch-arg only.                                                              |
+| `refresh_interval_ms` | `30000`                               | Safety-backstop refresh interval in ms (graph events drive the primary refresh). Launch-arg only.    |
 
 ### Authentication Configuration Examples
 
@@ -1403,13 +1418,23 @@ ros2 launch ros2_medkit_gateway gateway_https.launch.py cert_dir:=/home/user/cer
 ros2 launch ros2_medkit_gateway gateway_https.launch.py min_tls_version:=1.3
 ```
 
-| Launch Argument       | Default                    | Description                                      |
-| --------------------- | -------------------------- | ------------------------------------------------ |
-| `cert_dir`            | `/tmp/ros2_medkit_certs`   | Directory for auto-generated certificates        |
-| `server_host`         | `127.0.0.1`                | Host to bind HTTPS server                        |
-| `server_port`         | `8443`                     | Port for HTTPS API                               |
-| `min_tls_version`     | `1.2`                      | Minimum TLS version (`1.2` or `1.3`)             |
-| `refresh_interval_ms` | `10000`                    | Cache refresh interval in milliseconds           |
+**Use config from another package (`gateway_https.launch.py`):**
+
+```bash
+ros2 launch ros2_medkit_gateway gateway_https.launch.py \
+  config_file:=<your_package>/config/gateway_params.yaml
+```
+
+> **Parameter priority:** launch args > `config_file` > packaged defaults. `config_file` overrides only the keys it defines; `cert_dir`, `server_host`, `server_port`, `min_tls_version`, and `refresh_interval_ms` are launch-arg only and always take precedence.
+
+| Launch Argument       | Default                               | Description                                                                              |
+| --------------------- | ------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `config_file`         | packaged `config/gateway_params.yaml` | Path to a YAML parameter file applied on top of the packaged defaults.                   |
+| `cert_dir`            | `/tmp/ros2_medkit_certs`              | Directory for auto-generated certificates. Launch-arg only.                              |
+| `server_host`         | `127.0.0.1`                           | Host to bind HTTPS server. Launch-arg only.                                              |
+| `server_port`         | `8443`                                | Port for HTTPS API. Launch-arg only.                                                     |
+| `min_tls_version`     | `1.2`                                 | Minimum TLS version (`1.2` or `1.3`). Launch-arg only.                                  |
+| `refresh_interval_ms` | `30000`                               | Safety-backstop refresh interval (graph events drive primary refresh). Launch-arg only.  |
 
 **Usage with curl (self-signed certs):**
 ```bash
@@ -1434,6 +1459,22 @@ curl --cacert ./certs/ca.crt https://localhost:8443/api/v1
 > - Store certificates outside the source tree and never commit private keys
 
 ## Architecture
+
+### Build Layers
+
+The package compiles into two layered static libraries with a strict dependency direction:
+
+- **`gateway_core`** - middleware-neutral business logic. Sources live under `src/core/` and headers under `include/ros2_medkit_gateway/core/`. Links only header-only and C-level externals (cpp-httplib, nlohmann/json, yaml-cpp, tl::expected, jwt-cpp, OpenSSL, SQLite, dl). Carries no rclcpp / rcl_interfaces / message-package dependency. Hosts the neutral HTTP request handlers, JWT authentication, fault model (debounce, storage, cache, correlation), peer aggregation, manifest parsing, the entity cache, the neutral managers (lock, bulk-data, subscription, script, update, plugin), and every provider interface contract.
+- **`gateway_ros2`** - ROS adapter layer. Compiles the remaining sources under `src/` and links `gateway_core` publicly via `medkit_target_dependencies`. Hosts `GatewayNode` (the `rclcpp::Node` entry point), the ROS-coupled managers (data access, operation, configuration, fault facade, log, trigger), runtime discovery, the native topic sampler, and the ROS-specific provider default implementations.
+
+The `gateway_node` executable and existing test targets link `gateway_ros2`, so they transitively get both layers from a single dependency. The neutral contract is enforced by two CTest checks:
+
+- `gateway_core_purity` (linter label) - greps `core/` for any ROS-package include and fails on any match.
+- `test_gateway_core_smoke` (unit label) - compiles a translation unit that includes a sampling of `core/` headers and links exclusively against `gateway_core` + GTest with no `ament_target_dependencies`. Build failure indicates a transitive ROS coupling that the grep guard might miss.
+
+A third purity gate keeps cpp-httplib out of the plugin ABI. Plugin-facing public headers - the provider interfaces, the `GatewayPlugin` base headers, and the DTOs they include - must not depend on `<httplib.h>`. cpp-httplib is a gateway-internal detail; plugins exchange `nlohmann::json`, typed `dto::` structs, `tl::expected`, and the opaque `PluginRequest`/`PluginResponse` shim across the `.so` boundary, so the gateway and its plugins need not share an httplib version. The httplib-free handler-result vocabulary (`Result`, `NoContent`, `Forwarded`, `ValidatorResult`, `ResponseAttachments`) lives in `http/handler_result.hpp`; only `http/typed_router.hpp` and the handler-internal headers touch httplib. The invariant is enforced by:
+
+- `gateway_plugin_header_purity` (linter label) - runs `scripts/check_headers_httplib_free.sh`, a preprocessor-only scan (`g++ -M -MG`) over the plugin-facing surface that fails on any transitive `httplib.h` dependency. Also wired into the pre-push hook. The build-farm topology (installed gateway, no vendored httplib on the include path) is reproduced locally by `scripts/check_isolated_build.sh`.
 
 ### Components
 
@@ -1460,15 +1501,21 @@ In addition to standard ROS 2 node discovery, the gateway supports **topic-based
 - `/parameter_events`, `/rosout`, `/clock`
 - Note: `/tf` and `/tf_static` are NOT filtered (useful for diagnostics)
 
-### Area Organization
+### Entity Organization
 
-The gateway organizes nodes into "areas" based on their namespace:
+In runtime discovery mode, the gateway maps the ROS 2 graph to the SOVD entity model:
+
+- **Component**: A single host-derived Component is created from `HostInfoProvider` (hostname, OS, architecture). All Apps belong to this Component.
+- **App**: Each discovered ROS 2 node becomes an App entity.
+- **Function**: The first namespace segment creates a Function entity that groups all Apps under that namespace (e.g., `/powertrain/engine/temp_sensor` and `/powertrain/engine/rpm_sensor` both belong to Function `powertrain`).
+- **Area**: Areas are only created from manifest definitions. They are never auto-generated in runtime mode. Use hybrid or manifest-only mode to organize entities into Areas.
 
 ```
-/powertrain/engine/temp_sensor  → Area: powertrain, Component: temp_sensor
-/chassis/brakes/pressure_sensor → Area: chassis, Component: pressure_sensor
-/body/lights/controller         → Area: body, Component: controller
-/standalone_node                → Area: root, Component: standalone_node
+Runtime mode mapping:
+/powertrain/engine/temp_sensor  -> Component: <hostname>, Function: powertrain, App: temp_sensor
+/chassis/brakes/pressure_sensor -> Component: <hostname>, Function: chassis, App: pressure_sensor
+/body/lights/controller         -> Component: <hostname>, Function: body, App: controller
+/standalone_node                -> Component: <hostname>, App: standalone_node
 ```
 
 ## Demo Nodes
@@ -1520,6 +1567,40 @@ We provide a Postman collection for easy API testing:
 
 See [postman/README.md](postman/README.md) for detailed instructions.
 
+## Multi-Instance Aggregation
+
+Federate multiple gateway instances into a single unified API. A primary gateway merges entities from peer gateways and transparently forwards requests for remote entities.
+
+**Quick Start:**
+
+```yaml
+# gateway_params.yaml
+ros2_medkit_gateway:
+  ros__parameters:
+    aggregation:
+      enabled: true
+      peer_urls: ["http://localhost:8081"]
+      peer_names: ["subsystem_b"]
+```
+
+```bash
+# Start primary gateway with aggregation
+ros2 run ros2_medkit_gateway gateway_node --ros-args \
+    --params-file gateway_params.yaml
+
+# Query merged entity tree
+curl http://localhost:8080/api/v1/components | jq
+```
+
+**Key features:**
+- **Static peers**: List known gateways in config
+- **mDNS auto-discovery**: Zero-configuration peer discovery on local network
+- **Type-aware merging**: Areas, Functions, and Components merge by ID; Apps get peer-name prefixes on collision
+- **Transparent forwarding**: Requests for remote entities forwarded to owning peer
+- **Graceful degradation**: Unhealthy peers excluded, partial results clearly marked
+
+See the [documentation](https://selfpatch.github.io/ros2_medkit/) for detailed configuration reference and tutorials.
+
 ## Testing
 
 ### Run Integration Tests
@@ -1534,6 +1615,27 @@ colcon test --packages-select ros2_medkit_gateway --event-handlers console_direc
 # View test results
 colcon test-result --verbose
 ```
+
+### Subscription Architecture Regression Gate
+
+All rcl subscription create/destroy calls must go through
+`Ros2SubscriptionSlot::create_typed` / `create_generic` (defined in
+`ros2_common/`). Calling `node->create_subscription<T>()`,
+`create_generic_subscription()`, or `create_callback_group()` anywhere
+else triggers the race from issue #375 and SIGSEGVs on Rolling/Lyrical under
+concurrent HTTP load.
+
+The regression gate is `scripts/check_no_naked_subscriptions.sh`. It
+runs in CI (`quality.yml`) and as a pre-commit hook. If your PR
+adds a naked subscription call the gate fails with the file:line,
+the class to use instead, and a pointer to
+[ros2_subscription_architecture.rst](design/ros2_subscription_architecture.rst)
+for the full rationale and example.
+
+Five legacy call sites are currently on the allowlist
+(`sse_fault_handler.cpp`, `trigger_fault_subscriber.cpp`,
+`trigger_topic_subscriber.cpp`, `operation_manager.cpp`,
+`log_manager.cpp`) pending migration to the slot pattern.
 
 ## License
 
