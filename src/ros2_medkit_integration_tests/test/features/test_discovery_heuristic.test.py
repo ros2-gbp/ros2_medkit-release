@@ -14,19 +14,19 @@
 # limitations under the License.
 
 """
-Integration tests for heuristic discovery - runtime Apps and topic-only policies.
+Integration tests for heuristic discovery - runtime Apps, Functions.
 
-This test file validates the runtime discovery heuristics:
+This test file validates the runtime discovery heuristics with SOVD-aligned model:
 - Nodes are exposed as Apps with source="heuristic"
-- Synthetic components are created from namespace grouping
-- TopicOnlyPolicy controls topic-based component creation
-- min_topics_for_component threshold filters low-topic namespaces
+- Functions are created from namespace grouping (default)
+- Areas are always empty (come from manifest only)
+- Components come from HostInfoProvider (single host-level component)
 
 Tests verify:
 - Apps have correct source field
-- Components have source field (node vs topic)
-- Topic-only policy IGNORE prevents component creation
-- min_topics_for_component threshold works
+- Functions are created from namespaces
+- Areas are empty in runtime mode
+- HostInfoProvider component exists
 
 """
 
@@ -49,15 +49,9 @@ def generate_test_description():
     coverage_env = get_coverage_env()
 
     # Gateway node with runtime_only discovery mode (default)
-    # Uses default topic_only_policy=create_component and min_topics=1
-    gateway_node = create_gateway_node(
-        extra_params={
-            'discovery.runtime.create_synthetic_components': True,
-            'discovery.runtime.grouping_strategy': 'namespace',
-            'discovery.runtime.topic_only_policy': 'create_component',
-            'discovery.runtime.min_topics_for_component': 1,
-        },
-    )
+    # Functions from namespaces is enabled by default
+    # HostInfoProvider creates the single host-level Component
+    gateway_node = create_gateway_node()
 
     # Launch demo nodes to test heuristic discovery
     demo_nodes = [
@@ -85,9 +79,7 @@ def generate_test_description():
             output='screen',
             additional_env=coverage_env,
         ),
-        # Node in root namespace to test duplicate component prevention
-        # This node publishes /root_ns_demo/temperature which could incorrectly
-        # create a duplicate topic-based component
+        # Node in root namespace
         launch_ros.actions.Node(
             package='ros2_medkit_integration_tests',
             executable='demo_engine_temp_sensor',
@@ -118,7 +110,7 @@ class TestHeuristicAppsDiscovery(GatewayTestCase):
     """Integration tests for heuristic runtime discovery of Apps."""
 
     MIN_EXPECTED_APPS = 3
-    REQUIRED_AREAS = {'powertrain', 'chassis'}
+    REQUIRED_FUNCTIONS = {'powertrain', 'chassis'}
 
     def test_apps_have_heuristic_source(self):
         """Test that runtime-discovered apps have source='heuristic'."""
@@ -143,61 +135,42 @@ class TestHeuristicAppsDiscovery(GatewayTestCase):
                 f"App {app_id} has source={x_medkit['source']}, expected 'heuristic'"
             )
 
-    def test_synthetic_components_created(self):
-        """Test that synthetic components are created by namespace grouping."""
+    def test_host_component_created(self):
+        """Test that a single host-level Component exists from HostInfoProvider."""
         data = self.get_json('/components')
         self.assertIn('items', data)
         components = data['items']
 
-        # Should have synthetic components for powertrain, chassis namespaces
-        component_ids = [c.get('id') for c in components]
+        # Should have exactly one host-derived component
+        self.assertEqual(
+            len(components), 1,
+            f"Expected exactly 1 host component, found: {[c.get('id') for c in components]}"
+        )
 
-        # At least powertrain and chassis should exist
-        expected_areas = ['powertrain', 'chassis']
-        for area in expected_areas:
-            matching = [c for c in component_ids if area in c.lower()]
-            self.assertTrue(
-                len(matching) > 0,
-                f"Expected component for area '{area}', found: {component_ids}"
-            )
+    def test_functions_created_from_namespaces(self):
+        """Test that Functions are created from top-level namespaces."""
+        data = self.get_json('/functions')
+        self.assertIn('items', data)
+        functions = data['items']
 
-    def test_apps_grouped_under_components(self):
-        """Test that apps are properly grouped under synthetic components."""
-        data = self.get_json('/apps')
-        apps = data.get('items', [])
+        # Should have functions for powertrain, chassis
+        func_ids = [f.get('id') for f in functions]
+        self.assertIn('powertrain', func_ids, f"Missing 'powertrain' function, found: {func_ids}")
+        self.assertIn('chassis', func_ids, f"Missing 'chassis' function, found: {func_ids}")
 
-        for app in apps:
-            x_medkit = app.get('x-medkit', {})
-            app_id = app.get('id')
-            self.assertIn('component_id', x_medkit, f'App {app_id} missing component_id')
-            # Component ID should not be empty for grouped apps
-            ros2 = x_medkit.get('ros2', {})
-            if ros2.get('namespace', '').startswith('/'):
-                self.assertTrue(
-                    len(x_medkit.get('component_id', '')) > 0,
-                    f"App {app.get('id')} has empty component_id"
-                )
-
-    def test_areas_created_from_namespaces(self):
-        """Test that areas are created from top-level namespaces."""
+    def test_areas_always_empty(self):
+        """Test that areas are always empty in runtime mode - Areas come from manifest only."""
         data = self.get_json('/areas')
         self.assertIn('items', data)
         areas = data['items']
-
-        # Should have areas for powertrain, chassis
-        area_ids = [a.get('id') for a in areas]
-        self.assertIn('powertrain', area_ids, f"Missing 'powertrain' area, found: {area_ids}")
-        self.assertIn('chassis', area_ids, f"Missing 'chassis' area, found: {area_ids}")
+        self.assertEqual(
+            len(areas), 0,
+            f'Expected empty areas in runtime mode, '
+            f'got: {[a.get("id") for a in areas]}'
+        )
 
     def test_no_duplicate_component_ids(self):
-        """
-        Test that component IDs are unique.
-
-        Root namespace nodes publishing topics with matching prefix should
-        not create duplicate topic-based components. The 'root_ns_demo' node
-        in root namespace publishes /root_ns_demo/temperature - this should
-        NOT create a separate topic-based component.
-        """
+        """Test that component IDs are unique."""
         data = self.get_json('/components')
         self.assertIn('items', data)
 
@@ -215,25 +188,8 @@ class TestHeuristicAppsDiscovery(GatewayTestCase):
             f'Found duplicate component IDs: {duplicates}'
         )
 
-    def test_root_namespace_node_exists_as_app_not_component(self):
-        """
-        Test that root namespace node is an app, not a duplicate component.
-
-        The 'root_ns_demo' node is in root namespace (/) and publishes topics
-        with prefix /root_ns_demo/. Without the fix, this would create both:
-        - A node-based app for the root area (correct)
-        - A topic-based component named 'root_ns_demo' (WRONG - duplicate)
-
-        Expected: root_ns_demo exists as an app, NOT as a standalone component.
-        """
-        # Verify root_ns_demo is NOT a standalone component
-        components = self.get_json('/components').get('items', [])
-        component_ids = [c.get('id') for c in components]
-        self.assertNotIn(
-            'root_ns_demo', component_ids,
-            "'root_ns_demo' should not exist as a component - it should be an app"
-        )
-
+    def test_root_namespace_node_exists_as_app(self):
+        """Test that root namespace node exists as an app."""
         # Verify root_ns_demo IS an app
         apps = self.get_json('/apps').get('items', [])
         app_ids = [a.get('id') for a in apps]
@@ -241,49 +197,6 @@ class TestHeuristicAppsDiscovery(GatewayTestCase):
             'root_ns_demo', app_ids,
             "'root_ns_demo' should exist as an app"
         )
-
-
-class TestTopicOnlyPolicy(GatewayTestCase):
-    """
-    Tests for topic_only_policy configuration.
-
-    These tests verify the three policy modes work correctly.
-    Note: Testing IGNORE policy requires a separate gateway instance.
-    """
-
-    def test_topic_components_have_source_field(self):
-        """
-        Test that topic-only components (if any) have source='topic'.
-
-        This test checks that the source field distinguishes node-based
-        components from topic-only components.
-        """
-        data = self.get_json('/components')
-        components = data.get('items', [])
-
-        # Check source field is present on all components
-        for comp in components:
-            # Source should be present (node, topic, synthetic, heuristic, or empty)
-            if 'source' in comp:
-                self.assertIn(
-                    comp['source'], ['node', 'topic', 'synthetic', 'heuristic', ''],
-                    f"Component {comp.get('id')} has unexpected source: {comp['source']}"
-                )
-
-    def test_min_topics_threshold_respected(self):
-        """
-        Test that components with fewer topics than threshold are filtered.
-
-        With min_topics_for_component=1 (default), all namespaces with topics
-        should create components.
-        """
-        # This is a smoke test - verifying the parameter is read correctly
-        # Full threshold testing would require topic-only namespaces
-        data = self.get_json('/components')
-        components = data.get('items', [])
-
-        # Should have at least the components from our demo nodes
-        self.assertGreaterEqual(len(components), 2)
 
 
 @launch_testing.post_shutdown_test()

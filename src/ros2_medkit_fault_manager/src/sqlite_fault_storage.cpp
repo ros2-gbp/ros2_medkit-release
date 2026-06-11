@@ -363,7 +363,7 @@ bool SqliteFaultStorage::report_fault_event(const std::string & fault_code, uint
     int64_t existing_count = check_stmt.column_int64(1);
     std::string sources_json = check_stmt.column_text(2);
     std::string current_status = check_stmt.column_text(3);
-    int32_t debounce_counter = static_cast<int32_t>(check_stmt.column_int(4));
+    int32_t debounce_counter = check_stmt.column_int(4);
 
     // CLEARED faults can be reactivated by FAILED events
     bool is_reactivation = false;
@@ -690,8 +690,24 @@ size_t SqliteFaultStorage::check_time_based_confirmation(const rclcpp::Time & cu
   return static_cast<size_t>(sqlite3_changes(db_));
 }
 
+void SqliteFaultStorage::set_max_snapshots_per_fault(size_t max_count) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  max_snapshots_per_fault_ = max_count;
+}
+
 void SqliteFaultStorage::store_snapshot(const SnapshotData & snapshot) {
   std::lock_guard<std::mutex> lock(mutex_);
+
+  // Check snapshot limit per fault (reject-new strategy: keep earliest)
+  if (max_snapshots_per_fault_ > 0) {
+    SqliteStatement count_stmt(db_, "SELECT COUNT(*) FROM snapshots WHERE fault_code = ?");
+    count_stmt.bind_text(1, snapshot.fault_code);
+    if (count_stmt.step() == SQLITE_ROW &&
+        count_stmt.column_int64(0) >= static_cast<int64_t>(max_snapshots_per_fault_)) {
+      // Silent rejection: storage layer has no logger. Callers should log if needed.
+      return;  // Reject new - keep first N inserted snapshots
+    }
+  }
 
   SqliteStatement stmt(db_,
                        "INSERT INTO snapshots (fault_code, topic, message_type, data, captured_at_ns) "

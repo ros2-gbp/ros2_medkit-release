@@ -14,8 +14,6 @@
 
 #pragma once
 
-#include <httplib.h>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -32,10 +30,10 @@
 #include "ros2_medkit_beacon_common/beacon_hint_store.hpp"
 #include "ros2_medkit_beacon_common/beacon_types.hpp"
 #include "ros2_medkit_beacon_common/beacon_validator.hpp"
-#include "ros2_medkit_gateway/plugins/gateway_plugin.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_context.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_types.hpp"
-#include "ros2_medkit_gateway/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/core/plugins/gateway_plugin.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_types.hpp"
+#include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 
 // Simple token bucket for rate limiting.
 // Thread safety: on_beacon() is called from the DDS callback thread,
@@ -83,8 +81,8 @@ class TopicBeaconPlugin : public ros2_medkit_gateway::GatewayPlugin, public ros2
   void configure(const nlohmann::json & config) override;
   void set_context(ros2_medkit_gateway::PluginContext & context) override;
   void shutdown() override;
-  void register_routes(httplib::Server & server, const std::string & api_prefix) override;
-  std::vector<ros2_medkit_gateway::GatewayPlugin::RouteDescription> get_route_descriptions() const override;
+  ~TopicBeaconPlugin() noexcept override;
+  std::vector<ros2_medkit_gateway::GatewayPlugin::PluginRoute> get_routes() override;
   ros2_medkit_gateway::IntrospectionResult introspect(const ros2_medkit_gateway::IntrospectionInput & input) override;
 
   // Expose for testing
@@ -99,7 +97,7 @@ class TopicBeaconPlugin : public ros2_medkit_gateway::GatewayPlugin, public ros2
   void on_beacon(const ros2_medkit_msgs::msg::MedkitDiscoveryHint::SharedPtr & msg);
 
   std::string topic_{"/ros2_medkit/discovery"};
-  ros2_medkit_gateway::PluginContext * ctx_{nullptr};
+  ros2_medkit_gateway::RosPluginContext * ctx_{nullptr};
   rclcpp::Subscription<ros2_medkit_msgs::msg::MedkitDiscoveryHint>::SharedPtr subscription_;
   std::unique_ptr<ros2_medkit_beacon::BeaconHintStore> store_;
   ros2_medkit_beacon::BeaconEntityMapper mapper_;
@@ -108,4 +106,5 @@ class TopicBeaconPlugin : public ros2_medkit_gateway::GatewayPlugin, public ros2
   std::atomic<bool> capacity_warned_{false};
   std::mutex skipped_mutex_;
   std::unordered_set<std::string> logged_skipped_entities_;
+  std::atomic<bool> shutdown_requested_{false};
 };
