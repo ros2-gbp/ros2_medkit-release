@@ -21,13 +21,13 @@
 #include "openapi_spec_builder.hpp"
 #include "path_builder.hpp"
 
+#include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/models/entity_capabilities.hpp"
+#include "ros2_medkit_gateway/core/models/entity_types.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
+#include "ros2_medkit_gateway/core/version.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
-#include "ros2_medkit_gateway/http/http_utils.hpp"
-#include "ros2_medkit_gateway/models/entity_capabilities.hpp"
-#include "ros2_medkit_gateway/models/entity_types.hpp"
-#include "ros2_medkit_gateway/plugins/plugin_manager.hpp"
-#include "ros2_medkit_gateway/version.hpp"
 
 namespace ros2_medkit_gateway {
 namespace openapi {
@@ -458,6 +458,8 @@ bool CapabilityGenerator::validate_entity_hierarchy(const ResolvedPath & resolve
           return false;
         }
         break;
+      case SovdEntityType::SERVER:
+      case SovdEntityType::UNKNOWN:
       default:
         return false;
     }
@@ -487,6 +489,8 @@ bool CapabilityGenerator::validate_entity_hierarchy(const ResolvedPath & resolve
           return false;
         }
         break;
+      case SovdEntityType::SERVER:
+      case SovdEntityType::UNKNOWN:
       default:
         return false;
     }
@@ -631,13 +635,7 @@ void CapabilityGenerator::add_log_configuration_path(nlohmann::json & paths, con
   config_get["summary"] = "Get log configuration for " + entity_path;
   config_get["description"] = "Returns the current log level configuration.";
   config_get["responses"]["200"]["description"] = "Current log configuration";
-  config_get["responses"]["200"]["content"]["application/json"]["schema"] = {
-      {"type", "object"},
-      {"properties",
-       {{"severity_filter", {{"type", "string"}, {"description", "Minimum log severity level"}}},
-        {"max_entries", {{"type", "integer"}, {"description", "Maximum number of log entries to retain"}}},
-        {"entity_id", {{"type", "string"}}}}},
-      {"required", {"severity_filter"}}};
+  config_get["responses"]["200"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("LogConfiguration");
   config_path_item["get"] = std::move(config_get);
 
   nlohmann::json config_put;
@@ -645,19 +643,8 @@ void CapabilityGenerator::add_log_configuration_path(nlohmann::json & paths, con
   config_put["summary"] = "Update log configuration for " + entity_path;
   config_put["description"] = "Update the log level configuration.";
   config_put["requestBody"]["required"] = true;
-  config_put["requestBody"]["content"]["application/json"]["schema"] = {
-      {"type", "object"},
-      {"properties",
-       {{"severity_filter", {{"type", "string"}, {"description", "Minimum log severity level"}}},
-        {"max_entries", {{"type", "integer"}, {"description", "Maximum number of log entries to retain"}}}}}};
-  config_put["responses"]["200"]["description"] = "Log configuration updated";
-  config_put["responses"]["200"]["content"]["application/json"]["schema"] = {
-      {"type", "object"},
-      {"properties",
-       {{"severity_filter", {{"type", "string"}}},
-        {"max_entries", {{"type", "integer"}}},
-        {"entity_id", {{"type", "string"}}}}},
-      {"required", {"severity_filter"}}};
+  config_put["requestBody"]["content"]["application/json"]["schema"] = SchemaBuilder::ref("LogConfiguration");
+  config_put["responses"]["204"]["description"] = "Log configuration updated";
   config_path_item["put"] = std::move(config_put);
 
   paths[logs_path + "/configuration"] = std::move(config_path_item);
@@ -697,6 +684,8 @@ void CapabilityGenerator::add_resource_collection_paths(nlohmann::json & paths, 
           case SovdEntityType::FUNCTION:
             ops = cache.get_function_operations(entity_id);
             break;
+          case SovdEntityType::SERVER:
+          case SovdEntityType::UNKNOWN:
           default:
             break;
         }
@@ -719,6 +708,13 @@ void CapabilityGenerator::add_resource_collection_paths(nlohmann::json & paths, 
         paths[col_path] = path_builder.build_logs_collection(entity_path);
         add_log_configuration_path(paths, col_path, entity_path);
         break;
+      case ResourceCollection::DATA_LISTS:
+      case ResourceCollection::LOCKS:
+      case ResourceCollection::MODES:
+      case ResourceCollection::COMMUNICATION_LOGS:
+      case ResourceCollection::TRIGGERS:
+      case ResourceCollection::SCRIPTS:
+      case ResourceCollection::UPDATES:
       default:
         // For other collections we don't have specific builders, add generic listing
         {
