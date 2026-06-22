@@ -30,6 +30,13 @@ inline constexpr std::string_view kFaultSeverityLabelValues[] = {"INFO", "WARN",
 /// Fault aggregated status (fault_detail_schema - status.aggregatedStatus).
 inline constexpr std::string_view kFaultAggregatedStatusValues[] = {"active", "passive", "cleared"};
 
+/// Fault status query filter (FaultListQuery.status / FaultEntityListQuery.status
+/// / FaultClearQuery.status).
+/// Mirrors the values parse_fault_status_param() accepts in http_utils.hpp;
+/// any other value yields ERR_INVALID_PARAMETER. The leading entry must be a
+/// handler-accepted value (the OpenAPI callability test sends enum[0]).
+inline constexpr std::string_view kFaultStatusFilterValues[] = {"pending", "confirmed", "cleared", "healed", "all"};
+
 /// Log aggregation level (log_entry_list_schema - x-medkit.aggregation_level).
 inline constexpr std::string_view kLogAggregationLevelValues[] = {"function", "area", "component"};
 
@@ -54,6 +61,9 @@ inline constexpr std::string_view kLogSeverityFilterValues[] = {"debug", "info",
 
 /// Execution control capability (execution_update_request_schema).
 inline constexpr std::string_view kExecutionCapabilityValues[] = {"stop", "execute", "freeze", "reset"};
+
+/// Lifecycle status (LifecycleStatusResponse.status).
+inline constexpr std::string_view kLifecycleStatusValues[] = {"ready", "notReady"};
 
 }  // namespace dto
 }  // namespace ros2_medkit_gateway
