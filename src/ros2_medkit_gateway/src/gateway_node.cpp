@@ -18,8 +18,10 @@
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <mutex>
 #include <set>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -27,7 +29,9 @@
 
 #include "ros2_medkit_gateway/core/aggregation/network_utils.hpp"
 #include "ros2_medkit_gateway/core/data/topic_data_provider.hpp"
+#include "ros2_medkit_gateway/core/discovery/refresh_debounce.hpp"
 #include "ros2_medkit_gateway/core/entity_validation.hpp"
+#include "ros2_medkit_gateway/core/thread_pool_config.hpp"
 #include "ros2_medkit_gateway/param_utils.hpp"
 #include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 
@@ -143,10 +147,42 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // Declare parameters with defaults
   declare_parameter("server.host", "127.0.0.1");
   declare_parameter("server.port", 8080);
+
+  // Thread-pool bounds (issue #440). Both pools default to a small fixed size
+  // instead of scaling with the host core count, so the footprint stays the
+  // same on a 4-core SBC and a 64-core server.
+  //
+  // executor_threads: the main executor only delivers the node's own callbacks
+  // (timers, graph events, subscriptions) and the service-response callbacks
+  // that complete operation/action RPC futures. All of these run on the node's
+  // default callback group, which is mutually-exclusive, so they serialize
+  // through a single thread regardless of this count - raising it buys no
+  // RPC-response parallelism. The reason a small executor is safe is solely that
+  // the blocking wait for an RPC runs on the cpp-httplib pool thread (off the
+  // executor), never on an executor thread, so it cannot deadlock the executor.
+  //
+  // http_thread_pool_size: each active SSE stream pins one worker for its
+  // lifetime and each cold-/data wait parks one for up to
+  // topic_sample_timeout_sec, so the pool defaults at or above
+  // sse.max_clients + data_provider.cold_wait_cap (2 + 4 = 6) to avoid
+  // starvation; main.cpp warns at startup if it is set below that sum. Both
+  // values are clamped to a bounded range on read (see clamp_thread_count).
+  declare_parameter("server.executor_threads", 2);
+  declare_parameter("server.http_thread_pool_size", 6);
+
+  // cpp-httplib keep-alive idle timeout (seconds). The library default (5s)
+  // parks a request-pool worker on an idle keep-alive connection for that long;
+  // with the small bounded pool above, a burst of short-lived client connections
+  // (e.g. a client polling several endpoints per cycle) can pin every worker and
+  // stall ordinary requests for up to one timeout per cycle. Defaulting to 2s
+  // recovers workers quickly while retaining connection reuse for legitimate
+  // clients. Clamped to [1, 3600] on read (see clamp_keep_alive_timeout).
+  declare_parameter("server.keep_alive_timeout_sec", 2);
   // Safety-backstop refresh interval. Primary discovery refresh is driven
   // by rclcpp graph events; this only controls the periodic forced
   // refresh used when a graph event would otherwise be missed.
   declare_parameter("refresh_interval_ms", 30000);
+  declare_parameter("discovery.refresh_debounce_ms", 1000);
   declare_parameter("fault_manager.namespace", "");
   declare_parameter("fault_manager.service_timeout_sec", 5.0);
   declare_parameter("cors.allowed_origins", std::vector<std::string>{});
@@ -156,13 +192,25 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   declare_parameter("cors.max_age_seconds", 86400);
 
   // SSE (Server-Sent Events) parameters
-  declare_parameter("sse.max_clients", 10);         // Limit concurrent SSE connections to prevent resource exhaustion
+  // Concurrent SSE connections. Each one pins an HTTP pool worker for its
+  // lifetime, so this is kept within the pool's budget: the default (2) plus
+  // data_provider.cold_wait_cap (4) equals server.http_thread_pool_size (6),
+  // leaving the pool able to cover the documented worst case. Raise the pool to
+  // match if you raise this (main.cpp warns at startup otherwise). Clamped on
+  // read.
+  declare_parameter("sse.max_clients", 2);
   declare_parameter("sse.max_subscriptions", 100);  // Maximum active cyclic subscriptions across all entities
   declare_parameter("sse.max_duration_sec", 3600);  // Maximum subscription duration in seconds (1 hour default)
 
   // Log management parameters
   declare_parameter("logs.buffer_size",
                     200);  // Ring buffer capacity per node; entries exceeding this are dropped (oldest first)
+
+  // Entity cache capacity. Pre-reserves the cache backing stores so steady-state
+  // refreshes below this entity count cause no structural reallocation.
+  // Valid range: 16-1000000 (values outside this range are clamped with a warning).
+  // Default: 256 (covers most production graphs with headroom).
+  declare_parameter("entity_cache.capacity", 256);
 
   // Topic-sample default timeout used by the data-access path.
   declare_parameter("topic_sample_timeout_sec", 1.0);
@@ -352,6 +400,21 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   server_host_ = get_parameter("server.host").as_string();
   server_port_ = static_cast<int>(get_parameter("server.port").as_int());
   refresh_interval_ms_ = static_cast<int>(get_parameter("refresh_interval_ms").as_int());
+  // Read as int64 and validate BEFORE narrowing to int: a value above INT_MAX
+  // would otherwise wrap into the valid range and silently bypass the range
+  // check (e.g. 4294967296 -> 0, disabling debounce). 0 disables debouncing
+  // (refresh on every graph event, the pre-#442 behaviour); otherwise coalesce
+  // graph events into at most one refresh per this interval. An out-of-range
+  // value is rejected with a warning and the default (1000 ms) is used.
+  const int64_t refresh_debounce_raw = get_parameter("discovery.refresh_debounce_ms").as_int();
+  if (refresh_debounce_raw < 0 || refresh_debounce_raw > 60000) {
+    RCLCPP_WARN(get_logger(),
+                "Invalid discovery.refresh_debounce_ms %" PRId64 "ms. Must be between 0-60000ms. Using default 1000ms.",
+                refresh_debounce_raw);
+    refresh_debounce_ms_ = 1000;
+  } else {
+    refresh_debounce_ms_ = static_cast<int>(refresh_debounce_raw);
+  }
 
   // Build CORS configuration using builder pattern
   // Throws std::invalid_argument if configuration is invalid
@@ -631,8 +694,11 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   subscription_mgr_ = std::make_unique<SubscriptionManager>(max_subscriptions);
   RCLCPP_INFO(get_logger(), "Subscription manager: max_subscriptions=%zu", max_subscriptions);
 
-  // Create SSE client tracker (shared between SseTransportProvider and SSEFaultHandler)
-  auto max_sse_clients = static_cast<size_t>(get_parameter("sse.max_clients").as_int());
+  // Create SSE client tracker (shared between SseTransportProvider and SSEFaultHandler).
+  // Clamp like the pool knobs (issue #440): read raw, a negative value would wrap
+  // to a huge size_t. Bounded to [1, 1024]; main.cpp warns at startup if this
+  // exceeds the HTTP pool budget (pool < sse.max_clients + cold_wait_cap).
+  auto max_sse_clients = clamp_thread_count(get_parameter("sse.max_clients").as_int(), 1, 1024);
   sse_client_tracker_ = std::make_shared<SSEClientTracker>(max_sse_clients);
 
   // Initialize resource sampler and transport registries
@@ -721,6 +787,22 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     RCLCPP_WARN(get_logger(), "logs.buffer_size %" PRId64 " clamped to %" PRId64, raw_buffer_size, clamped);
   }
   auto log_buffer_size = static_cast<size_t>(clamped);
+
+  // Apply entity_cache.capacity: clamp to [16, 1000000] and pre-reserve the cache.
+  // Reserve is called here (in the ctor) so the backing stores are sized before
+  // the first refresh_cache() call. thread_safe_cache_ is a value member so it
+  // is already default-constructed at this point; reserve() only grows it.
+  static constexpr int kMinCacheCapacity = 16;
+  static constexpr int kMaxCacheCapacity = 1000000;
+  auto raw_cache_capacity = get_parameter("entity_cache.capacity").as_int();
+  auto clamped_cache_capacity =
+      std::clamp(raw_cache_capacity, static_cast<int64_t>(kMinCacheCapacity), static_cast<int64_t>(kMaxCacheCapacity));
+  if (clamped_cache_capacity != raw_cache_capacity) {
+    RCLCPP_WARN(get_logger(), "entity_cache.capacity %" PRId64 " clamped to %" PRId64, raw_cache_capacity,
+                clamped_cache_capacity);
+  }
+  thread_safe_cache_.reserve(static_cast<size_t>(clamped_cache_capacity));
+
   log_source_ = std::make_shared<ros2::Ros2LogSource>(this);
   // Inject a sink that forwards LogManager's neutral diagnostics back to the
   // gateway's rclcpp logger so plugin-provider exceptions remain visible to
@@ -1423,9 +1505,25 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     if (!graph_event_) {
       return;
     }
-    if (!graph_event_->check_and_clear()) {
-      return;
+    // Coalesce graph events: under graph churn (nodes/topics created and
+    // destroyed repeatedly) the event fires many times per second, and each
+    // refresh_cache() runs the full discovery pipeline. Debounce so we run at
+    // most one refresh per `refresh_debounce_ms` (default 1000 ms) - the ROS
+    // graph rarely changes faster than that in practice, and coalescing
+    // bounds the per-event allocation churn (issue #442). A pending event is
+    // always serviced within refresh_debounce_ms + one 100 ms tick.
+    const bool event_fired = graph_event_->check_and_clear();
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - last_graph_refresh_.load(std::memory_order_relaxed))
+            .count();
+    const auto decision = decide_graph_refresh(event_fired, graph_dirty_.load(std::memory_order_relaxed), elapsed_ms,
+                                               refresh_debounce_ms_);
+    graph_dirty_.store(decision.dirty, std::memory_order_relaxed);
+    if (!decision.refresh) {
+      return;  // nothing pending, or still within the debounce window
     }
+    last_graph_refresh_.store(now, std::memory_order_relaxed);
     refresh_cache();
     // Note: orphan-trigger sweep is deliberately NOT run from the graph-event
     // path. Graph events fire on every node up/down at high frequency,
@@ -1484,6 +1582,94 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   std::string protocol = tls_config_.enabled ? "HTTPS" : "HTTP";
   RCLCPP_INFO(get_logger(), "ROS 2 Medkit Gateway ready on %s://%s:%d", protocol.c_str(), server_host_.c_str(),
               server_port_);
+
+  // One-shot discovery summary a few seconds after startup. The delay lets DDS
+  // discovery settle so the counts (and any empty-graph warning) reflect a
+  // converged view rather than the cold-start moment.
+  startup_summary_timer_ = create_wall_timer(std::chrono::seconds(5), [this]() {
+    startup_summary_timer_->cancel();
+    startup_summary_timer_.reset();
+    log_startup_summary();
+  });
+}
+
+size_t GatewayNode::count_peer_nodes(const std::vector<std::pair<std::string, std::string>> & nodes_and_namespaces,
+                                     const std::string & self_fqn) {
+  size_t count = 0;
+  for (const auto & [name, ns] : nodes_and_namespaces) {
+    if (!name.empty() && name.front() == '_') {
+      continue;  // hidden node (name part starts with '_')
+    }
+    std::string fqn = ns;
+    if (ns != "/") {
+      fqn += "/";
+    }
+    fqn += name;
+    // Exclude the gateway's own nodes by exact FQN: the main node and its known
+    // internal helpers. A plain prefix match would also drop a genuine peer whose
+    // name starts with the gateway name (e.g. "<fqn>_monitor" or "<fqn>2").
+    if (fqn == self_fqn || fqn == self_fqn + "_sub" || fqn == self_fqn + "_fault_clients") {
+      continue;
+    }
+    ++count;
+  }
+  return count;
+}
+
+std::string GatewayNode::connectable_host(const std::string & bind_host) {
+  // A bind-all address is not a valid connect target, so the sample curl must use
+  // a loopback address the operator can actually reach.
+  if (bind_host.empty() || bind_host == "0.0.0.0") {
+    return "127.0.0.1";
+  }
+  if (bind_host == "::" || bind_host == "[::]") {
+    return "[::1]";
+  }
+  // Bracket a bare IPv6 literal so "host:port" is a valid URL authority for curl.
+  if (bind_host.front() != '[' && bind_host.find(':') != std::string::npos) {
+    return "[" + bind_host + "]";
+  }
+  return bind_host;
+}
+
+void GatewayNode::log_startup_summary() {
+  size_t topic_count = 0;
+  size_t peer_node_count = 0;
+  try {
+    for (const auto & entry : get_topic_names_and_types()) {
+      const std::string & topic = entry.first;
+      if (topic.find("/parameter_events") == std::string::npos && topic.find("/rosout") == std::string::npos) {
+        ++topic_count;
+      }
+    }
+    peer_node_count =
+        count_peer_nodes(get_node_graph_interface()->get_node_names_and_namespaces(), get_fully_qualified_name());
+  } catch (const std::exception & e) {
+    RCLCPP_DEBUG(get_logger(), "Startup summary: graph query failed: %s", e.what());
+  }
+
+  const size_t entity_count = thread_safe_cache_.get_areas().size() + thread_safe_cache_.get_components().size() +
+                              thread_safe_cache_.get_apps().size() + thread_safe_cache_.get_functions().size();
+
+  const std::string protocol = tls_config_.enabled ? "https" : "http";
+  const std::string url = protocol + "://" + connectable_host(server_host_) + ":" + std::to_string(server_port_);
+
+  RCLCPP_INFO(get_logger(),
+              "Discovery summary: %zu peer node(s), %zu topic(s), %zu medkit entit%s. REST API: %s  Try: curl "
+              "%s/api/v1/areas",
+              peer_node_count, topic_count, entity_count, entity_count == 1 ? "y" : "ies", url.c_str(), url.c_str());
+
+  if (peer_node_count == 0) {
+    const char * domain = std::getenv("ROS_DOMAIN_ID");
+    const char * rmw = std::getenv("RMW_IMPLEMENTATION");
+    const char * localhost_only = std::getenv("ROS_LOCALHOST_ONLY");
+    RCLCPP_WARN(get_logger(),
+                "No application nodes are visible on the ROS graph - the gateway sees only its own nodes. "
+                "Active ROS environment: ROS_DOMAIN_ID=%s, RMW_IMPLEMENTATION=%s, ROS_LOCALHOST_ONLY=%s. Check that "
+                "the gateway shares the robot stack's ROS_DOMAIN_ID and RMW_IMPLEMENTATION and can reach it on the "
+                "network (in containers: matching domain/RMW and DDS discovery not blocked).",
+                domain ? domain : "0 (default)", rmw ? rmw : "(default)", localhost_only ? localhost_only : "(unset)");
+  }
 }
 
 GatewayNode::~GatewayNode() {
@@ -1554,6 +1740,10 @@ GatewayNode::~GatewayNode() {
   if (backstop_timer_) {
     backstop_timer_->cancel();
     backstop_timer_.reset();
+  }
+  if (startup_summary_timer_) {
+    startup_summary_timer_->cancel();
+    startup_summary_timer_.reset();
   }
   graph_event_.reset();
   // 10. Normal member destruction (managers safe - all transports stopped)
@@ -1989,6 +2179,20 @@ void GatewayNode::refresh_cache() {
     // Update ThreadSafeEntityCache atomically (entities + node_to_app under single lock)
     thread_safe_cache_.update_all(std::move(areas), std::move(all_components), std::move(apps), std::move(functions),
                                   std::move(node_to_app));
+
+    // Emit a one-shot WARN when the entity cache grew beyond its reserved capacity.
+    // Growing is harmless but causes structural reallocation; embedded / memory-
+    // constrained deployments should raise entity_cache.capacity to prevent it.
+    if (!warned_cache_grow_) {
+      const auto stats = thread_safe_cache_.get_stats();
+      if (stats.grew) {
+        RCLCPP_WARN(get_logger(),
+                    "entity_cache capacity %zu exceeded (grew); raise entity_cache.capacity "
+                    "for embedded determinism",
+                    stats.capacity);
+        warned_cache_grow_ = true;
+      }
+    }
 
     // Update topic type cache (avoids expensive ROS graph queries on /data requests)
     if (data_access_mgr_) {

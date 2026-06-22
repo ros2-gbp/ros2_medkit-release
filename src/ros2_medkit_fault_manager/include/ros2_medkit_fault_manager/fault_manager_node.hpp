@@ -20,6 +20,7 @@
 #include <unordered_map>
 
 #include "rclcpp/rclcpp.hpp"
+#include "ros2_medkit_fault_manager/capture_thread_pool.hpp"
 #include "ros2_medkit_fault_manager/correlation/correlation_engine.hpp"
 #include "ros2_medkit_fault_manager/entity_threshold_resolver.hpp"
 #include "ros2_medkit_fault_manager/fault_storage.hpp"
@@ -63,6 +64,16 @@ class FaultManagerNode : public rclcpp::Node {
   /// Get the storage type being used
   const std::string & get_storage_type() const {
     return storage_type_;
+  }
+
+  int capture_pool_size_for_test() const {
+    return capture_pool_size_;
+  }
+  int capture_queue_depth_for_test() const {
+    return capture_queue_depth_;
+  }
+  QueueFullPolicy capture_queue_full_policy_for_test() const {
+    return capture_queue_full_policy_;
   }
 
   /// Check if entity matches any reporting source
@@ -144,6 +155,9 @@ class FaultManagerNode : public rclcpp::Node {
   int32_t healing_threshold_{3};
   double auto_confirm_after_sec_{0.0};
   double snapshot_recapture_cooldown_sec_{60.0};
+  int capture_pool_size_{2};
+  int capture_queue_depth_{16};
+  QueueFullPolicy capture_queue_full_policy_{QueueFullPolicy::kRejectNewest};
   DebounceConfig global_config_;  ///< Global debounce config (built from ROS params)
   std::unique_ptr<FaultStorage> storage_;
   std::unique_ptr<EntityThresholdResolver> threshold_resolver_;  ///< Per-entity threshold overrides
@@ -165,19 +179,19 @@ class FaultManagerNode : public rclcpp::Node {
   rclcpp::Publisher<ros2_medkit_msgs::msg::FaultEvent>::SharedPtr event_publisher_;
 
   /// Snapshot capture for capturing topic data on fault confirmation.
-  /// shared_ptr to allow safe capture-by-value in detached capture threads.
+  /// shared_ptr to allow safe capture-by-value in the pool's capture jobs.
   std::shared_ptr<SnapshotCapture> snapshot_capture_;
 
   /// Rosbag capture for time-window recording (nullptr if disabled).
-  /// shared_ptr to allow safe capture-by-value in detached capture threads.
+  /// shared_ptr to allow safe capture-by-value in the pool's capture jobs.
   std::shared_ptr<RosbagCapture> rosbag_capture_;
 
   /// Correlation engine for fault correlation/muting (nullptr if disabled)
   std::unique_ptr<correlation::CorrelationEngine> correlation_engine_;
 
-  /// Tracks active capture threads for clean shutdown (join before destruction)
-  std::mutex capture_threads_mutex_;
-  std::vector<std::thread> capture_threads_;
+  /// Bounded pool that runs capture jobs off the service thread (issue #441).
+  /// Declared after snapshot_capture_/rosbag_capture_ so it is destroyed first.
+  std::unique_ptr<CaptureThreadPool> capture_pool_;
 
   /// Per-fault cooldown tracking for snapshot recapture
   std::mutex last_capture_mutex_;

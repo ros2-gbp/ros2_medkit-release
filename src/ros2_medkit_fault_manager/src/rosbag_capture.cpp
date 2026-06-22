@@ -18,17 +18,39 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <rosbag2_cpp/writer.hpp>
 #include <rosbag2_storage/storage_options.hpp>
 #include <set>
 #include <sstream>
+#include <utility>
 
 #include "ros2_medkit_fault_manager/time_utils.hpp"
 
 namespace ros2_medkit_fault_manager {
 
 namespace {
+
+/// Actionable install hint for an unavailable storage backend.
+std::string storage_plugin_hint(const std::string & format) {
+  if (format == "mcap") {
+    const char * distro = std::getenv("ROS_DISTRO");
+    const std::string d = (distro && *distro) ? distro : "$ROS_DISTRO";
+    return "install ros-" + d + "-rosbag2-storage-mcap";
+  }
+  return "check the rosbag2 storage plugin installation";
+}
+
+/// Bound the probe reason so a verbose pluginlib error does not flood the log.
+std::string truncate_reason(const std::string & reason, size_t max_len = 200) {
+  if (reason.size() <= max_len) {
+    return reason;
+  }
+  return reason.substr(0, max_len) + "...";
+}
 
 /// Custom deleter for rcutils_uint8_array_t that calls rcutils_uint8_array_fini
 struct Uint8ArrayDeleter {
@@ -85,7 +107,7 @@ std::shared_ptr<rosbag2_storage::SerializedBagMessage> create_bag_message(const 
 }  // namespace
 
 RosbagCapture::RosbagCapture(rclcpp::Node * node, FaultStorage * storage, const RosbagConfig & config,
-                             const SnapshotConfig & snapshot_config)
+                             const SnapshotConfig & snapshot_config, StorageProbeFn storage_probe)
   : node_(node), storage_(storage), config_(config), snapshot_config_(snapshot_config) {
   if (!node_) {
     throw std::invalid_argument("RosbagCapture requires a valid node pointer");
@@ -94,13 +116,53 @@ RosbagCapture::RosbagCapture(rclcpp::Node * node, FaultStorage * storage, const 
     throw std::invalid_argument("RosbagCapture requires a valid storage pointer");
   }
 
+  storage_probe_ = storage_probe ? std::move(storage_probe) : [this](const std::string & f) {
+    return default_storage_probe(f);
+  };
+
   if (!config_.enabled) {
     RCLCPP_INFO(node_->get_logger(), "RosbagCapture disabled");
     return;
   }
 
-  // Validate storage format before proceeding
-  validate_storage_format();
+  // Resolve a usable storage backend without ever terminating the FaultManager:
+  // an unavailable plugin (e.g. rosbag2_storage_mcap not installed) must degrade,
+  // not crash. Unknown formats and a missing plugin fall back to sqlite3 (always
+  // shipped with rosbag2); if no backend works, disable capture and keep running
+  // (freeze-frame snapshots are independent of rosbag).
+  if (config_.format != "sqlite3" && config_.format != "mcap") {
+    RCLCPP_WARN(node_->get_logger(), "Unknown rosbag storage format '%s'; using 'sqlite3'", config_.format.c_str());
+    config_.format = "sqlite3";
+  }
+
+  if (auto probe_err = storage_probe_(config_.format)) {
+    const std::string reason = truncate_reason(*probe_err);
+    if (config_.format == "sqlite3") {
+      // The always-shipped baseline failed: an environment-level problem (broken
+      // rosbag2 base install / disk / permissions), not a missing optional plugin.
+      RCLCPP_WARN(node_->get_logger(),
+                  "sqlite3 rosbag storage is unavailable (%s); the rosbag2 base install may be broken. "
+                  "Black-box rosbag capture disabled (freeze-frame snapshots still work)",
+                  reason.c_str());
+      config_.enabled = false;
+      return;
+    }
+    if (auto sqlite_err = storage_probe_("sqlite3")) {
+      RCLCPP_WARN(node_->get_logger(),
+                  "No usable rosbag storage backend: '%s' (%s) and sqlite3 (%s) both failed to load; black-box "
+                  "rosbag capture disabled (freeze-frame snapshots still work)",
+                  config_.format.c_str(), reason.c_str(), truncate_reason(*sqlite_err).c_str());
+      config_.enabled = false;
+      return;
+    }
+    // Explicitly-configured (non-default) format unavailable: name the fix so an
+    // operator who chose e.g. mcap for Foxglove is not silently downgraded.
+    RCLCPP_WARN(node_->get_logger(),
+                "Rosbag storage format '%s' is unavailable (%s); %s. Falling back to 'sqlite3' for black-box "
+                "capture (sqlite3 bags are not directly Foxglove-readable)",
+                config_.format.c_str(), reason.c_str(), storage_plugin_hint(config_.format).c_str());
+    config_.format = "sqlite3";
+  }
 
   RCLCPP_INFO(node_->get_logger(), "RosbagCapture initialized (duration=%.1fs, after=%.1fs, lazy_start=%s, format=%s)",
               config_.duration_sec, config_.duration_after_sec, config_.lazy_start ? "true" : "false",
@@ -150,11 +212,13 @@ void RosbagCapture::stop() {
 
   // Clear subscriptions
   subscriptions_.clear();
+  subscribed_topics_.clear();
 
   // Clear buffer
   {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     message_buffer_.clear();
+    buffer_bytes_ = 0;
   }
 
   RCLCPP_INFO(node_->get_logger(), "RosbagCapture stopped");
@@ -189,6 +253,10 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
   }
 
   RCLCPP_INFO(node_->get_logger(), "RosbagCapture: fault '%s' confirmed, flushing buffer to bag", fault_code.c_str());
+
+  // In "entity" mode, narrow the broadly-buffered messages to the faulting node's
+  // topics. Sets the filter used by flush_to_bag() and the post-fault write path.
+  resolve_entity_topics(fault_code);
 
   // Flush buffer to bag
   std::string bag_path = flush_to_bag(fault_code);
@@ -237,6 +305,9 @@ void RosbagCapture::on_fault_confirmed(const std::string & fault_code) {
 
     RCLCPP_INFO(node_->get_logger(), "Bag file created: %s (%.2f MB)", bag_path.c_str(),
                 static_cast<double>(bag_size) / (1024.0 * 1024.0));
+
+    std::lock_guard<std::mutex> lock(capture_topics_mutex_);
+    active_capture_topics_.clear();
   }
 }
 
@@ -252,31 +323,30 @@ void RosbagCapture::on_fault_cleared(const std::string & fault_code) {
 }
 
 void RosbagCapture::init_subscriptions() {
-  auto topics = resolve_topics();
-  if (topics.empty()) {
-    RCLCPP_WARN(node_->get_logger(), "No topics configured for rosbag capture");
-    return;
-  }
+  // Broad modes ("all"/"auto"/"entity") capture whatever is on the graph, so the
+  // subscribe set must keep growing as publishers appear after startup (dynamic
+  // capture). Fixed modes (config/explicit/list) have a closed set known up front.
+  dynamic_discovery_ = (config_.topics == "all" || config_.topics == "auto" || config_.topics == "entity");
 
   subscriptions_.clear();
+  subscribed_topics_.clear();
 
   // Track topics that couldn't be subscribed yet (type not discoverable)
   std::vector<std::string> pending_topics;
-
-  for (const auto & topic : topics) {
+  for (const auto & topic : resolve_topics()) {
     if (!try_subscribe_topic(topic)) {
       pending_topics.push_back(topic);
     }
   }
 
-  // If we have pending topics, start a timer to retry subscription
-  if (!pending_topics.empty() && !discovery_retry_timer_) {
+  // Run the discovery timer when there are type-pending topics OR we need to keep
+  // picking up newly-appeared topics in a broad mode.
+  if ((dynamic_discovery_ || !pending_topics.empty()) && !discovery_retry_timer_) {
     pending_topics_ = pending_topics;
     discovery_retry_count_ = 0;
     discovery_retry_timer_ = node_->create_wall_timer(std::chrono::milliseconds(500), [this]() {
       discovery_retry_callback();
     });
-    RCLCPP_INFO(node_->get_logger(), "Will retry subscribing to %zu pending topics", pending_topics_.size());
   }
 }
 
@@ -294,7 +364,7 @@ bool RosbagCapture::try_subscribe_topic(const std::string & topic) {
   }
 
   try {
-    rclcpp::QoS qos = rclcpp::SensorDataQoS();
+    rclcpp::QoS qos = config_.qos_match ? resolve_topic_qos(topic) : rclcpp::QoS(rclcpp::SensorDataQoS());
 
     auto callback = [this, topic, msg_type](const std::shared_ptr<const rclcpp::SerializedMessage> & msg) {
       message_callback(topic, msg_type, msg);
@@ -302,6 +372,7 @@ bool RosbagCapture::try_subscribe_topic(const std::string & topic) {
 
     auto subscription = node_->create_generic_subscription(topic, msg_type, qos, callback);
     subscriptions_.push_back(subscription);
+    subscribed_topics_.insert(topic);
 
     RCLCPP_INFO(node_->get_logger(), "Subscribed to '%s' (%s) for rosbag capture", topic.c_str(), msg_type.c_str());
     return true;
@@ -313,7 +384,7 @@ bool RosbagCapture::try_subscribe_topic(const std::string & topic) {
 }
 
 void RosbagCapture::discovery_retry_callback() {
-  if (pending_topics_.empty() || !running_.load()) {
+  if (!running_.load()) {
     if (discovery_retry_timer_) {
       discovery_retry_timer_->cancel();
       discovery_retry_timer_.reset();
@@ -321,6 +392,19 @@ void RosbagCapture::discovery_retry_callback() {
     return;
   }
 
+  if (dynamic_discovery_) {
+    // Re-resolve the broad set every tick and subscribe to anything new, so topics
+    // whose publishers come up after startup are captured. Runs for the capture's
+    // lifetime; already-subscribed topics are skipped cheaply.
+    for (const auto & topic : resolve_topics()) {
+      if (subscribed_topics_.count(topic) == 0) {
+        try_subscribe_topic(topic);
+      }
+    }
+    return;
+  }
+
+  // Fixed modes: bounded retry of the initially type-pending topics only.
   discovery_retry_count_++;
   constexpr int max_retries = 20;  // 10 seconds total (20 * 500ms)
 
@@ -358,6 +442,10 @@ void RosbagCapture::message_callback(const std::string & topic, const std::strin
 
   // During post-fault recording, write directly to bag (no buffering)
   if (recording_post_fault_.load()) {
+    // Entity mode: keep the post-fault stream scoped to the same topics as the flush
+    if (!should_capture_topic(topic)) {
+      return;
+    }
     std::lock_guard<std::mutex> wlock(writer_mutex_);
     if (active_writer_) {
       try {
@@ -390,9 +478,11 @@ void RosbagCapture::message_callback(const std::string & topic, const std::strin
   buffered.message_type = msg_type;
   buffered.serialized_data = std::make_shared<rclcpp::SerializedMessage>(*msg);
   buffered.timestamp_ns = timestamp_ns;
+  const size_t msg_bytes = buffered.serialized_data->size();
 
   {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
+    buffer_bytes_ += msg_bytes;
     message_buffer_.push_back(std::move(buffered));
   }
 
@@ -419,8 +509,30 @@ void RosbagCapture::prune_buffer() {
 
   // Remove messages older than cutoff
   while (!message_buffer_.empty() && message_buffer_.front().timestamp_ns < cutoff_ns) {
+    buffer_bytes_ -= message_buffer_.front().serialized_data->size();
     message_buffer_.pop_front();
   }
+
+  // RAM cap: drop the oldest messages once the buffer exceeds max_buffer_mb, so a
+  // broad subscribe set on a busy robot cannot grow the ring buffer without bound.
+  const size_t cap_bytes = config_.max_buffer_mb * 1024UL * 1024UL;
+  while (message_buffer_.size() > 1 && buffer_bytes_ > cap_bytes) {
+    buffer_bytes_ -= message_buffer_.front().serialized_data->size();
+    message_buffer_.pop_front();
+  }
+}
+
+bool RosbagCapture::is_high_bandwidth_topic(const std::string & topic) {
+  // Segment-anchored match (leading '/') so '/camera/image' and '/points' are caught
+  // but low-bandwidth lookalikes that merely contain the word - /waypoints,
+  // /setpoints, /keypoints, /image_quality on another node - are not.
+  static const std::array<const char *, 4> kSegments{"/image", "/points", "/depth", "/compressed"};
+  for (const char * seg : kSegments) {
+    if (topic.find(seg) != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
 }
 
 std::vector<std::string> RosbagCapture::resolve_topics() const {
@@ -441,14 +553,19 @@ std::vector<std::string> RosbagCapture::resolve_topics() const {
         topics_set.insert(topic);
       }
     }
-  } else if (config_.topics == "all" || config_.topics == "auto") {
-    // Discover all available topics ("auto" is an alias for "all").
-    // Skip gracefully if the context is invalidated mid-call (shutdown race).
+  } else if (config_.topics == "all" || config_.topics == "auto" || config_.topics == "entity") {
+    // Broad discovery for the subscribe set ("auto" is an alias for "all"). "entity"
+    // also subscribes broadly for pre-roll and narrows to the faulting node's topics
+    // only at flush time. Skip gracefully if the context is invalidated mid-call.
     try {
       auto topic_names_and_types = node_->get_topic_names_and_types();
       for (const auto & [topic, types] : topic_names_and_types) {
         // Skip internal ROS topics
         if (topic.find("/parameter_events") != std::string::npos || topic.find("/rosout") != std::string::npos) {
+          continue;
+        }
+        // Skip high-bandwidth sensor topics in broad modes to bound memory
+        if (config_.exclude_sensor_topics && is_high_bandwidth_topic(topic)) {
           continue;
         }
         topics_set.insert(topic);
@@ -486,6 +603,141 @@ std::vector<std::string> RosbagCapture::resolve_topics() const {
   return {topics_set.begin(), topics_set.end()};
 }
 
+rclcpp::QoS RosbagCapture::resolve_topic_qos(const std::string & topic) const {
+  // QoS is resolved once, at subscribe time, from the publishers present then. It is
+  // not re-resolved later: if a best-effort publisher appears afterwards on a topic
+  // already subscribed as reliable, that publisher is QoS-incompatible and the
+  // subscription receives nothing from it. Acceptable for black-box capture, where
+  // the publisher set is stable by the time a fault occurs.
+  std::vector<rclcpp::TopicEndpointInfo> pubs;
+  try {
+    pubs = node_->get_publishers_info_by_topic(topic);
+  } catch (const std::exception &) {
+    return rclcpp::SensorDataQoS();
+  }
+  if (pubs.empty()) {
+    // No known publisher yet - best-effort default. Not upgraded once subscribed,
+    // but a topic discovered via get_topic_names_and_types already has a publisher,
+    // so this branch is a rare startup race rather than the steady state.
+    return rclcpp::SensorDataQoS();
+  }
+
+  // Build a subscriber QoS compatible with every publisher while staying as faithful
+  // as the offers allow: reliable only if ALL publishers offer reliable, transient-local
+  // only if ALL offer it (otherwise the sub would be incompatible and never connect).
+  bool all_reliable = true;
+  bool all_transient_local = true;
+  size_t depth = 10;
+  for (const auto & p : pubs) {
+    const auto & pq = p.qos_profile();
+    if (pq.reliability() != rclcpp::ReliabilityPolicy::Reliable) {
+      all_reliable = false;
+    }
+    if (pq.durability() != rclcpp::DurabilityPolicy::TransientLocal) {
+      all_transient_local = false;
+    }
+    depth = std::max(depth, std::min<size_t>(pq.depth(), 100));
+  }
+
+  rclcpp::QoS qos{rclcpp::KeepLast(depth)};
+  qos.reliability(all_reliable ? rclcpp::ReliabilityPolicy::Reliable : rclcpp::ReliabilityPolicy::BestEffort);
+  qos.durability(all_transient_local ? rclcpp::DurabilityPolicy::TransientLocal : rclcpp::DurabilityPolicy::Volatile);
+  return qos;
+}
+
+void RosbagCapture::resolve_entity_topics(const std::string & fault_code) {
+  std::set<std::string> topics;
+
+  if (config_.topics == "entity") {
+    // The whole resolution is guarded: this runs on a detached capture thread with
+    // no outer catch, and storage_->get_fault() can throw on the sqlite backend
+    // (e.g. SQLITE_BUSY). A throw here would terminate the process - the exact crash
+    // the crash-safety work removed - so any failure degrades to "write everything".
+    try {
+      auto fault = storage_->get_fault(fault_code);
+      if (fault && !fault->reporting_sources.empty()) {
+        // reporting_sources hold the reporting node's FQN (e.g. "/planner_server").
+        // Split each into (name, namespace) to match against topic endpoints.
+        std::set<std::pair<std::string, std::string>> wanted;
+        for (const auto & source : fault->reporting_sources) {
+          std::string ns = "/";
+          std::string name = source;
+          const auto slash = source.rfind('/');
+          if (slash != std::string::npos) {
+            name = source.substr(slash + 1);
+            ns = (slash == 0) ? "/" : source.substr(0, slash);
+          }
+          if (!name.empty()) {
+            wanted.emplace(name, ns);
+          }
+        }
+
+        // rclcpp does not expose per-node topic listing, so scan each topic's
+        // endpoints and keep the topics a wanted node publishes or subscribes to.
+        auto owned_by_wanted = [&wanted](const std::vector<rclcpp::TopicEndpointInfo> & eps) {
+          for (const auto & ep : eps) {
+            if (wanted.count({ep.node_name(), ep.node_namespace()})) {
+              return true;
+            }
+          }
+          return false;
+        };
+        for (const auto & [topic, types] : node_->get_topic_names_and_types()) {
+          if (owned_by_wanted(node_->get_publishers_info_by_topic(topic)) ||
+              owned_by_wanted(node_->get_subscriptions_info_by_topic(topic))) {
+            topics.insert(topic);
+          }
+        }
+
+        if (!topics.empty()) {
+          // Always-on context that makes a scoped bag useful for replay.
+          topics.insert("/tf");
+          topics.insert("/tf_static");
+        }
+
+        // Intersect with the actually-subscribed set so the filter never names a
+        // topic that was never buffered (an excluded/sensor topic, or one with no
+        // publisher) - which would otherwise be silently absent from the bag.
+        const auto subscribed_vec = resolve_topics();
+        const std::set<std::string> subscribed(subscribed_vec.begin(), subscribed_vec.end());
+        std::set<std::string> scoped;
+        for (const auto & t : topics) {
+          if (subscribed.count(t)) {
+            scoped.insert(t);
+          }
+        }
+        topics = std::move(scoped);
+      }
+    } catch (const std::exception & e) {
+      RCLCPP_WARN(node_->get_logger(), "Entity scope resolution failed for fault '%s' (%s); writing full buffer",
+                  fault_code.c_str(), e.what());
+      topics.clear();
+    }
+
+    if (!topics.empty()) {
+      RCLCPP_INFO(node_->get_logger(), "Entity scope for fault '%s': %zu topic(s) from the faulting node(s) + /tf",
+                  fault_code.c_str(), topics.size());
+    } else {
+      RCLCPP_WARN(node_->get_logger(),
+                  "Entity scope unresolved for fault '%s' (source not a live node, or no buffered topics); "
+                  "writing the full buffer",
+                  fault_code.c_str());
+    }
+  }
+
+  std::lock_guard<std::mutex> lock(capture_topics_mutex_);
+  active_capture_topics_ = std::move(topics);
+}
+
+bool RosbagCapture::should_capture_topic(const std::string & topic) const {
+  std::lock_guard<std::mutex> lock(capture_topics_mutex_);
+  // Empty filter = manual modes, or entity resolution found nothing: write everything.
+  if (active_capture_topics_.empty()) {
+    return true;
+  }
+  return active_capture_topics_.count(topic) > 0;
+}
+
 std::string RosbagCapture::get_topic_type(const std::string & topic) const {
   // node_->get_topic_names_and_types() throws if the rcl context is
   // invalidated mid-call (e.g. SIGINT fires between the check and the rcl
@@ -514,6 +766,7 @@ std::string RosbagCapture::flush_to_bag(const std::string & fault_code) {
     }
     messages_to_write = std::move(message_buffer_);
     message_buffer_.clear();
+    buffer_bytes_ = 0;
   }
 
   std::string bag_path = generate_bag_path(fault_code);
@@ -539,9 +792,23 @@ std::string RosbagCapture::flush_to_bag(const std::string & fault_code) {
       active_writer_->open(storage_options);
     }
 
+    // Snapshot the entity filter once (empty = write everything) so the flush loop
+    // does not take capture_topics_mutex_ for every buffered message.
+    std::set<std::string> capture_filter;
+    {
+      std::lock_guard<std::mutex> lock(capture_topics_mutex_);
+      capture_filter = active_capture_topics_;
+    }
+    const bool entity_filtered = !capture_filter.empty();
+
     // Write messages (no buffer_mutex_ held, writer_mutex_ only for brief access)
     size_t msg_count = 0;
     for (const auto & msg : messages_to_write) {
+      // Entity mode: write only the faulting node's topics (+ /tf). No-op otherwise.
+      if (entity_filtered && capture_filter.count(msg.topic) == 0) {
+        continue;
+      }
+
       std::lock_guard<std::mutex> wlock(writer_mutex_);
       if (!active_writer_) {
         break;
@@ -696,44 +963,34 @@ void RosbagCapture::post_fault_timer_callback() {
 
   current_fault_code_.clear();
   current_bag_path_.clear();
+  {
+    std::lock_guard<std::mutex> lock(capture_topics_mutex_);
+    active_capture_topics_.clear();
+  }
 }
 
-void RosbagCapture::validate_storage_format() const {
-  // Validate format is one of the known options
-  if (config_.format != "sqlite3" && config_.format != "mcap") {
-    throw std::runtime_error("Invalid rosbag storage format '" + config_.format +
-                             "'. "
-                             "Valid options: 'sqlite3', 'mcap'");
-  }
-
-  // Verify the selected storage plugin is available by trying to create a test bag
-  std::string test_path =
+std::optional<std::string> RosbagCapture::default_storage_probe(const std::string & format) const {
+  // Probe the plugin by opening a throwaway bag. Returns the failure reason (never
+  // throws) when the plugin is missing or unusable, so the caller can fall back or
+  // self-disable instead of crashing.
+  const std::string test_path =
       std::filesystem::temp_directory_path().string() + "/.rosbag_format_test_" + std::to_string(getpid());
 
+  std::optional<std::string> error;
   try {
     rosbag2_cpp::Writer writer;
     rosbag2_storage::StorageOptions opts;
     opts.uri = test_path;
-    opts.storage_id = config_.format;
+    opts.storage_id = format;
     writer.open(opts);
-    // Success - plugin is available
   } catch (const std::exception & e) {
-    // Clean up any partial test files
-    std::error_code ec;
-    std::filesystem::remove_all(test_path, ec);
-
-    throw std::runtime_error("Rosbag storage format '" + config_.format +
-                             "' is not available. "
-                             "Install the plugin or use a different format. "
-                             "Error: " +
-                             std::string(e.what()));
+    // Keep the reason (plugin missing vs. I/O / permission) for the caller's log.
+    error = e.what();
   }
 
-  // Clean up test file
   std::error_code ec;
   std::filesystem::remove_all(test_path, ec);
-
-  RCLCPP_INFO(node_->get_logger(), "%s storage format validated successfully", config_.format.c_str());
+  return error;
 }
 
 }  // namespace ros2_medkit_fault_manager
