@@ -21,6 +21,7 @@ find_package(rcl_interfaces REQUIRED)
 find_package(example_interfaces REQUIRED)
 find_package(ros2_medkit_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
 
 # === Demo node executables ===
 
@@ -72,6 +73,9 @@ add_executable(demo_param_beacon_node demo_nodes/param_beacon_node.cpp)
 target_include_directories(demo_param_beacon_node PRIVATE ${_demo_include_dir})
 medkit_target_dependencies(demo_param_beacon_node rclcpp)
 
+add_executable(managed_lifecycle demo_nodes/managed_lifecycle_node.cpp)
+medkit_target_dependencies(managed_lifecycle rclcpp rclcpp_lifecycle)
+
 install(TARGETS
   demo_engine_temp_sensor
   demo_rpm_sensor
@@ -84,6 +88,7 @@ install(TARGETS
   demo_lidar_sensor
   demo_beacon_publisher
   demo_param_beacon_node
+  managed_lifecycle
   DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -110,6 +115,10 @@ if(BUILD_TESTING)
   set(_INTEG_PORT 9100)
 
   include(ROS2MedkitTestDomain)
+  # Primary per-test domain pool. Upper bound is 229: the documented
+  # integration_tests allocation is 140-229, with 230-232 reserved for the
+  # multi-gateway secondary pool (see get_test_domain_id below). One domain is
+  # consumed per feature + scenario test.
   medkit_init_test_domains(START 140 END 229)
 
   # Feature tests (atomic, independent, 120s timeout)
