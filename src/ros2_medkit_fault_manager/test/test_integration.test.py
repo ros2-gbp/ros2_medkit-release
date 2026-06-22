@@ -90,6 +90,11 @@ def generate_test_description():
             'snapshots.config_file': snapshot_config,
             'snapshots.timeout_sec': 3.0,
             'snapshots.background_capture': False,  # On-demand for testing
+            # Small bound so test_27's burst genuinely overflows the queue and
+            # exercises the drop path (cap = pool_size + queue_depth = 3).
+            'snapshots.capture_pool_size': 1,
+            'snapshots.capture_queue_depth': 2,
+            'snapshots.capture_queue_full_policy': 'reject_newest',
             'correlation.config_file': correlation_config,  # Enable correlation
         }],
     )
@@ -955,6 +960,63 @@ class TestFaultManagerIntegration(unittest.TestCase):
         self.assertEqual(fault.occurrence_count, 2)
         self.assertEqual(len(fault.reporting_sources), 2)
         print(f'Cleared fault reactivated: occurrence_count={fault.occurrence_count}')
+
+    def test_27_capture_pool_bounds_fault_storm(self, proc_output):
+        """
+        Burst of distinct CRITICAL faults that overflows the bounded pool (issue #441).
+
+        The launch caps the pool small (pool_size=1, queue_depth=2 -> capacity 3). The
+        STORM_FAULT_* codes capture /test/default_data; the publisher exists but is
+        idle during the burst, so each on-demand capture blocks for the full snapshot
+        timeout (3s). With a single worker stuck on each capture, a 12-fault burst
+        overflows capacity deterministically (independent of how fast a capture would
+        otherwise complete) and exercises the reject_newest drop path.
+
+        We assert the bound engaged (a "Capture queue full" drop was logged) and the
+        node stayed responsive (no crash/UAF). That drop signal is the real regression
+        guard: it is absent on the old unbounded thread-per-fault model. Capture-still-
+        works is already covered by the snapshot tests above, so we deliberately do not
+        re-assert a near-tautological "something captured" here.
+        """
+        fault_codes = [f'STORM_FAULT_{i}' for i in range(12)]
+
+        # STORM_FAULT_* codes fall through to default_topics: [/test/default_data].
+        # Keep the publisher alive so the topic type resolves and the on-demand capture
+        # subscribes - but do NOT publish during the burst, so each capture waits the
+        # full timeout and the single worker stays busy long enough to overflow.
+        default_pub = self.node.create_publisher(Temperature, '/test/default_data', 10)
+        temp_msg = Temperature()
+        temp_msg.temperature = 70.0
+        temp_msg.variance = 0.1
+        # Establish topic presence (let discovery propagate) before confirming faults.
+        self._publish_and_spin(default_pub, temp_msg, count=10, interval=0.05)
+
+        # Synchronous sends (no lost responses): report_fault replies immediately after
+        # enqueue, on the executor thread, independently of the busy capture worker.
+        for code in fault_codes:
+            request = ReportFault.Request()
+            request.fault_code = code
+            request.event_type = ReportFault.Request.EVENT_FAILED
+            request.severity = Fault.SEVERITY_CRITICAL  # immediate confirm
+            request.description = 'storm'
+            request.source_id = '/test_node'
+            response = self._call_service(self.report_fault_client, request)
+            self.assertTrue(response.accepted)
+
+        # The bound engaged: with capacity 3 and the worker stuck on 3s captures, the
+        # 12-fault burst overflowed and the pool dropped captures. The first drop logs
+        # immediately (later drops are throttled).
+        proc_output.assertWaitFor('Capture queue full', timeout=15.0)
+
+        # Node is still responsive after the storm (no crash/UAF).
+        list_request = ListFaults.Request()
+        list_request.filter_by_severity = False
+        list_request.severity = 0
+        list_request.statuses = [Fault.STATUS_CONFIRMED]
+        list_response = self._call_service(self.list_faults_client, list_request)
+        storm = [f for f in list_response.faults if f.fault_code.startswith('STORM_FAULT_')]
+        self.assertGreater(len(storm), 0, 'Storm faults not persisted')
+        print(f'Storm bounded: {len(storm)} faults confirmed, reject_newest drop path exercised')
 
 
 @launch_testing.post_shutdown_test()
