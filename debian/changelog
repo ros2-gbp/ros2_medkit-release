@@ -1,0 +1,12 @@
+ros-lyrical-ros2-medkit-log-bridge (0.6.0-1resolute) resolute; urgency=high
+
+  * Initial release: promote ``/rosout`` log entries (WARN/ERROR/FATAL) to
+    FaultManager faults, attributed to the originating node via a per-source
+    FaultReporter, with auto-generated stable fault codes (#422 <https://github.com/selfpatch/ros2_medkit/pull/422>)
+  * Ships a default configuration so the bridge starts out of the box (#449 <https://github.com/selfpatch/ros2_medkit/pull/449>)
+  * Skips the medkit stack's own nodes by default, matching on the raw logger name (#460 <https://github.com/selfpatch/ros2_medkit/pull/460>)
+  * Contributors: @mfaferek93
+
+ -- "mfaferek93" <michal.faferek@selfpatch.ai>  Sun, 21 Jun 2026 22:00:00 -0000
+
+
