@@ -1,0 +1,12 @@
+Source: ros-lyrical-ros2-medkit-gateway
+Section: misc
+Priority: optional
+Maintainer: "bburda" <bartoszburda93@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), libcpp-httplib-dev, libsqlite3-dev, libssl-dev, nlohmann-json3-dev, ros-lyrical-action-msgs, ros-lyrical-ament-cmake, ros-lyrical-ament-cmake-clang-format <!nocheck>, ros-lyrical-ament-cmake-clang-tidy <!nocheck>, ros-lyrical-ament-cmake-gtest <!nocheck>, ros-lyrical-ament-index-cpp, ros-lyrical-ament-lint-auto <!nocheck>, ros-lyrical-ament-lint-common <!nocheck>, ros-lyrical-example-interfaces <!nocheck>, ros-lyrical-lifecycle-msgs, ros-lyrical-rcl-interfaces, ros-lyrical-rclcpp, ros-lyrical-rclcpp-action <!nocheck>, ros-lyrical-ros2-medkit-cmake, ros-lyrical-ros2-medkit-msgs, ros-lyrical-ros2-medkit-serialization, ros-lyrical-rosidl-typesupport-cpp, ros-lyrical-rosidl-typesupport-introspection-cpp, ros-lyrical-sensor-msgs, ros-lyrical-std-msgs, ros-lyrical-std-srvs, ros-lyrical-yaml-cpp-vendor, ros-lyrical-ros-workspace
+Homepage: https://index.ros.org/p/ros2_medkit_gateway/#lyrical
+Standards-Version: 3.9.2
+
+Package: ros-lyrical-ros2-medkit-gateway
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, libcpp-httplib-dev, libsqlite3-dev, libssl-dev, nlohmann-json3-dev, ros-lyrical-action-msgs, ros-lyrical-ament-index-cpp, ros-lyrical-ament-index-python, ros-lyrical-launch, ros-lyrical-launch-ros, ros-lyrical-lifecycle-msgs, ros-lyrical-rcl-interfaces, ros-lyrical-rclcpp, ros-lyrical-ros2-medkit-action-status-bridge, ros-lyrical-ros2-medkit-diagnostic-bridge, ros-lyrical-ros2-medkit-fault-manager, ros-lyrical-ros2-medkit-log-bridge, ros-lyrical-ros2-medkit-msgs, ros-lyrical-ros2-medkit-serialization, ros-lyrical-rosidl-parser, ros-lyrical-rosidl-runtime-py, ros-lyrical-rosidl-typesupport-cpp, ros-lyrical-rosidl-typesupport-introspection-cpp, ros-lyrical-sensor-msgs, ros-lyrical-std-msgs, ros-lyrical-std-srvs, ros-lyrical-yaml-cpp-vendor, ros-lyrical-ros-workspace
+Description: HTTP gateway for ros2_medkit diagnostics system
