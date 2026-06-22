@@ -1,199 +1,109 @@
-# ros2_medkit
+# ros2_medkit_log_bridge
 
-[![CI](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml/badge.svg)](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/selfpatch/ros2_medkit/branch/main/graph/badge.svg)](https://codecov.io/gh/selfpatch/ros2_medkit)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selfpatch.github.io/ros2_medkit/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![ROS 2 Jazzy](https://img.shields.io/badge/ROS%202-Jazzy-blue)](https://docs.ros.org/en/jazzy/)
-[![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-blue)](https://docs.ros.org/en/humble/)
-[![ROS 2 Lyrical](https://img.shields.io/badge/ROS%202-Lyrical-blue)](https://docs.ros.org/en/lyrical/)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/6CXPMApAyq)
-[![Quality Level 3](https://img.shields.io/badge/Quality-Level%203-yellow)](QUALITY_DECLARATION.md)
+Drop-in bridge that promotes ROS 2 `/rosout` log entries to structured medkit
+faults, attributing each fault to the node that logged it. No changes to the
+user's nodes are required.
 
-<p align="center">
-  <img src="hero-full-720-12fps.gif" alt="Robots break. Now you'll know why." width="720">
-</p>
+It is a compatibility adapter, the same category as
+`ros2_medkit_diagnostic_bridge`. Native `ros2_medkit_fault_reporter`
+instrumentation stays the canonical path for code you control; this bridge is
+the fallback for nodes that only log.
 
-<p align="center">
-  <b>Structured diagnostics for ROS 2 robots.</b><br>
-  When your robot fails, find out why - in minutes, not hours.
-</p>
+## What it does
 
-<p align="center">
-  Fault management · Live introspection · REST API · <a href="https://github.com/selfpatch/ros2_medkit_mcp">AI via MCP</a>
-</p>
+Subscribes to `/rosout` (`rcl_interfaces/msg/Log`) and forwards entries at or
+above a severity floor to the FaultManager:
 
-## The problem
+| Log level | medkit severity |
+|-----------|-----------------|
+| DEBUG (10) / INFO (20) | dropped |
+| WARN (30) | `SEVERITY_WARN` |
+| ERROR (40) | `SEVERITY_ERROR` |
+| FATAL (50) | `SEVERITY_CRITICAL` |
 
-When a robot breaks in the field, you SSH in, run `ros2 node list`, grep through logs, and try to reconstruct what happened. It works for one robot on your desk. It does not work for 20 robots at a customer site, at 2 AM, when you cannot reproduce the issue.
+- `source_id` of each fault is the originating node's fully-qualified name. It
+  is derived from `Log.name` by taking the first dotted segment (a `Log.name`
+  may carry a sub-logger suffix, e.g. `controller_manager.resource_manager`, and
+  node names cannot contain `.`) and prefixing `/`, giving e.g.
+  `/controller_manager`. The gateway discovers entities by node FQN, so this is
+  the form that lets a fault (and its snapshots / rosbag) associate with the
+  entity in the SOVD tree. Each node gets its own per-node `FaultReporter` and
+  therefore its own client-side debounce.
+- `fault_code` is auto-generated as `<PREFIX>_<NODE>_<HASH>`. `<HASH>` is a fixed
+  FNV-1a 32-bit digest (8 lowercase hex) of a normalized message template
+  (numbers / hex / paths stripped, isolated single-letter tokens dropped) so the
+  same logical message maps to the same code across occurrences. `<NODE>` is the
+  upper-snake of `source_id`. The 8-hex hash is never truncated; if the 64-char
+  cap is hit the node part is trimmed instead.
 
-ros2_medkit gives your ROS 2 system a **diagnostic REST API** so you can inspect what is running, what failed, and why, without SSH and without custom tooling.
+> Namespaced-node limitation: `Log.name` encodes a node's namespace with the same
+> `.` separator as a sub-logger suffix, so the two are indistinguishable from the
+> string alone. `source_id` takes the first dotted segment, which is right for a
+> non-namespaced node with a sub-logger but collapses a namespaced node
+> (`robot1.planner_server` -> `/robot1`) to its namespace, so same-named nodes in
+> different namespaces share one code. Multi-robot fleets typically isolate robots
+> by `ROS_DOMAIN_ID` (one gateway per robot, federated by peer aggregation), which
+> sidesteps this.
 
-## 🚀 Quick Start
+## Forwarding, the LocalFilter, and confirmation
 
-**Try the full demo** (requires [Docker](https://docs.docker.com/get-docker/) with Compose, no ROS 2 needed):
+Two independent debounces sit between a log line and a confirmed fault:
 
-```bash
-git clone https://github.com/selfpatch/selfpatch_demos.git
-cd selfpatch_demos/demos/turtlebot3_integration
-./run-demo.sh
-# → API: http://localhost:8080/api/v1/  Web UI: http://localhost:3000
-```
+1. Per-node `FaultReporter` `LocalFilter` (client-side). WARN is held until
+   `default_threshold` (3) occurrences within `default_window_sec` (10s).
+   ERROR/FATAL have severity `>= bypass_severity` (2) and bypass the filter,
+   forwarding immediately.
+2. Bridge `report_cooldown_sec` cooldown, applied only to `ERROR`/`FATAL` (the
+   levels that bypass the LocalFilter). It forwards the first occurrence of a
+   `(fault_code, severity)` immediately and suppresses that same pair for
+   `report_cooldown_sec` (default 5s, `0.0` disables), bounding a flood. `WARN`
+   is never cooled here (that would starve its LocalFilter threshold counting),
+   and keying on severity means a `WARN` never suppresses a same-message `ERROR`
+   escalation.
 
-Open `http://localhost:3000` in your browser. You will see a TurtleBot3 with Nav2, organized into a browsable entity tree with live faults, topic data, and parameter access.
+Whether a forwarded fault then shows as `PREFAILED` (suspected) or `CONFIRMED`
+is a separate, gateway-side decision driven by the FaultManager's
+`confirmation_threshold` - not by this bridge and not by the client-side
+LocalFilter. For visible-but-quiet WARNs, launch the FaultManager with a low
+`confirmation_threshold` (or an entity threshold for `LOG_*` codes).
 
-**Build from source** (ROS 2 Jazzy, Humble, or Lyrical):
+## Hard limitations (by construction)
 
-```bash
-source /opt/ros/jazzy/setup.bash   # or humble - adjust for your distro
-git clone --recurse-submodules https://github.com/selfpatch/ros2_medkit.git
-cd ros2_medkit
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install && source install/setup.bash
-ros2 launch ros2_medkit_gateway gateway.launch.py
-# → http://localhost:8080/api/v1/health
-```
+- Only sees logs that reach `/rosout` via rclcpp from a still-alive node.
+  Console-only loggers (e.g. some Micro XRCE-DDS / non-rclcpp loggers) are
+  invisible.
+- A node that crashes hard may not flush its final log to `/rosout`, so the
+  terminating ERROR can be missed. Process-death detection belongs to a
+  separate liveliness bridge, not here.
 
-Verify it works: `curl http://localhost:8080/api/v1/health` should return `{"status": "healthy", ...}`.
-
-For a guided walkthrough with demo nodes and the full API, see the [Getting Started tutorial](https://selfpatch.github.io/ros2_medkit/getting_started.html). For API examples, see our [Postman collection](postman/).
-
-### Experimental: Pixi
-
-[Pixi](https://pixi.sh) provides a reproducible, lockfile-based environment
-without requiring a system-wide ROS 2 installation (Linux x86_64 only).
-This is experimental; the standard ROS 2 toolchain (rosdep + colcon) remains the primary method.
-
-```bash
-curl -fsSL https://pixi.sh/install.sh | bash
-pixi install -e jazzy     # or: pixi install -e humble
-pixi run -e jazzy build
-pixi run -e jazzy test
-pixi run -e jazzy smoke   # verify gateway starts
-```
-
-See [installation docs](https://selfpatch.github.io/ros2_medkit/installation.html#experimental-pixi)
-for details. Feedback welcome on [#265](https://github.com/selfpatch/ros2_medkit/issues/265).
-
-## What you get
-
-**Start here: Faults.** Your robot has 47 nodes. Something throws an error.
-Instead of grepping logs, you query `GET /api/v1/faults` and get a structured list
-with fault codes, timestamps, affected entities, environment snapshots, and history.
-Clear faults, subscribe to new ones via SSE, correlate them across components.
-
-Beyond faults, medkit exposes the full ROS 2 graph through REST:
-
-| | What it does |
-|---|---|
-| **Discovery** | Automatically finds running nodes, topics, services, and actions |
-| **Data** | Read and write topic data via REST |
-| **Operations** | Call services and actions with execution tracking |
-| **Configurations** | Read, write, and reset node parameters |
-| **Bulk Data** | Upload/download files (calibration, firmware, rosbags) |
-| **Subscriptions** | Stream live data and fault events via SSE |
-| **Triggers** | Condition-based push notifications for resource changes |
-| **Locking** | Resource locking for safe concurrent access |
-| **Scripts** | Upload and execute diagnostic scripts on entities |
-| **Software Updates** | Async prepare/execute lifecycle with pluggable backends |
-| **Authentication** | JWT-based RBAC (viewer, operator, configurator, admin) |
-| **Logs** | Log entries and configuration |
-| **Docs** | OpenAPI 3.1.0 spec and Swagger UI at `/api/v1/docs` - schemas are generated from typed C++ structs so the spec always matches the wire format |
-
-On the [roadmap](https://selfpatch.github.io/ros2_medkit/roadmap.html): entity lifecycle control, mode management, communication logs.
-
-## How it organizes your robot
-
-medkit models your system as an **entity tree** with four levels:
-
-```
-Areas          Components         Apps (nodes)
-─────          ──────────         ────────────
-base       ┬─ motor_controller ┬─ left_wheel_driver
-           │                   └─ right_wheel_driver
-           └─ battery_monitor  └─ bms_node
-
-navigation ┬─ lidar_driver     └─ rplidar_node
-           └─ nav_stack        ┬─ nav2_controller
-                               ├─ nav2_planner
-                               └─ nav2_bt_navigator
-```
-
-A small robot might have a single area. A large robot can use areas to separate physical domains:
-
-```
-areas/
-├── base/
-│   └── components/
-│       ├── motor_controller/   → apps: left_wheel, right_wheel
-│       └── battery_monitor/    → apps: bms_node
-├── arm/
-│   └── components/
-│       ├── joint_controller/   → apps: joint_1..joint_6
-│       └── gripper/            → apps: gripper_driver
-├── navigation/
-│   └── components/
-│       ├── lidar_driver/       → apps: rplidar_node
-│       ├── camera_driver/      → apps: realsense_node
-│       └── nav_stack/          → apps: controller, planner, bt_navigator
-└── safety/
-    └── components/
-        ├── emergency_stop/     → apps: estop_monitor
-        └── collision_detect/   → apps: collision_checker
-```
-
-**Functions** cut across the tree. A function like `localization` might depend on apps from both `navigation` and `base`, giving you a capability-oriented view alongside the physical hierarchy.
-
-This entity model follows the **SOVD (Service-Oriented Vehicle Diagnostics)** standard, so the same concepts work across robots, vehicles, and embedded systems.
-
-## 📋 Requirements
-
-- **OS:** Ubuntu 26.04 LTS (Resolute, for Lyrical), Ubuntu 24.04 LTS (Noble, for Jazzy), or Ubuntu 22.04 LTS (Jammy, for Humble)
-- **ROS 2:** Jazzy Jalisco, Humble Hawksbill, or Lyrical Luth (LTS, released May 2026)
-- **Compiler:** GCC 11+ (C++17 support)
-- **Build System:** colcon + ament_cmake
-
-## 📚 Documentation
-
-- 📖 [Full Documentation](https://selfpatch.github.io/ros2_medkit/)
-- 🗺️ [Roadmap](https://selfpatch.github.io/ros2_medkit/roadmap.html)
-- 📋 [GitHub Milestones](https://github.com/selfpatch/ros2_medkit/milestones)
-
-## 💬 Community
-
-- **💬 Discord** - [Join our server](https://discord.gg/6CXPMApAyq) for discussions, help, and announcements
-- **🐛 Issues** - [Report bugs or request features](https://github.com/selfpatch/ros2_medkit/issues)
-- **💡 Discussions** - [GitHub Discussions](https://github.com/selfpatch/ros2_medkit/discussions) for Q&A and ideas
-
-## 🤝 Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, testing, pre-commit hooks, CI/CD details, and code coverage.
-
-Quick version:
+## Run it
 
 ```bash
-source /opt/ros/jazzy/setup.bash  # or humble
-pipx install pre-commit && pre-commit install && pre-commit install --hook-type pre-push
-colcon build --symlink-install
-source install/setup.bash
-./scripts/test.sh          # unit tests
-./scripts/test.sh all      # everything
+# next to an existing stack + the medkit gateway/fault_manager
+ros2 launch ros2_medkit_log_bridge log_bridge.launch.py
 ```
 
-Check out [good first issues](https://github.com/selfpatch/ros2_medkit/labels/good%20first%20issue) for places to start.
+## Configuration (`config/log_bridge.yaml`)
 
-## 🔒 Security
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `rosout_topic` | `/rosout` | log topic to subscribe |
+| `severity_floor` | `30` (WARN) | minimum level promoted; raise to `40` on chatty / constrained targets. Clamped to `[0, 50]` at load (a value out of range is corrected with a warning) |
+| `code_prefix` | `LOG` | prefix for generated fault codes; normalized to `[A-Z0-9_]` at load |
+| `exclude_nodes` | `[]` | node-FQN substrings to skip |
+| `include_only_nodes` | `[]` | if set, only promote nodes whose FQN matches |
+| `max_tracked_nodes` | `512` | cap on per-node reporters; least-recently-used nodes evicted past this |
+| `report_cooldown_sec` | `5.0` | per-fault_code forward debounce; `0.0` disables |
+| `exclude_medkit_stack` | `true` | skip medkit's own infrastructure nodes (`fault_manager`, gateway, the other bridges) so their logs do not feed back as faults; set `false` to debug medkit's own logs |
 
-If you discover a security vulnerability, please follow the responsible disclosure process in [SECURITY.md](SECURITY.md).
+`exclude_nodes` / `include_only_nodes` match as **unanchored substrings**
+against the node FQN: `planner` matches `/planner_server` and
+`/robot1/planner_server`. Use a longer, more specific substring (e.g.
+`/planner_server`) to avoid accidental matches.
 
-## 📄 License
-
-Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
----
-
-<p align="center">
-  Made with ❤️ by the <a href="https://github.com/selfpatch">selfpatch</a> community
-  <br>
-  <a href="https://discord.gg/6CXPMApAyq">💬 Join us on Discord</a>
-</p>
+`exclude_medkit_stack` likewise matches **unanchored substrings** (on the raw
+logger name, so a namespaced `robot1.fault_manager` is still caught). A user
+node whose name contains one of these tokens - e.g. `fault_manager` or
+`diagnostic_bridge` - is therefore also skipped; set `exclude_medkit_stack:
+false` (and use `exclude_nodes` for the real medkit nodes) if that collides
+with your naming.
