@@ -259,10 +259,116 @@ Performance Tuning
      - Safety-backstop refresh interval (ms). Primary discovery is graph-event
        driven (polled every 100 ms); this timer forces a full refresh only if
        a graph event is missed. Range: 100-60000 (0.1s-60s).
+   * - ``discovery.refresh_debounce_ms``
+     - int
+     - ``1000``
+     - Debounce for graph-event-driven refreshes (ms). Under graph churn the
+       rclcpp graph event fires many times per second; each refresh runs the
+       full discovery pipeline. Coalesces graph events so a refresh runs at most
+       once per this interval, bounding per-event allocation. A pending change is
+       serviced within this interval plus one 100 ms poll. Range: 0-60000
+       (0 disables debouncing). A value outside the range is rejected with a
+       warning and the default (1000) is used.
+   * - ``entity_cache.capacity``
+     - int
+     - ``256``
+     - Fixed capacity of the thread-safe entity cache object pool, reserved once
+       at startup. Steady-state refresh cycles perform zero structural allocations
+       in the cache layer as long as the live entity count stays within this
+       value. Valid range: 16-1000000 (values outside this range are clamped with
+       a warning). Raise it for graphs larger than the default; exceeding the
+       reserved capacity is harmless but triggers a one-shot WARN log. Note that a
+       refresh that fully turns the entity set over allocates the new slots before
+       freeing the absent old ones, so the pool transiently holds up to ~2x the
+       steady-state live count - size capacity to about twice the expected peak to
+       keep full-turnover ticks allocation-free.
 
 Lower values shorten the worst-case recovery window if a graph event is missed
 but increase idle CPU. The default rarely fires on a stable graph because the
 graph-event poll handles node up/down events directly.
+
+Thread Pools
+------------
+
+The gateway runs two thread pools. By default both are bounded to a small fixed
+size instead of scaling with the host CPU count, so the gateway's thread
+footprint is the same on a 4-core SBC and a 64-core server. A third knob,
+``keep_alive_timeout_sec``, bounds how long the HTTP pool keeps a worker parked
+on an idle keep-alive connection. Every value is clamped to a working minimum on
+read, so a mis-set parameter can never break request serving.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 32 8 10 50
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``server.http_thread_pool_size``
+     - int
+     - ``6``
+     - Worker threads in the HTTP request pool (cpp-httplib). Replaces the
+       library default of ``max(8, cores - 1)``. Kept at or above
+       ``sse.max_clients + data_provider.cold_wait_cap`` so SSE streams and cold
+       ``/data`` waits cannot starve every worker (see note below); the gateway
+       warns at startup if it is set below that sum. Clamped to ``[1, 1024]``.
+   * - ``server.keep_alive_timeout_sec``
+     - int
+     - ``2``
+     - How long (seconds) a request-pool worker stays parked on an idle
+       keep-alive connection before freeing it. Replaces the cpp-httplib default
+       of ``5``. A shorter value recovers workers from short-lived client
+       connections faster (important with a small pool); a longer value favours
+       connection reuse. Clamped to ``[1, 3600]``.
+   * - ``server.executor_threads``
+     - int
+     - ``2``
+     - Threads in the main rclcpp ``MultiThreadedExecutor``. Replaces rclcpp's
+       default (host cores, minimum 2). Clamped to ``[1, 256]``.
+
+**HTTP pool, keep-alive, and SSE.** Several things hold an HTTP pool worker:
+each active SSE stream (fault dashboard, cyclic subscriptions, trigger events -
+see `SSE (Server-Sent Events)`_) holds one for its entire lifetime; the data
+cold-wait path parks up to ``data_provider.cold_wait_cap`` workers for up to
+``topic_sample_timeout_sec`` each; a bulk-data download holds one
+for the whole transfer (uncounted by any cap); and on top of that each *recently
+used* client connection keeps a worker parked for up to ``keep_alive_timeout_sec``
+after its last request. The shipped pool default (``6``) covers the documented
+worst case ``sse.max_clients (2) + data_provider.cold_wait_cap (4)``; the gateway
+emits a startup warning if ``http_thread_pool_size`` is set below
+``sse.max_clients + data_provider.cold_wait_cap``. The short ``keep_alive_timeout_sec``
+default (``2`` s) stops a poller that opens several short-lived connections per
+cycle (for example hitting ``/apps``, ``/areas`` and ``/functions`` every
+iteration) from pinning the pool until the keep-alive timers expire. If you raise
+``sse.max_clients``, raise ``cold_wait_cap``, or serve concurrent bulk-data
+downloads, raise ``http_thread_pool_size`` to match (and keep
+``keep_alive_timeout_sec`` short unless your clients benefit from long-lived
+connection reuse).
+
+**Executor threads.** The main executor delivers the gateway node's own
+callbacks (timers, graph events, log and fault subscriptions) and the
+service-response callbacks that complete operation/action RPC futures. These all
+run on the node's default, *mutually-exclusive* callback group, so they serialize
+through a single thread regardless of ``executor_threads`` - raising it buys no
+RPC-response parallelism. A small executor is safe because the blocking wait for
+an RPC runs on the cpp-httplib pool thread (a separate server thread), never on
+an executor thread, so it cannot deadlock the executor; the fault transport also
+uses its own private executor. Increase this only if the node's own callback load
+grows (for example very frequent graph churn).
+
+Example (more SSE clients needs a larger pool and matching ``sse.max_clients``):
+
+.. code-block:: yaml
+
+   ros2_medkit_gateway:
+     ros__parameters:
+       server:
+         http_thread_pool_size: 16   # workers for heavy SSE + request load
+         keep_alive_timeout_sec: 5   # longer reuse for steady browser clients
+         executor_threads: 4
+       sse:
+         max_clients: 10             # raised together with the HTTP pool
 
 Bulk Data Storage
 -----------------
@@ -329,8 +435,8 @@ Configure limits for SSE-based streaming (fault events and cyclic subscriptions)
      - Description
    * - ``sse.max_clients``
      - int
-     - ``10``
-     - Maximum number of concurrent SSE connections (fault stream, cyclic subscription streams, and trigger event streams combined).
+     - ``2``
+     - Maximum number of concurrent SSE connections (fault stream, cyclic subscription streams, and trigger event streams combined). Each connection pins one ``server.http_thread_pool_size`` worker for its lifetime, so this defaults at or below that pool; raise both together for more concurrent streams.
    * - ``sse.max_subscriptions``
      - int
      - ``100``
@@ -347,7 +453,7 @@ Example:
    ros2_medkit_gateway:
      ros__parameters:
        sse:
-         max_clients: 10
+         max_clients: 2
          max_subscriptions: 100
          max_duration_sec: 3600
 
@@ -643,7 +749,7 @@ Complete Example
          categories: ["calibration", "firmware"]
 
        sse:
-         max_clients: 10
+         max_clients: 2
          max_subscriptions: 100
          max_duration_sec: 3600
 
