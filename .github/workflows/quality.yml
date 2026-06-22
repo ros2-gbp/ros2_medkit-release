@@ -32,6 +32,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Pre-install ROS 2 apt source
+        uses: ./.github/actions/ros-apt-source
+
       - name: Set up ROS 2 Jazzy
         uses: ros-tooling/setup-ros@v0.7
         with:
@@ -75,6 +78,9 @@ jobs:
       - name: No naked rclcpp subscription APIs (issue #375 regression gate)
         run: ./scripts/check_no_naked_subscriptions.sh
 
+      - name: Handlers read query params via typed query<T>() (zero-query-params regression gate)
+        run: ./src/ros2_medkit_gateway/scripts/check_handlers_typed_query.sh
+
       - name: Show results
         if: always()
         run: colcon test-result --verbose
@@ -101,6 +107,9 @@ jobs:
 
       - name: Fix git safe directory
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Pre-install ROS 2 apt source
+        uses: ./.github/actions/ros-apt-source
 
       - name: Set up ROS 2 Jazzy
         uses: ros-tooling/setup-ros@v0.7
@@ -241,6 +250,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Pre-install ROS 2 apt source
+        uses: ./.github/actions/ros-apt-source
+
       - name: Set up ROS 2 Jazzy
         uses: ros-tooling/setup-ros@v0.7
         with:
@@ -348,6 +360,9 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Pre-install ROS 2 apt source
+        uses: ./.github/actions/ros-apt-source
 
       - name: Set up ROS 2 Jazzy
         uses: ros-tooling/setup-ros@v0.7
