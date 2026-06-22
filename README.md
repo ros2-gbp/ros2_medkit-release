@@ -1,199 +1,111 @@
-# ros2_medkit
+# ros2_medkit_action_status_bridge
 
-[![CI](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml/badge.svg)](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/selfpatch/ros2_medkit/branch/main/graph/badge.svg)](https://codecov.io/gh/selfpatch/ros2_medkit)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selfpatch.github.io/ros2_medkit/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![ROS 2 Jazzy](https://img.shields.io/badge/ROS%202-Jazzy-blue)](https://docs.ros.org/en/jazzy/)
-[![ROS 2 Humble](https://img.shields.io/badge/ROS%202-Humble-blue)](https://docs.ros.org/en/humble/)
-[![ROS 2 Lyrical](https://img.shields.io/badge/ROS%202-Lyrical-blue)](https://docs.ros.org/en/lyrical/)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/6CXPMApAyq)
-[![Quality Level 3](https://img.shields.io/badge/Quality-Level%203-yellow)](QUALITY_DECLARATION.md)
+Generic drop-in bridge that turns terminal ROS 2 action goal states into
+structured medkit faults. It watches the `/<action>/_action/status`
+(`action_msgs/msg/GoalStatusArray`) topic that **every** action server
+publishes, so it works across Nav2, MoveIt 2, ros2_control's controller
+actions, and any custom action with **no per-project code**.
 
-<p align="center">
-  <img src="hero-full-720-12fps.gif" alt="Robots break. Now you'll know why." width="720">
-</p>
+## Why this matters
 
-<p align="center">
-  <b>Structured diagnostics for ROS 2 robots.</b><br>
-  When your robot fails, find out why - in minutes, not hours.
-</p>
+For the core ROS 2 league the authoritative "the goal failed" verdict lives on
+the action-result channel, not on `/diagnostics` or `/rosout`:
 
-<p align="center">
-  Fault management · Live introspection · REST API · <a href="https://github.com/selfpatch/ros2_medkit_mcp">AI via MCP</a>
-</p>
+- Nav2 `NavigateToPose` -> `GoalStatus = ABORTED`
+- MoveIt `MoveGroup` -> `GoalStatus = ABORTED` (with `MoveItErrorCode` in the result)
+- ros2_control controller actions -> aborted goals
 
-## The problem
+Neither the diagnostic bridge nor the log bridge sees this. This bridge does,
+generically, by observing the goal-status topic.
 
-When a robot breaks in the field, you SSH in, run `ros2 node list`, grep through logs, and try to reconstruct what happened. It works for one robot on your desk. It does not work for 20 robots at a customer site, at 2 AM, when you cannot reproduce the issue.
+## What it does
 
-ros2_medkit gives your ROS 2 system a **diagnostic REST API** so you can inspect what is running, what failed, and why, without SSH and without custom tooling.
+- Discovers every action on the graph by scanning for `*/_action/status`
+  topics (re-scanned on a timer to catch actions that appear later, and to drop
+  actions that vanish, e.g. a Nav2 lifecycle deactivate or a one-shot node).
+- `ABORTED (6)` -> fault (`SEVERITY_ERROR` by default).
+- `CANCELED (5)` -> fault only if `canceled_is_fault` (off by default; cancel is
+  usually intentional). When enabled it emits a `_CANCELED` code.
+- `SUCCEEDED (4)` -> `PASSED` to heal the action's fault code (if enabled).
+- `fault_code` is `<PREFIX>_<ACTION>_ABORTED` (or `_CANCELED`), e.g.
+  `ACTION_NAVIGATE_TO_POSE_ABORTED`. `source_id` is the action **server's node
+  FQN** (resolved from the status topic's publisher, e.g. `/bt_navigator`), so
+  the fault associates with that node's SOVD entity; it falls back to the action
+  name only if no publisher is visible.
 
-## 🚀 Quick Start
+## Per-action state, not per-goal
 
-**Try the full demo** (requires [Docker](https://docs.docker.com/get-docker/) with Compose, no ROS 2 needed):
+The fault is a property of the **action**, not of an individual goal. On every
+status message the whole `GoalStatusArray` is scanned for the net state:
 
-```bash
-git clone https://github.com/selfpatch/selfpatch_demos.git
-cd selfpatch_demos/demos/turtlebot3_integration
-./run-demo.sh
-# → API: http://localhost:8080/api/v1/  Web UI: http://localhost:3000
-```
+- if **any** goal is `ABORTED` (or `CANCELED` when `canceled_is_fault`), the
+  action is **failed** (order of goals in the array does not matter);
+- otherwise, if the array has terminal goals and none are failing, the action is
+  **healthy**.
 
-Open `http://localhost:3000` in your browser. You will see a TurtleBot3 with Nav2, organized into a browsable entity tree with live faults, topic data, and parameter access.
+A fault is raised only on the `healthy -> failed` transition and healed only on
+`failed -> healthy`. This means one failed goal cannot heal an action while
+another goal is still failed, and a dropped terminal message cannot leave a
+fault stuck. Per-goal dedup (keyed on `goal_id:status`) only suppresses
+duplicate log lines; it never gates the transition.
 
-**Build from source** (ROS 2 Jazzy, Humble, or Lyrical):
+## Scope: the terminal verdict, not the reason
 
-```bash
-source /opt/ros/jazzy/setup.bash   # or humble - adjust for your distro
-git clone --recurse-submodules https://github.com/selfpatch/ros2_medkit.git
-cd ros2_medkit
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install && source install/setup.bash
-ros2 launch ros2_medkit_gateway gateway.launch.py
-# → http://localhost:8080/api/v1/health
-```
+This bridge delivers the generic "it aborted" event. The action-specific
+*reason* (e.g. `MoveItErrorCode.val = -26 START_STATE_IN_COLLISION`, Nav2
+`error_code` on Iron/Jazzy) lives in the action result message and is a separate
+enrichment concern (a future action-result reader using runtime message
+introspection / dynmsg). Per-project plugins are only needed for human-readable
+labels, not to surface the fault.
 
-Verify it works: `curl http://localhost:8080/api/v1/health` should return `{"status": "healthy", ...}`.
-
-For a guided walkthrough with demo nodes and the full API, see the [Getting Started tutorial](https://selfpatch.github.io/ros2_medkit/getting_started.html). For API examples, see our [Postman collection](postman/).
-
-### Experimental: Pixi
-
-[Pixi](https://pixi.sh) provides a reproducible, lockfile-based environment
-without requiring a system-wide ROS 2 installation (Linux x86_64 only).
-This is experimental; the standard ROS 2 toolchain (rosdep + colcon) remains the primary method.
+## Run it
 
 ```bash
-curl -fsSL https://pixi.sh/install.sh | bash
-pixi install -e jazzy     # or: pixi install -e humble
-pixi run -e jazzy build
-pixi run -e jazzy test
-pixi run -e jazzy smoke   # verify gateway starts
+ros2 launch ros2_medkit_action_status_bridge action_status_bridge.launch.py
 ```
 
-See [installation docs](https://selfpatch.github.io/ros2_medkit/installation.html#experimental-pixi)
-for details. Feedback welcome on [#265](https://github.com/selfpatch/ros2_medkit/issues/265).
+## Configuration (`config/action_status_bridge.yaml`)
 
-## What you get
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `aborted_severity` | `2` (ERROR) | severity of an aborted goal |
+| `canceled_is_fault` | `false` | treat CANCELED as a fault |
+| `heal_on_succeeded` | `true` | send PASSED on a successful goal |
+| `rescan_period_sec` | `2.0` | how often to look for new actions |
+| `code_prefix` | `ACTION` | prefix for generated codes |
+| `exclude_actions` | `[]` | action-name substrings to skip |
+| `include_only_actions` | `[]` | if set, only watch these |
+| `dedup_capacity` | `4096` | remembered goal/status log keys |
 
-**Start here: Faults.** Your robot has 47 nodes. Something throws an error.
-Instead of grepping logs, you query `GET /api/v1/faults` and get a structured list
-with fault codes, timestamps, affected entities, environment snapshots, and history.
-Clear faults, subscribe to new ones via SSE, correlate them across components.
+`exclude_actions` / `include_only_actions` match as **unanchored substrings** of
+the fully-qualified action name (e.g. `nav` matches `/navigate_to_pose`). Use a
+longer fragment (or the full name) for exact targeting.
 
-Beyond faults, medkit exposes the full ROS 2 graph through REST:
+`aborted_severity`, `code_prefix` and `dedup_capacity` are range-checked and
+normalized at load (out-of-range severity clamps to ERROR, a non-snake-case
+`code_prefix` is upper-snake-cased, a non-positive `dedup_capacity` falls back to
+the default), with a warning.
 
-| | What it does |
-|---|---|
-| **Discovery** | Automatically finds running nodes, topics, services, and actions |
-| **Data** | Read and write topic data via REST |
-| **Operations** | Call services and actions with execution tracking |
-| **Configurations** | Read, write, and reset node parameters |
-| **Bulk Data** | Upload/download files (calibration, firmware, rosbags) |
-| **Subscriptions** | Stream live data and fault events via SSE |
-| **Triggers** | Condition-based push notifications for resource changes |
-| **Locking** | Resource locking for safe concurrent access |
-| **Scripts** | Upload and execute diagnostic scripts on entities |
-| **Software Updates** | Async prepare/execute lifecycle with pluggable backends |
-| **Authentication** | JWT-based RBAC (viewer, operator, configurator, admin) |
-| **Logs** | Log entries and configuration |
-| **Docs** | OpenAPI 3.1.0 spec and Swagger UI at `/api/v1/docs` - schemas are generated from typed C++ structs so the spec always matches the wire format |
+## Limitations
 
-On the [roadmap](https://selfpatch.github.io/ros2_medkit/roadmap.html): entity lifecycle control, mode management, communication logs.
-
-## How it organizes your robot
-
-medkit models your system as an **entity tree** with four levels:
-
-```
-Areas          Components         Apps (nodes)
-─────          ──────────         ────────────
-base       ┬─ motor_controller ┬─ left_wheel_driver
-           │                   └─ right_wheel_driver
-           └─ battery_monitor  └─ bms_node
-
-navigation ┬─ lidar_driver     └─ rplidar_node
-           └─ nav_stack        ┬─ nav2_controller
-                               ├─ nav2_planner
-                               └─ nav2_bt_navigator
-```
-
-A small robot might have a single area. A large robot can use areas to separate physical domains:
-
-```
-areas/
-├── base/
-│   └── components/
-│       ├── motor_controller/   → apps: left_wheel, right_wheel
-│       └── battery_monitor/    → apps: bms_node
-├── arm/
-│   └── components/
-│       ├── joint_controller/   → apps: joint_1..joint_6
-│       └── gripper/            → apps: gripper_driver
-├── navigation/
-│   └── components/
-│       ├── lidar_driver/       → apps: rplidar_node
-│       ├── camera_driver/      → apps: realsense_node
-│       └── nav_stack/          → apps: controller, planner, bt_navigator
-└── safety/
-    └── components/
-        ├── emergency_stop/     → apps: estop_monitor
-        └── collision_detect/   → apps: collision_checker
-```
-
-**Functions** cut across the tree. A function like `localization` might depend on apps from both `navigation` and `base`, giving you a capability-oriented view alongside the physical hierarchy.
-
-This entity model follows the **SOVD (Service-Oriented Vehicle Diagnostics)** standard, so the same concepts work across robots, vehicles, and embedded systems.
-
-## 📋 Requirements
-
-- **OS:** Ubuntu 26.04 LTS (Resolute, for Lyrical), Ubuntu 24.04 LTS (Noble, for Jazzy), or Ubuntu 22.04 LTS (Jammy, for Humble)
-- **ROS 2:** Jazzy Jalisco, Humble Hawksbill, or Lyrical Luth (LTS, released May 2026)
-- **Compiler:** GCC 11+ (C++17 support)
-- **Build System:** colcon + ament_cmake
-
-## 📚 Documentation
-
-- 📖 [Full Documentation](https://selfpatch.github.io/ros2_medkit/)
-- 🗺️ [Roadmap](https://selfpatch.github.io/ros2_medkit/roadmap.html)
-- 📋 [GitHub Milestones](https://github.com/selfpatch/ros2_medkit/milestones)
-
-## 💬 Community
-
-- **💬 Discord** - [Join our server](https://discord.gg/6CXPMApAyq) for discussions, help, and announcements
-- **🐛 Issues** - [Report bugs or request features](https://github.com/selfpatch/ros2_medkit/issues)
-- **💡 Discussions** - [GitHub Discussions](https://github.com/selfpatch/ros2_medkit/discussions) for Q&A and ideas
-
-## 🤝 Contributing
-
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, testing, pre-commit hooks, CI/CD details, and code coverage.
-
-Quick version:
-
-```bash
-source /opt/ros/jazzy/setup.bash  # or humble
-pipx install pre-commit && pre-commit install && pre-commit install --hook-type pre-push
-colcon build --symlink-install
-source install/setup.bash
-./scripts/test.sh          # unit tests
-./scripts/test.sh all      # everything
-```
-
-Check out [good first issues](https://github.com/selfpatch/ros2_medkit/labels/good%20first%20issue) for places to start.
-
-## 🔒 Security
-
-If you discover a security vulnerability, please follow the responsible disclosure process in [SECURITY.md](SECURITY.md).
-
-## 📄 License
-
-Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
-
----
-
-<p align="center">
-  Made with ❤️ by the <a href="https://github.com/selfpatch">selfpatch</a> community
-  <br>
-  <a href="https://discord.gg/6CXPMApAyq">💬 Join us on Discord</a>
-</p>
+- **Flapping**: a retry loop that issues a fresh `goal_id` each attempt does not
+  re-raise while the action stays failed (only net-state changes transition),
+  but a true flap (fail -> succeed -> fail) does produce one raise + heal per
+  cycle. There is no per-code rate throttle in this bridge; lower noise via the
+  FaultReporter local filter if needed.
+- **No per-code throttle**: every action-level transition is forwarded.
+- **CANCELED heal semantics**: with `canceled_is_fault`, a canceled action heals
+  on the next non-failing terminal (a later SUCCEEDED), or when the canceled goal
+  ages out of the action server's retained status array and a non-failed terminal
+  remains. It is not healed by an explicit "uncancel" because none exists.
+- **QoS**: the bridge requests the standard action status QoS (reliable +
+  transient_local). A non-standard server (volatile/best-effort) is logged with
+  an incompatible-QoS warning rather than silently yielding zero faults.
+- **Vanish while failed**: if an action that is currently failed disappears from
+  the graph (lifecycle deactivate, one-shot node), the bridge heals its fault
+  before forgetting it (when `heal_on_succeeded` is set), so it is not left stuck
+  active. With healing disabled the fault persists by design.
+- **Healing threshold**: the bridge emits one `PASSED` per recovery (a discrete
+  event, not a stream), so a fault reaches `HEALED` only when the FaultManager's
+  `healing_threshold` is `0`. With a higher threshold the fault stays `CONFIRMED`
+  after the action recovers.
