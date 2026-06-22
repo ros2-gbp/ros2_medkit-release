@@ -25,6 +25,7 @@
 
 #include "../src/openapi/route_registry.hpp"
 #include "ros2_medkit_gateway/dto/contract.hpp"
+#include "ros2_medkit_gateway/dto/faults.hpp"
 #include "ros2_medkit_gateway/http/typed_router.hpp"
 
 // -----------------------------------------------------------------------------
@@ -53,6 +54,8 @@ inline constexpr std::string_view dto_name<RouteRegistryTestSeedDto> = "RouteReg
 }  // namespace ros2_medkit_gateway
 
 using namespace ros2_medkit_gateway::openapi;
+using ros2_medkit_gateway::dto::FaultEntityListQuery;
+using ros2_medkit_gateway::dto::FaultListQuery;
 using ros2_medkit_gateway::dto::RouteRegistryTestSeedDto;
 using ros2_medkit_gateway::http::Result;
 using ros2_medkit_gateway::http::TypedRequest;
@@ -129,6 +132,107 @@ TEST_F(RouteRegistryTest, ToOpenapiPathsMultipleMethodsSamePath) {
   ASSERT_TRUE(paths.contains("/data"));
   EXPECT_TRUE(paths["/data"].contains("get"));
   EXPECT_TRUE(paths["/data"].contains("post"));
+}
+
+// @verifies REQ_INTEROP_002
+TEST_F(RouteRegistryTest, ToOpenapiPathsEmitsQueryParameters) {
+  seed_get(registry_, "/components/{component_id}/logs")
+      .tag("Logs")
+      .query_param("severity", "Filter by minimum severity")
+      .query_param("context", "Filter by logger context")
+      .query_param("include_muted", "Include muted entries", "boolean");
+
+  auto paths = registry_.to_openapi_paths();
+
+  ASSERT_TRUE(paths.contains("/components/{component_id}/logs"));
+  auto & get_op = paths["/components/{component_id}/logs"]["get"];
+  ASSERT_TRUE(get_op.contains("parameters"));
+
+  // Collect the query parameters by name (the path param is auto-generated).
+  std::vector<std::string> query_names;
+  const nlohmann::json * severity = nullptr;
+  const nlohmann::json * include_muted = nullptr;
+  for (const auto & p : get_op["parameters"]) {
+    if (p["in"] == "query") {
+      query_names.push_back(p["name"].get<std::string>());
+      if (p["name"] == "severity") {
+        severity = &p;
+      }
+      if (p["name"] == "include_muted") {
+        include_muted = &p;
+      }
+    }
+  }
+
+  EXPECT_EQ(query_names.size(), 3u);
+  ASSERT_NE(severity, nullptr);
+  EXPECT_EQ((*severity)["in"], "query");
+  EXPECT_FALSE((*severity)["required"].get<bool>());
+  EXPECT_EQ((*severity)["schema"]["type"], "string");
+  ASSERT_NE(include_muted, nullptr);
+  EXPECT_EQ((*include_muted)["schema"]["type"], "boolean");
+}
+
+// @verifies REQ_INTEROP_002
+TEST_F(RouteRegistryTest, TypedQueryDeclaresParametersFromDto) {
+  // .query<T>() derives the OpenAPI parameters straight from dto_fields<T> - the
+  // same descriptor a handler reads via TypedRequest::query<T>(), so the two
+  // cannot drift.
+  seed_get(registry_, "/faults").tag("Faults").query<FaultListQuery>();
+
+  auto paths = registry_.to_openapi_paths();
+  ASSERT_TRUE(paths.contains("/faults"));
+  auto & get_op = paths["/faults"]["get"];
+  ASSERT_TRUE(get_op.contains("parameters"));
+
+  const nlohmann::json * status = nullptr;
+  const nlohmann::json * include_muted = nullptr;
+  std::size_t query_count = 0;
+  for (const auto & p : get_op["parameters"]) {
+    if (p["in"] == "query") {
+      ++query_count;
+      if (p["name"] == "status") {
+        status = &p;
+      }
+      if (p["name"] == "include_muted") {
+        include_muted = &p;
+      }
+    }
+  }
+
+  // status + include_muted + include_clusters.
+  EXPECT_EQ(query_count, 3u);
+  ASSERT_NE(status, nullptr);
+  EXPECT_EQ((*status)["in"], "query");
+  EXPECT_FALSE((*status)["required"].get<bool>());  // optional<std::string> -> not required
+  EXPECT_EQ((*status)["schema"]["type"], "string");
+  ASSERT_NE(include_muted, nullptr);
+  EXPECT_EQ((*include_muted)["schema"]["type"], "boolean");  // bool member, kOptional presence
+  EXPECT_FALSE((*include_muted)["required"].get<bool>());
+}
+
+// @verifies REQ_INTEROP_002
+TEST_F(RouteRegistryTest, PerEntityFaultsQueryAdvertisesStatusOnly) {
+  // The per-entity /faults route uses the narrower FaultEntityListQuery so the
+  // spec advertises exactly what the handler reads: status only. The
+  // correlation flags (include_muted / include_clusters) are global-only, so
+  // they must NOT appear on the per-entity route.
+  seed_get(registry_, "/apps/{app_id}/faults").tag("Faults").query<FaultEntityListQuery>();
+
+  auto paths = registry_.to_openapi_paths();
+  ASSERT_TRUE(paths.contains("/apps/{app_id}/faults"));
+  auto & get_op = paths["/apps/{app_id}/faults"]["get"];
+  ASSERT_TRUE(get_op.contains("parameters"));
+
+  std::vector<std::string> query_names;
+  for (const auto & p : get_op["parameters"]) {
+    if (p["in"] == "query") {
+      query_names.push_back(p["name"].get<std::string>());
+    }
+  }
+
+  ASSERT_EQ(query_names.size(), 1u);
+  EXPECT_EQ(query_names[0], "status");
 }
 
 // =============================================================================

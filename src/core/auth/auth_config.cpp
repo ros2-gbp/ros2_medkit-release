@@ -161,6 +161,9 @@ const std::unordered_map<UserRole, std::unordered_set<std::string>> & AuthConfig
            "GET:/api/v1/apps/*/scripts/*",
            "GET:/api/v1/components/*/scripts/*/executions/*",
            "GET:/api/v1/apps/*/scripts/*/executions/*",
+           // Status: apps and components (read-only)
+           "GET:/api/v1/apps/*/status",
+           "GET:/api/v1/components/*/status",
            // Docs
            "GET:/api/v1/docs",
        }},
@@ -302,6 +305,9 @@ const std::unordered_map<UserRole, std::unordered_set<std::string>> & AuthConfig
            "GET:/api/v1/apps/*/scripts/*",
            "GET:/api/v1/components/*/scripts/*/executions/*",
            "GET:/api/v1/apps/*/scripts/*/executions/*",
+           // Status: apps and components (read-only, inherited from VIEWER)
+           "GET:/api/v1/apps/*/status",
+           "GET:/api/v1/components/*/status",
            // Docs
            "GET:/api/v1/docs",
            // --- Operator-specific write permissions ---
@@ -365,6 +371,15 @@ const std::unordered_map<UserRole, std::unordered_set<std::string>> & AuthConfig
            "PUT:/api/v1/apps/*/scripts/*/executions/*",
            "DELETE:/api/v1/components/*/scripts/*/executions/*",
            "DELETE:/api/v1/apps/*/scripts/*/executions/*",
+           // Lifecycle control (non-destructive): apps and components.
+           // shutdown / force-shutdown tear an entity down and are gated
+           // behind CONFIGURATOR, so OPERATOR gets only start/restart/force-restart.
+           "PUT:/api/v1/apps/*/status/start",
+           "PUT:/api/v1/apps/*/status/restart",
+           "PUT:/api/v1/apps/*/status/force-restart",
+           "PUT:/api/v1/components/*/status/start",
+           "PUT:/api/v1/components/*/status/restart",
+           "PUT:/api/v1/components/*/status/force-restart",
        }},
       {UserRole::CONFIGURATOR,
        {
@@ -504,6 +519,9 @@ const std::unordered_map<UserRole, std::unordered_set<std::string>> & AuthConfig
            "GET:/api/v1/apps/*/scripts/*",
            "GET:/api/v1/components/*/scripts/*/executions/*",
            "GET:/api/v1/apps/*/scripts/*/executions/*",
+           // Status: apps and components (read-only, inherited from VIEWER)
+           "GET:/api/v1/apps/*/status",
+           "GET:/api/v1/components/*/status",
            // Docs
            "GET:/api/v1/docs",
            // Inherited from OPERATOR - write permissions
@@ -567,6 +585,18 @@ const std::unordered_map<UserRole, std::unordered_set<std::string>> & AuthConfig
            "PUT:/api/v1/apps/*/scripts/*/executions/*",
            "DELETE:/api/v1/components/*/scripts/*/executions/*",
            "DELETE:/api/v1/apps/*/scripts/*/executions/*",
+           // Lifecycle control: apps and components, including the destructive
+           // shutdown / force-shutdown teardown transitions (CONFIGURATOR and above).
+           "PUT:/api/v1/apps/*/status/start",
+           "PUT:/api/v1/apps/*/status/restart",
+           "PUT:/api/v1/apps/*/status/force-restart",
+           "PUT:/api/v1/apps/*/status/shutdown",
+           "PUT:/api/v1/apps/*/status/force-shutdown",
+           "PUT:/api/v1/components/*/status/start",
+           "PUT:/api/v1/components/*/status/restart",
+           "PUT:/api/v1/components/*/status/force-restart",
+           "PUT:/api/v1/components/*/status/shutdown",
+           "PUT:/api/v1/components/*/status/force-shutdown",
            // --- Configurator-specific write permissions ---
            // Modify configurations: all entity types (PUT)
            "PUT:/api/v1/components/*/configurations/*",

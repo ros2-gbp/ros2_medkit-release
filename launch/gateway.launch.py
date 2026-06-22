@@ -18,9 +18,39 @@ from ament_index_python.packages import get_package_prefix
 from ament_index_python.packages import get_package_share_directory
 from ament_index_python.packages import PackageNotFoundError
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+# Default web UI origins enabled when the user does not override CORS, so the
+# bundled web UI works out of the box. A wildcard is deliberately not used.
+CORS_DEFAULT = 'http://localhost:3000,http://localhost:5173'
+
+
+def cors_override(cors_arg, config_file, default_config):
+    """
+    Return the ``cors.allowed_origins`` entry for the final overrides, or {}.
+
+    The final overrides dict is applied after the config file, so anything in it
+    wins per key. To avoid silently overriding a user's ``config_file``:
+
+    - an explicit ``cors_allowed_origins`` arg always wins (empty -> [''], which
+      the gateway reads as CORS off);
+    - with no arg and a *custom* config file, inject nothing so the file's
+      ``cors.allowed_origins`` is respected;
+    - with no arg and the default config, apply the web UI origins so the bundled
+      UI works out of the box.
+
+    An empty list cannot be passed as a launch parameter (and is the untyped-empty
+    shape that aborts startup), so the off case uses [''] - the same placeholder
+    the gateway config ships; config.cpp filters the empty string.
+    """
+    if cors_arg.strip() != CORS_DEFAULT:
+        origins = [o.strip() for o in cors_arg.split(',') if o.strip()] or ['']
+        return {'cors.allowed_origins': origins}
+    if not config_file or config_file == default_config:
+        return {'cors.allowed_origins': CORS_DEFAULT.split(',')}
+    return {}
 
 
 def generate_launch_description():
@@ -64,28 +94,45 @@ def generate_launch_description():
             'controls the periodic forced refresh. Must match the default '
             'in config/gateway_params.yaml.'))
 
-    # Build parameter overrides - only inject plugin path if found
-    param_overrides = {
-        'server.host': LaunchConfiguration('server_host'),
-        'server.port': LaunchConfiguration('server_port'),
-        'refresh_interval_ms': LaunchConfiguration('refresh_interval_ms'),
-    }
-    if graph_provider_path:
-        param_overrides['plugins'] = ['graph_provider']
-        param_overrides['plugins.graph_provider.path'] = graph_provider_path
+    declare_cors_arg = DeclareLaunchArgument(
+        'cors_allowed_origins',
+        default_value=CORS_DEFAULT,
+        description='Comma-separated CORS origins allowed to call the REST API from a browser, so '
+                    'the bundled web UI (a different origin) works out of the box. Pass an '
+                    'explicit value to override (empty disables CORS); when left at the default, '
+                    'a config_file that sets cors.allowed_origins is respected. A wildcard is '
+                    'intentionally not the default: with auth off and write methods enabled it '
+                    'would let any site drive cross-origin writes.')
 
-    gateway_node = Node(
-        package='ros2_medkit_gateway',
-        executable='gateway_node',
-        name='ros2_medkit_gateway',
-        output='screen',
-        parameters=[default_config, LaunchConfiguration('config_file'), param_overrides],
-        arguments=['--ros-args', '--log-level', 'info'])
+    # The cors arg is resolved at launch time (a comma-separated LaunchConfiguration
+    # cannot be passed straight through as a string-array parameter) and folded in
+    # by cors_override, which keeps a config_file's CORS from being silently
+    # overridden by the launch default.
+    def _launch_setup(context, *_args, **_kwargs):
+        param_overrides = {
+            'server.host': LaunchConfiguration('server_host'),
+            'server.port': LaunchConfiguration('server_port'),
+            'refresh_interval_ms': LaunchConfiguration('refresh_interval_ms'),
+        }
+        if graph_provider_path:
+            param_overrides['plugins'] = ['graph_provider']
+            param_overrides['plugins.graph_provider.path'] = graph_provider_path
+        param_overrides.update(cors_override(
+            LaunchConfiguration('cors_allowed_origins').perform(context),
+            LaunchConfiguration('config_file').perform(context), default_config))
+        return [Node(
+            package='ros2_medkit_gateway',
+            executable='gateway_node',
+            name='ros2_medkit_gateway',
+            output='screen',
+            parameters=[default_config, LaunchConfiguration('config_file'), param_overrides],
+            arguments=['--ros-args', '--log-level', 'info'])]
 
     return LaunchDescription([
         declare_override_config_arg,
         declare_host_arg,
         declare_port_arg,
         declare_refresh_arg,
-        gateway_node,
+        declare_cors_arg,
+        OpaqueFunction(function=_launch_setup),
     ])

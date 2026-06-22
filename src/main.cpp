@@ -14,11 +14,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
 #include <rclcpp/rclcpp.hpp>
 
+#include "ros2_medkit_gateway/core/thread_pool_config.hpp"
 #include "ros2_medkit_gateway/data/ros2_topic_data_provider.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/ros2_common/ros2_subscription_executor.hpp"
@@ -69,13 +71,29 @@ int main(int argc, char ** argv) {
 
     auto node = std::make_shared<ros2_medkit_gateway::GatewayNode>();
 
-    // MultiThreadedExecutor for the gateway node - HTTP handlers run on several
-    // threads, so the main executor must dispatch callbacks in parallel to avoid
-    // starving slow handlers. The Ros2SubscriptionExecutor built below owns its
-    // own internal single-threaded executor (spun from its worker thread); the
-    // subscription node is intentionally not added here.
-    rclcpp::executors::MultiThreadedExecutor executor;
+    // MultiThreadedExecutor for the gateway node. Issue #440: the thread count
+    // is bounded by the server.executor_threads parameter (default 2) instead of
+    // rclcpp's default (host cores, minimum 2), so the footprint does not grow
+    // with the host core count.
+    //
+    // Note this count does NOT buy RPC-response parallelism: the futures behind
+    // operation/action RPCs are completed by service-response callbacks, and
+    // every client here registers on the node's default callback group, which is
+    // mutually-exclusive - so those responses, timers, and graph events all
+    // serialize through a single executor thread no matter how high this is set.
+    // The reason a small executor is safe is solely that the blocking wait for an
+    // RPC runs on the cpp-httplib pool thread (a separate server_thread_), never
+    // on an executor thread, so it cannot deadlock the executor; the fault
+    // transport additionally uses its own private executor. Raise this only if
+    // the node's own callback load (e.g. very frequent graph churn) grows. The
+    // Ros2SubscriptionExecutor built below owns its own internal single-threaded
+    // executor (spun from its worker thread); the subscription node is
+    // intentionally not added here.
+    const auto executor_threads =
+        ros2_medkit_gateway::clamp_thread_count(node->get_parameter("server.executor_threads").as_int(), 1, 256);
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), executor_threads);
     executor.add_node(node);
+    RCLCPP_INFO(node->get_logger(), "Main executor bounded to %zu threads", executor_threads);
 
     // Stand up the ROS 2 subscription executor + topic data provider.
     // Issue #375: all subscription create/destroy calls are funneled through the
@@ -84,6 +102,33 @@ int main(int argc, char ** argv) {
     // created subscriptions on the same node.
     const auto exec_cfg = declare_executor_config(*node);
     const auto dp_cfg = declare_data_provider_config(*node);
+
+    // Issue #440: warn if the HTTP pool cannot cover the documented worst case.
+    // Every SSE stream pins a worker for its lifetime and every cold-/data wait
+    // parks one for up to topic_sample_timeout_sec, so a pool below
+    // sse.max_clients + data_provider.cold_wait_cap can be fully starved (slow
+    // bulk-data downloads also hold a worker, uncounted, so leave extra headroom
+    // if you serve those concurrently). This is a misconfiguration warning, not a
+    // hard error - an operator who knows their traffic stays under the cap may
+    // run a smaller pool. Values are clamped the same way their consumers clamp
+    // them, so the comparison reflects effective sizes. cold_wait_cap is read
+    // from dp_cfg (already clamped above).
+    {
+      const auto http_pool = ros2_medkit_gateway::clamp_thread_count(
+          node->get_parameter("server.http_thread_pool_size").as_int(), 1, 1024);
+      const auto sse_clients =
+          ros2_medkit_gateway::clamp_thread_count(node->get_parameter("sse.max_clients").as_int(), 1, 1024);
+      const auto needed = sse_clients + dp_cfg.cold_wait_cap;
+      if (http_pool < needed) {
+        RCLCPP_WARN(node->get_logger(),
+                    "server.http_thread_pool_size (%zu) is below sse.max_clients (%zu) + "
+                    "data_provider.cold_wait_cap (%zu) = %zu: a burst of SSE streams and cold /data "
+                    "requests can starve the HTTP worker pool. Raise http_thread_pool_size, or lower "
+                    "sse.max_clients / data_provider.cold_wait_cap, so the pool covers their sum.",
+                    http_pool, sse_clients, dp_cfg.cold_wait_cap, needed);
+      }
+    }
+
     auto sub_exec = std::make_shared<ros2_medkit_gateway::ros2_common::Ros2SubscriptionExecutor>(node, exec_cfg);
     auto serializer = std::make_shared<ros2_medkit_serialization::JsonSerializer>();
     auto data_provider = std::make_shared<ros2_medkit_gateway::Ros2TopicDataProvider>(sub_exec, serializer, dp_cfg);

@@ -41,6 +41,7 @@ find_package(yaml_cpp_vendor REQUIRED)
 medkit_find_yaml_cpp()
 find_package(ament_index_cpp REQUIRED)
 find_package(action_msgs REQUIRED)
+find_package(lifecycle_msgs REQUIRED)
 find_package(ros2_medkit_msgs REQUIRED)
 find_package(ros2_medkit_serialization REQUIRED)
 find_package(SQLite3 REQUIRED)
@@ -159,6 +160,7 @@ add_library(gateway_ros2 STATIC
   src/ros2/transports/ros2_service_transport.cpp
   src/ros2/transports/ros2_topic_subscription_transport.cpp
   src/ros2/transports/ros2_topic_transport.cpp
+  src/ros2/status/ros2_lifecycle_state_reader.cpp
   src/ros2/trigger_topic_subscriber.cpp
   src/default_script_provider.cpp
   src/discovery/discovery_manager.cpp
@@ -182,6 +184,7 @@ add_library(gateway_ros2 STATIC
   src/http/handlers/fault_handlers.cpp
   src/http/handlers/handler_context.cpp
   src/http/handlers/health_handlers.cpp
+  src/http/handlers/lifecycle_handlers.cpp
   src/http/handlers/lock_handlers.cpp
   src/http/handlers/log_handlers.cpp
   src/http/handlers/operation_handlers.cpp
@@ -223,6 +226,7 @@ medkit_target_dependencies(gateway_ros2
   rcl_interfaces
   ament_index_cpp
   action_msgs
+  lifecycle_msgs
   ros2_medkit_msgs
   ros2_medkit_serialization
   rosidl_typesupport_cpp
@@ -526,6 +530,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_plugin_notify_integration gateway_ros2)
   medkit_set_test_domain(test_plugin_notify_integration)
 
+  ament_add_gtest(test_plugin_context_aggregation test/test_plugin_context_aggregation.cpp)
+  target_link_libraries(test_plugin_context_aggregation gateway_ros2)
+  medkit_set_test_domain(test_plugin_context_aggregation)
+
   ament_add_gtest(test_auth_manager test/test_auth_manager.cpp)
   target_link_libraries(test_auth_manager gateway_ros2)
 
@@ -558,6 +566,10 @@ if(BUILD_TESTING)
   # Add TLS configuration tests
   ament_add_gtest(test_tls_config test/test_tls_config.cpp)
   target_link_libraries(test_tls_config gateway_ros2)
+
+  # Add HTTP server thread-pool bound tests (issue #440)
+  ament_add_gtest(test_http_server_thread_pool test/test_http_server_thread_pool.cpp)
+  target_link_libraries(test_http_server_thread_pool gateway_ros2)
 
   # Add FaultManager tests
   ament_add_gtest(test_fault_manager test/test_fault_manager.cpp)
@@ -639,9 +651,38 @@ if(BUILD_TESTING)
   target_link_libraries(test_handler_context gateway_ros2)
   medkit_set_test_domain(test_handler_context)
 
+  # FlatHashMap open-addressed container (pure C++17, no ROS node)
+  ament_add_gtest(test_flat_hash_map test/test_flat_hash_map.cpp)
+  if(TARGET test_flat_hash_map)
+    target_link_libraries(test_flat_hash_map gateway_core)
+  endif()
+
+  # Graph-event refresh debounce decision (pure C++17, no ROS node)
+  ament_add_gtest(test_refresh_debounce test/test_refresh_debounce.cpp)
+  if(TARGET test_refresh_debounce)
+    target_link_libraries(test_refresh_debounce gateway_core)
+  endif()
+
+  # SlotStore object pool (pure C++17, no ROS node)
+  ament_add_gtest(test_slot_store test/test_slot_store.cpp)
+  if(TARGET test_slot_store)
+    target_link_libraries(test_slot_store gateway_core)
+  endif()
+
+  # ThreadSafeEntityCache incremental reconcile (pure C++17, no ROS node)
+  ament_add_gtest(test_thread_safe_entity_cache
+    test/test_thread_safe_entity_cache.cpp)
+  if(TARGET test_thread_safe_entity_cache)
+    target_link_libraries(test_thread_safe_entity_cache gateway_core)
+  endif()
+
   # DTO contract core (pure C++17, no ROS node)
   ament_add_gtest(test_dto_contract test/test_dto_contract.cpp)
   target_link_libraries(test_dto_contract gateway_core)
+
+  # Lifecycle DTO (pure C++17, no ROS node)
+  ament_add_gtest(test_lifecycle_dto test/test_lifecycle_dto.cpp)
+  target_link_libraries(test_lifecycle_dto gateway_core)
 
   # DTO Collection<T, XMedkit> template + fan-out observability fields
   ament_add_gtest(test_collection test/test_collection.cpp)
@@ -650,6 +691,10 @@ if(BUILD_TESTING)
   # DTO opaque_object machinery (pure C++17, no ROS node)
   ament_add_gtest(test_opaque_object test/test_opaque_object.cpp)
   target_link_libraries(test_opaque_object gateway_core)
+
+  # Entity value equality (operator==) - pure C++17, no ROS node
+  ament_add_gtest(test_entity_equality test/test_entity_equality.cpp)
+  target_link_libraries(test_entity_equality gateway_core)
 
   # Typed router foundational types (pure C++17, no ROS node)
   ament_add_gtest(test_typed_router test/test_typed_router.cpp)
@@ -753,6 +798,23 @@ if(BUILD_TESTING)
   target_link_libraries(test_health_handlers gateway_ros2)
   medkit_set_test_domain(test_health_handlers)
 
+  # Add lifecycle handler tests
+  ament_add_gtest(test_lifecycle_handlers test/test_lifecycle_handlers.cpp)
+  target_link_libraries(test_lifecycle_handlers gateway_ros2)
+  medkit_target_dependencies(test_lifecycle_handlers rclcpp)
+  medkit_set_test_domain(test_lifecycle_handlers)
+
+  # Lifecycle status helpers (pure C++17, no ROS node)
+  ament_add_gtest(test_lifecycle_status_helpers test/test_lifecycle_status_helpers.cpp)
+  target_link_libraries(test_lifecycle_status_helpers gateway_core)
+  medkit_set_test_domain(test_lifecycle_status_helpers)
+
+  # GetState-backed lifecycle state reader (ROS 2 in-process service)
+  ament_add_gtest(test_ros2_lifecycle_state_reader test/test_ros2_lifecycle_state_reader.cpp)
+  target_link_libraries(test_ros2_lifecycle_state_reader gateway_ros2)
+  medkit_target_dependencies(test_ros2_lifecycle_state_reader rclcpp lifecycle_msgs)
+  medkit_set_test_domain(test_ros2_lifecycle_state_reader)
+
   # Add operation handler tests
   ament_add_gtest(test_operation_handlers test/test_operation_handlers.cpp)
   target_link_libraries(test_operation_handlers gateway_ros2)
@@ -817,6 +879,10 @@ if(BUILD_TESTING)
   # Plugin entity routing tests
   ament_add_gtest(test_plugin_entity_routing test/test_plugin_entity_routing.cpp)
   target_link_libraries(test_plugin_entity_routing gateway_ros2)
+
+  # Lifecycle provider routing tests
+  ament_add_gtest(test_lifecycle_provider_routing test/test_lifecycle_provider_routing.cpp)
+  target_link_libraries(test_lifecycle_provider_routing gateway_ros2)
 
   # Plugin HTTP types tests
   ament_add_gtest(test_plugin_http_types test/test_plugin_http_types.cpp)
@@ -941,6 +1007,17 @@ if(BUILD_TESTING)
   ament_add_gtest(test_network_utils test/test_network_utils.cpp)
   target_link_libraries(test_network_utils gateway_ros2)
 
+  # ─── Allocation-counter proxy gate (gateway_core only) ────────────────────
+  # Standalone TU with its own global operator new/delete override (gated by
+  # g_armed). Proves update_all performs ~zero net structural allocations in
+  # steady-state churn over a bounded id-set. Must be its OWN executable so
+  # the operator new override does not bleed into other test binaries.
+  # No medkit_set_test_domain - this is ROS-free (gateway_core only).
+  ament_add_gtest(test_entity_cache_alloc test/test_entity_cache_alloc.cpp)
+  target_link_libraries(test_entity_cache_alloc gateway_core)
+  # NOTE: test_entity_cache_alloc is intentionally excluded from _test_targets below.
+  # Its global operator new/delete override corrupts lcov allocation counters in other TUs.
+
   # Apply coverage flags to test targets
   if(ENABLE_COVERAGE)
     set(_test_targets
@@ -954,6 +1031,8 @@ if(BUILD_TESTING)
       test_tls_config
       test_fault_manager
       test_error_info
+      test_lifecycle_status_helpers
+      test_ros2_lifecycle_state_reader
       test_ros2_subscription_executor
       test_ros2_subscription_slot
       test_topic_data_provider_interface
@@ -1022,6 +1101,7 @@ if(BUILD_TESTING)
       test_stream_proxy
       test_mdns_discovery
       test_network_utils
+      test_plugin_context_aggregation
     )
     foreach(_target ${_test_targets})
       target_compile_options(${_target} PRIVATE --coverage -O0 -g)
