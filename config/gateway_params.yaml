@@ -20,6 +20,44 @@ ros2_medkit_gateway:
       # Valid range: 1024-65535
       port: 8080
 
+      # Number of worker threads in the HTTP request pool (cpp-httplib).
+      # Bounded to a small fixed size instead of scaling with the host core
+      # count. Clamped to [1, 1024].
+      #
+      # IMPORTANT: each active SSE stream (fault dashboard, cyclic
+      # subscriptions, trigger events) holds ONE pool thread for its entire
+      # lifetime, and the data cold-wait path can block up to
+      # data_provider.cold_wait_cap more (slow bulk-data downloads also hold a
+      # worker, uncounted). The default (6) covers the shipped worst case:
+      # sse.max_clients (2) + data_provider.cold_wait_cap (4) = 6. If you raise
+      # sse.max_clients or cold_wait_cap, raise this to match - the gateway warns
+      # at startup when pool < sse.max_clients + cold_wait_cap. See also
+      # keep_alive_timeout_sec below: the pool and the keep-alive timeout together
+      # bound how many concurrent client connections the gateway serves without
+      # stalling.
+      # Default: 6
+      http_thread_pool_size: 6
+
+      # cpp-httplib keep-alive idle timeout, in seconds. After answering a
+      # request the worker stays parked on the (idle) keep-alive connection for
+      # this long before freeing it. The library default (5s) lets a burst of
+      # short-lived client connections - e.g. a client polling several endpoints
+      # each cycle - pin every worker in the small pool above, stalling ordinary
+      # requests for up to one timeout per cycle. A shorter value recovers
+      # workers quickly; a longer value favours connection reuse (fewer TCP/TLS
+      # handshakes) for steady clients. Clamped to [1, 3600].
+      # Default: 2
+      keep_alive_timeout_sec: 2
+
+      # Number of threads in the main rclcpp MultiThreadedExecutor. This
+      # executor only dispatches the gateway node's own callbacks (timers,
+      # graph events, log/fault subscriptions); HTTP handlers that issue ROS
+      # service calls use their own private executors, so a small pool here is
+      # safe. Bounded to a small fixed size instead of std::thread::
+      # hardware_concurrency(). Clamped to [1, 256].
+      # Default: 2
+      executor_threads: 2
+
       # TLS/HTTPS Configuration
       # Enables encrypted communication using OpenSSL
       tls:
@@ -59,6 +97,18 @@ ros2_medkit_gateway:
     # Valid range: 100-60000 (0.1s to 60s)
     # Default: 30000 (30 seconds)
     refresh_interval_ms: 30000
+
+    # Graph-event refresh debounce (milliseconds).
+    # The rclcpp graph event fires many times per second under graph churn
+    # (nodes/topics repeatedly created and destroyed). Each refresh runs the
+    # full discovery pipeline, so coalescing graph events bounds the per-event
+    # allocation churn. A graph change triggers at most one refresh per this
+    # interval; a pending change is always serviced within this interval plus
+    # one 100 ms poll. The ROS graph rarely changes faster than ~1s in practice.
+    #
+    # Valid range: 0-60000 (0 disables debouncing: refresh on every graph event)
+    # Default: 1000 (1 second)
+    discovery.refresh_debounce_ms: 1000
 
     # CORS Configuration
     # Cross-Origin Resource Sharing settings for browser-based clients
@@ -136,9 +186,14 @@ ros2_medkit_gateway:
     # SSE (Server-Sent Events) Configuration
     sse:
       # Maximum number of concurrent SSE connections
-      # Applies to fault streams and cyclic subscription streams combined
-      # Default: 10
-      max_clients: 10
+      # Applies to fault streams and cyclic subscription streams combined.
+      # Each connection pins one server.http_thread_pool_size worker for its
+      # lifetime, so this is kept within the pool budget: the default (2) plus
+      # data_provider.cold_wait_cap (4) equals server.http_thread_pool_size (6).
+      # Raise the pool to match if you raise this (the gateway warns at startup
+      # when pool < sse.max_clients + cold_wait_cap). Clamped to [1, 1024].
+      # Default: 2
+      max_clients: 2
 
       # Maximum number of active cyclic subscriptions across all entities
       # Returns HTTP 503 when this limit is reached
@@ -149,6 +204,21 @@ ros2_medkit_gateway:
       # Subscriptions requesting a longer duration are rejected with HTTP 400
       # Default: 3600 (1 hour)
       max_duration_sec: 3600
+
+    # Entity Cache Configuration
+    entity_cache:
+      # Pre-reserved capacity for the thread-safe entity cache.
+      # Setting this to a value at or above the expected peak entity count prevents
+      # structural reallocation during steady-state refreshes (desirable for
+      # memory-constrained or real-time embedded deployments).
+      # Growing beyond the reserved capacity is harmless but triggers a one-shot
+      # WARN log; raise this value if you see that warning.
+      # A fully-turning-over refresh allocates the new slots before freeing the
+      # absent old ones, so the pool transiently needs ~2x the steady-state live
+      # count; size this to about twice the expected peak to stay allocation-free.
+      # Valid range: 16-1000000 (values outside this range are clamped with a warning).
+      # Default: 256 (covers most production graphs with headroom)
+      capacity: 256
 
     # Logging Configuration
     logs:

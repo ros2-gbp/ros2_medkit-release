@@ -14,10 +14,13 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "ros2_medkit_gateway/aggregation/aggregation_manager.hpp"
@@ -65,6 +68,16 @@ class GatewayNode : public rclcpp::Node {
  public:
   explicit GatewayNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions{});
   ~GatewayNode() override;
+
+  /// Count application (peer) nodes from (name, namespace) pairs: excludes hidden
+  /// nodes and the gateway's own nodes (whose FQN starts with @p self_fqn). Static
+  /// and public so the startup-summary counting logic is unit-testable.
+  static size_t count_peer_nodes(const std::vector<std::pair<std::string, std::string>> & nodes_and_namespaces,
+                                 const std::string & self_fqn);
+
+  /// Translate a bind address into a connectable address for the sample curl
+  /// (bind-all "0.0.0.0"/"::"/"" -> loopback). Static and public for testing.
+  static std::string connectable_host(const std::string & bind_host);
   GatewayNode(const GatewayNode &) = delete;
   GatewayNode & operator=(const GatewayNode &) = delete;
   GatewayNode(GatewayNode &&) = delete;
@@ -245,6 +258,13 @@ class GatewayNode : public rclcpp::Node {
   void start_rest_server();
   void stop_rest_server();
 
+  /// Log a one-time discovery summary shortly after startup: discovered node /
+  /// topic / entity counts, the REST URL and a sample curl. When no application
+  /// nodes are visible, also warn loudly with the active ROS environment
+  /// (ROS_DOMAIN_ID / RMW_IMPLEMENTATION / ROS_LOCALHOST_ONLY) and likely causes,
+  /// so a misconfigured bringup is not a silent empty tree.
+  void log_startup_summary();
+
   // Configuration parameters
   std::string server_host_;
   int server_port_;
@@ -333,6 +353,9 @@ class GatewayNode : public rclcpp::Node {
 
   // Cache with thread safety
   ThreadSafeEntityCache thread_safe_cache_;
+  // One-shot WARN when entity_cache capacity is exceeded (grew on first refresh after reserve).
+  // Cleared only at construction time; never reset so the WARN fires at most once per run.
+  bool warned_cache_grow_{false};
 
   // Graph-change-driven discovery refresh.
   //
@@ -352,6 +375,18 @@ class GatewayNode : public rclcpp::Node {
   rclcpp::TimerBase::SharedPtr graph_check_timer_;
   rclcpp::TimerBase::SharedPtr backstop_timer_;
 
+  // Debounce graph-event-driven refreshes (issue #442). The graph event fires
+  // many times per second under graph churn; coalesce so refresh_cache() runs
+  // at most once per `refresh_debounce_ms_`. `graph_dirty_` marks a pending
+  // (consumed-but-not-yet-serviced) graph change; `last_graph_refresh_` is the
+  // last graph-driven refresh time. Set via `discovery.refresh_debounce_ms`.
+  // `graph_dirty_`/`last_graph_refresh_` are atomic: under a MultiThreadedExecutor
+  // successive ticks of the graph-check timer can run on different worker threads,
+  // so this cross-tick state is accessed from more than one thread.
+  int refresh_debounce_ms_{1000};
+  std::atomic<bool> graph_dirty_{false};
+  std::atomic<std::chrono::steady_clock::time_point> last_graph_refresh_{};
+
   // Serializes `refresh_cache()` across the refresh timer, plugin
   // `notify_entities_changed` calls and any other caller. Required because
   // the refresh pipeline touches discovery state that is not itself
@@ -363,6 +398,10 @@ class GatewayNode : public rclcpp::Node {
 
   // Timer for periodic cleanup of old action goals
   rclcpp::TimerBase::SharedPtr cleanup_timer_;
+
+  // One-shot timer that fires the post-startup discovery summary (see
+  // log_startup_summary). Reset after it runs.
+  rclcpp::TimerBase::SharedPtr startup_summary_timer_;
 
   // Timer for periodic cleanup of expired cyclic subscriptions
   rclcpp::TimerBase::SharedPtr subscription_cleanup_timer_;

@@ -22,7 +22,9 @@
 #include "ros2_medkit_gateway/core/auth/auth_middleware.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/thread_pool_config.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
+#include "ros2_medkit_gateway/ros2/status/ros2_lifecycle_state_reader.hpp"
 
 #include "../openapi/route_registry.hpp"
 #include "../openapi/schema_builder.hpp"
@@ -81,8 +83,26 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   , cors_config_(cors_config)
   , auth_config_(auth_config)
   , tls_config_(tls_config) {
-  // Create HTTP/HTTPS server manager
-  http_server_ = std::make_unique<HttpServerManager>(tls_config_);
+  // Create HTTP/HTTPS server manager with a bounded request thread pool and a
+  // bounded keep-alive idle timeout (issue #440). clamp_thread_count keeps the
+  // pool in [1, 1024]: a pool of 0 would queue every request forever, and a
+  // typo'd huge value would spawn that many OS threads. Each active SSE stream
+  // holds one worker for its lifetime and each cold-/data wait parks one, so the
+  // default pool covers sse.max_clients + data_provider.cold_wait_cap (bulk-data
+  // downloads also hold a worker, uncounted); main.cpp warns at startup if the
+  // pool is set below that sum. clamp_keep_alive_timeout keeps the keep-alive
+  // timeout in [1, 3600]s: with a small pool, the cpp-httplib default (5s) lets
+  // a burst of short-lived client connections pin every worker, so we shorten it
+  // (default 2s) to recover workers quickly while retaining reuse.
+  const auto http_thread_pool_size =
+      clamp_thread_count(node_->get_parameter("server.http_thread_pool_size").as_int(), 1, 1024);
+  const auto keep_alive_timeout_sec =
+      clamp_keep_alive_timeout(node_->get_parameter("server.keep_alive_timeout_sec").as_int(), 1, 3600);
+  http_server_ = std::make_unique<HttpServerManager>(tls_config_, http_thread_pool_size, keep_alive_timeout_sec);
+  RCLCPP_INFO(rclcpp::get_logger("rest_server"),
+              "HTTP request thread pool bounded to %zu workers (each active SSE stream holds one), "
+              "keep-alive timeout %lds",
+              http_thread_pool_size, static_cast<long>(keep_alive_timeout_sec));
 
   // Set maximum payload size for uploads (cpp-httplib default is 8MB)
   auto * srv = http_server_->get_server();
@@ -125,6 +145,8 @@ RESTServer::RESTServer(GatewayNode * node, const std::string & host, int port, c
   health_handlers_ = std::make_unique<handlers::HealthHandlers>(*handler_ctx_, route_registry_.get());
   discovery_handlers_ = std::make_unique<handlers::DiscoveryHandlers>(*handler_ctx_);
   data_handlers_ = std::make_unique<handlers::DataHandlers>(*handler_ctx_);
+  lifecycle_handlers_ = std::make_unique<handlers::LifecycleHandlers>(
+      *handler_ctx_, node_->get_plugin_manager(), std::make_shared<Ros2LifecycleStateReader>(node_));
   operation_handlers_ = std::make_unique<handlers::OperationHandlers>(*handler_ctx_);
   config_handlers_ = std::make_unique<handlers::ConfigHandlers>(*handler_ctx_);
   fault_handlers_ = std::make_unique<handlers::FaultHandlers>(*handler_ctx_);
@@ -655,7 +677,8 @@ void RESTServer::setup_routes() {
         .tag("Faults")
         .summary(std::string("List faults for ") + et.singular)
         .description(std::string("Returns all active faults reported by this ") + et.singular + ".")
-        .operation_id(std::string("list") + capitalize(et.singular) + "Faults");
+        .operation_id(std::string("list") + capitalize(et.singular) + "Faults")
+        .query<dto::FaultEntityListQuery>();
 
     reg.get<dto::FaultDetailResult>(entity_path + "/faults/{fault_code}",
                                     [this](http::TypedRequest req) -> http::Result<dto::FaultDetailResult> {
@@ -700,7 +723,8 @@ void RESTServer::setup_routes() {
         .tag("Logs")
         .summary(std::string("Query log entries for ") + et.singular)
         .description(std::string("Queries application log entries for this ") + et.singular + ".")
-        .operation_id(std::string("list") + capitalize(et.singular) + "Logs");
+        .operation_id(std::string("list") + capitalize(et.singular) + "Logs")
+        .query<dto::LogQuery>();
 
     reg.get<dto::LogConfiguration>(entity_path + "/logs/configuration",
                                    [this](http::TypedRequest req) -> http::Result<dto::LogConfiguration> {
@@ -1406,7 +1430,8 @@ void RESTServer::setup_routes() {
       .tag("Faults")
       .summary("List all faults globally")
       .description("Retrieve all faults across the system.")
-      .operation_id("listAllFaults");
+      .operation_id("listAllFaults")
+      .query<dto::FaultListQuery>();
 
   reg.del<http::NoContent>(
          "/faults",
@@ -1416,7 +1441,8 @@ void RESTServer::setup_routes() {
       .tag("Faults")
       .summary("Clear all faults globally")
       .description("Clears all faults across the entire system.")
-      .operation_id("clearAllFaults");
+      .operation_id("clearAllFaults")
+      .query<dto::FaultClearQuery>();
 
   // === Software Updates ===
   //
@@ -1451,7 +1477,8 @@ void RESTServer::setup_routes() {
       .tag("Updates")
       .summary("List software updates")
       .description("Lists all registered software updates.")
-      .operation_id("listUpdates");
+      .operation_id("listUpdates")
+      .query<dto::UpdateListQuery>();
 
   reg.post<dto::UpdateRegisterRequest, dto::UpdateRegisterResponse>(
          "/updates",
@@ -1586,6 +1613,48 @@ void RESTServer::setup_routes() {
       .request_body("Token to revoke", SB::ref("AuthRevokeRequest"))
       .operation_id("revokeToken")
       .error_renderer(openapi::ErrorRenderer::kOAuth2Error);
+
+  // === Lifecycle (status) - apps and components only, outside the 4-type loop ===
+  // GET and PUT use different HTTP methods so neither can shadow the other.
+  // Registration order within the loop is arbitrary from the router's perspective.
+  for (const auto & et_lc :
+       std::vector<std::pair<const char *, const char *>>{{"apps", "app"}, {"components", "component"}}) {
+    const std::string base_lc = std::string("/") + et_lc.first + "/{" + et_lc.second + "_id}";
+    // e.g. "Apps" / "Components" for operation ID construction
+    const std::string entity_cap = capitalize(std::string(et_lc.first));
+
+    for (const auto & action : {"start", "restart", "force-restart", "shutdown", "force-shutdown"}) {
+      std::string action_str = action;
+      // Capitalise action for operation ID: "force-restart" -> "ForceRestart"
+      std::string action_cap;
+      bool cap_next = true;
+      for (char c : action_str) {
+        if (c == '-') {
+          cap_next = true;
+        } else {
+          action_cap += cap_next ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c;
+          cap_next = false;
+        }
+      }
+      reg.put<http::NoContent>(base_lc + "/status/" + action,
+                               [this, action_str](http::TypedRequest req)
+                                   -> http::Result<std::pair<http::NoContent, http::ResponseAttachments>> {
+                                 return lifecycle_handlers_->handle_transition(req, action_str);
+                               })
+          .tag("Lifecycle")
+          .summary(std::string("Request lifecycle transition '") + action + "'")
+          .response(202, "Lifecycle transition accepted")
+          .operation_id(std::string("put").append(entity_cap).append("Status").append(action_cap));
+    }
+
+    reg.get<dto::LifecycleStatusResponse>(base_lc + "/status",
+                                          [this](http::TypedRequest req) -> http::Result<dto::LifecycleStatusResponse> {
+                                            return lifecycle_handlers_->handle_get_status(req);
+                                          })
+        .tag("Lifecycle")
+        .summary(std::string("Get ") + et_lc.second + " lifecycle status")
+        .operation_id(std::string("get") + entity_cap + "Status");
+  }
 
   // Register all routes with cpp-httplib
   route_registry_->register_all(*srv, API_BASE_PATH);

@@ -10,6 +10,7 @@ The ROS 2 Medkit Gateway exposes ROS 2 system information and data through a RES
 - **Auto-discovery**: Automatically detects ROS 2 nodes and topics
 - **SOVD entity model**: Areas, Components (host-level), Apps (ROS 2 nodes), and Functions (namespace-based logical grouping)
 - **REST API**: Standard HTTP/JSON interface
+- **Incremental entity cache**: Discovery refresh diffs add/remove/change and performs zero structural allocations in the cache layer at steady state (object-pool backed, fixed capacity reserved at init via `entity_cache.capacity`)
 - **Real-time updates**: Configurable cache refresh for up-to-date system state
 - **Bulk Data Management**: Upload, download, list, and delete bulk data files (calibration, firmware, etc.)
 - **Resource Locking**: SOVD-compliant entity locking with scoped access control, lock breaking, and automatic expiry
@@ -113,6 +114,23 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 - `GET /api/v1/docs` - Full OpenAPI 3.1.0 specification
 - `GET /api/v1/{entity_type}/{id}/docs` - Entity-scoped OpenAPI spec
 - `GET /api/v1/swagger-ui` - Interactive Swagger UI (requires build with `-DENABLE_SWAGGER_UI=ON`)
+
+### Status and Lifecycle Endpoints
+
+- `GET /api/v1/apps/{app_id}/status` - Read app lifecycle status (`ready` or `notReady`)
+- `PUT /api/v1/apps/{app_id}/status/start` - Request app start transition
+- `PUT /api/v1/apps/{app_id}/status/restart` - Request controlled app restart
+- `PUT /api/v1/apps/{app_id}/status/force-restart` - Request forced app restart
+- `PUT /api/v1/apps/{app_id}/status/shutdown` - Request controlled app shutdown
+- `PUT /api/v1/apps/{app_id}/status/force-shutdown` - Request forced app shutdown
+- `GET /api/v1/components/{component_id}/status` - Read component lifecycle status
+- `PUT /api/v1/components/{component_id}/status/start` - Request component start transition
+- `PUT /api/v1/components/{component_id}/status/restart` - Request controlled component restart
+- `PUT /api/v1/components/{component_id}/status/force-restart` - Request forced component restart
+- `PUT /api/v1/components/{component_id}/status/shutdown` - Request controlled component shutdown
+- `PUT /api/v1/components/{component_id}/status/force-shutdown` - Request forced component shutdown
+
+`GET /status` always returns a response. For apps, the status is read from the ROS 2 lifecycle `GetState` service when the node is a managed lifecycle node (`active` -> `ready`; any other state, or an unreachable/timed-out read, -> `notReady`); plain (unmanaged) nodes fall back to graph presence (`is_online`). For components, the host component is `ready` while the gateway is reachable; any other local component is `notReady` when it hosts apps and all of them are offline, and `ready` otherwise (including when it hosts no apps). `PUT /status/{action}` returns `501 Not Implemented` until a substrate plugin registers a `LifecycleProvider` for the entity. Accepted transitions return `202` with a `Location` header pointing back to `GET /status`.
 
 ### Vendor Extension Endpoints
 
@@ -913,6 +931,11 @@ Snapshots are configured via FaultManager parameters:
 | `snapshots.max_message_size` | int | `65536` | Maximum message size in bytes (larger messages skipped) |
 | `snapshots.default_topics` | string[] | `[]` | Topics to capture for all faults |
 | `snapshots.config_file` | string | `""` | Path to YAML config file for `fault_specific` and `patterns` |
+| `snapshots.recapture_cooldown_sec` | double | `60.0` | Min seconds between captures for the same fault code. |
+| `snapshots.max_per_fault` | int | `10` | Max snapshots retained per fault. |
+| `snapshots.capture_pool_size` | int | `2` | Max concurrent capture threads under a fault storm (>= 1). Parallelizes snapshot capture only; rosbag stays single-writer (one fault at a time). |
+| `snapshots.capture_queue_depth` | int | `16` | Max pending captures before the full-queue policy applies (>= 1). |
+| `snapshots.capture_queue_full_policy` | string | `reject_newest` | Policy when the queue is full: `reject_newest` or `drop_oldest`. |
 
 **Topic Resolution Priority:**
 1. `fault_specific` - Exact match for fault code (configured via YAML config file)
@@ -982,9 +1005,12 @@ Rosbag capture is configured via FaultManager parameters. See `config/snapshots.
 | `snapshots.rosbag.enabled` | bool | `false` | Enable/disable rosbag capture |
 | `snapshots.rosbag.duration_sec` | double | `5.0` | Ring buffer duration (seconds before fault) |
 | `snapshots.rosbag.duration_after_sec` | double | `1.0` | Recording duration after fault confirmed |
-| `snapshots.rosbag.topics` | string | `"config"` | Topic selection: `"config"`, `"all"`, or `"explicit"` |
+| `snapshots.rosbag.topics` | string | `"entity"` | Topic selection: `"entity"` (default; faulting node's topics + `/tf`), `"config"`, `"all"`, or `"explicit"` |
+| `snapshots.rosbag.exclude_sensor_topics` | bool | `true` | Auto-exclude image/points/depth/compressed in broad modes (`include_topics` re-adds) |
+| `snapshots.rosbag.qos_match` | bool | `true` | Match each topic's publisher QoS for faithful capture |
 | `snapshots.rosbag.format` | string | `"sqlite3"` | Bag format: `"sqlite3"` or `"mcap"` |
 | `snapshots.rosbag.auto_cleanup` | bool | `true` | Delete bag when fault is cleared |
+| `snapshots.rosbag.max_buffer_mb` | int | `256` | Ring-buffer RAM cap (oldest messages drop past it) |
 | `snapshots.rosbag.max_bag_size_mb` | int | `50` | Max size per bag file |
 | `snapshots.rosbag.max_total_storage_mb` | int | `500` | Total storage limit |
 
@@ -1636,6 +1662,19 @@ Five legacy call sites are currently on the allowlist
 (`sse_fault_handler.cpp`, `trigger_fault_subscriber.cpp`,
 `trigger_topic_subscriber.cpp`, `operation_manager.cpp`,
 `log_manager.cpp`) pending migration to the slot pattern.
+
+## SOVD Compliance
+
+| Requirement     | Status   | Notes                                                                  |
+|-----------------|----------|------------------------------------------------------------------------|
+| REQ_INTEROP_076 | verified | `GET /status` - returns entity lifecycle status from cache or provider |
+| REQ_INTEROP_077 | open (route registered, returns 501) | `PUT /status/start` route registered; returns 501 until a `LifecycleProvider` plugin registers for the entity |
+| REQ_INTEROP_078 | open (route registered, returns 501) | `PUT /status/restart` - same as above                                  |
+| REQ_INTEROP_079 | open (route registered, returns 501) | `PUT /status/force-restart` - same as above                            |
+| REQ_INTEROP_080 | open (route registered, returns 501) | `PUT /status/shutdown` - same as above                                 |
+| REQ_INTEROP_081 | open (route registered, returns 501) | `PUT /status/force-shutdown` - same as above                           |
+
+Requirements 077-081 will be fully verified when a substrate plugin (ROS 2 lifecycle node manager, process supervisor, or container manager) implements the `LifecycleProvider` interface and registers it via the plugin manager.
 
 ## License
 

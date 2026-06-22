@@ -614,6 +614,7 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
     }
 
     std::string base = "/api/v1/components/" + comp.id;
+    detail.status = base + "/status";
     detail.data = base + "/data";
     detail.operations = base + "/operations";
     detail.configurations = base + "/configurations";
@@ -687,8 +688,8 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
 
     using Cap = CapabilityBuilder::Capability;
     std::vector<Cap> caps = {
-        Cap::DATA,  Cap::OPERATIONS, Cap::CONFIGURATIONS,       Cap::FAULTS,  Cap::LOGS, Cap::SUBCOMPONENTS,
-        Cap::HOSTS, Cap::BULK_DATA,  Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+        Cap::STATUS,        Cap::DATA,  Cap::OPERATIONS, Cap::CONFIGURATIONS,       Cap::FAULTS,  Cap::LOGS,
+        Cap::SUBCOMPONENTS, Cap::HOSTS, Cap::BULK_DATA,  Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
     if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
       caps.push_back(Cap::SCRIPTS);
     }
@@ -1027,6 +1028,7 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
     }
 
     std::string base_uri = "/api/v1/apps/" + app.id;
+    detail.status = base_uri + "/status";
     detail.data = base_uri + "/data";
     detail.operations = base_uri + "/operations";
     detail.configurations = base_uri + "/configurations";
@@ -1050,8 +1052,8 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
     }
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::DATA, Cap::OPERATIONS, Cap::CONFIGURATIONS,       Cap::FAULTS,
-                             Cap::LOGS, Cap::BULK_DATA,  Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+    std::vector<Cap> caps = {Cap::STATUS, Cap::DATA,      Cap::OPERATIONS,           Cap::CONFIGURATIONS, Cap::FAULTS,
+                             Cap::LOGS,   Cap::BULK_DATA, Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
     // Relationship endpoints are gated the same way as the top-level URI keys
     // above so the three advertising surfaces (top-level URIs, `_links`,
     // `capabilities` array) describe the same set of available collections.
