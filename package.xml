@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>ros2_medkit_fault_manager</name>
-  <version>0.5.0</version>
+  <version>0.6.0</version>
   <description>Central fault manager node for ros2_medkit fault management system</description>
 
   <maintainer email="bartoszburda93@gmail.com">bburda</maintainer>
@@ -18,15 +18,24 @@
   <depend>nlohmann-json-dev</depend>
   <depend>rosbag2_cpp</depend>
   <depend>rosbag2_storage</depend>
-  <depend>rosbag2_storage_mcap</depend>
+
+  <!-- Runtime deps for the shipped launch file (fault_manager.launch.py) -->
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
+  <!-- mcap is an opt-in storage backend (sqlite3 is the always-shipped default with
+       a runtime fallback); only the rosbag integration test needs the plugin present -->
+  <test_depend>rosbag2_storage_mcap</test_depend>
   <test_depend>ament_cmake_clang_format</test_depend>
   <test_depend>ament_cmake_clang_tidy</test_depend>
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>launch_ros</test_depend>
   <test_depend>launch_testing_ament_cmake</test_depend>
   <test_depend>launch_testing_ros</test_depend>
+  <test_depend>rosbag2_py</test_depend>
   <test_depend>sensor_msgs</test_depend>
   <test_depend>std_msgs</test_depend>
 

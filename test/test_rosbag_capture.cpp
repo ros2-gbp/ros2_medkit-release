@@ -17,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -109,11 +110,75 @@ TEST_F(RosbagCaptureTest, ConstructorWithDisabledRosbag) {
 }
 
 // @verifies REQ_INTEROP_088
-TEST_F(RosbagCaptureTest, ConstructorThrowsOnInvalidFormat) {
+TEST_F(RosbagCaptureTest, ConstructorFallsBackOnUnknownFormat) {
+  // An unknown/unavailable format must NOT terminate the node; it degrades to
+  // sqlite3 (always shipped with rosbag2) and capture stays enabled.
   auto rosbag_config = create_rosbag_config();
   rosbag_config.format = "invalid_format";
   auto snapshot_config = create_snapshot_config();
-  EXPECT_THROW(RosbagCapture(node_.get(), storage_.get(), rosbag_config, snapshot_config), std::runtime_error);
+  std::shared_ptr<RosbagCapture> rb;
+  EXPECT_NO_THROW(rb = std::make_shared<RosbagCapture>(node_.get(), storage_.get(), rosbag_config, snapshot_config));
+  ASSERT_NE(rb, nullptr);
+  EXPECT_TRUE(rb->is_enabled());
+  EXPECT_EQ(rb->config().format, "sqlite3");
+}
+
+// The crash-safety branches below force the storage probe via an injected double,
+// because mcap is installed in CI so the real probe cannot reach them there.
+
+// @verifies REQ_INTEROP_088
+TEST_F(RosbagCaptureTest, ConfiguredFormatUnavailableFallsBackToSqlite3) {
+  // A known format (mcap) whose plugin is unavailable degrades to sqlite3 and
+  // capture stays enabled - the exact scenario the crash-safety change exists for.
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.format = "mcap";
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture::StorageProbeFn probe = [](const std::string & f) -> std::optional<std::string> {
+    if (f == "mcap") {
+      return std::string("simulated: mcap plugin not found");
+    }
+    return std::nullopt;  // sqlite3 usable
+  };
+  std::shared_ptr<RosbagCapture> rb;
+  EXPECT_NO_THROW(
+      rb = std::make_shared<RosbagCapture>(node_.get(), storage_.get(), rosbag_config, snapshot_config, probe));
+  ASSERT_NE(rb, nullptr);
+  EXPECT_TRUE(rb->is_enabled());
+  EXPECT_EQ(rb->config().format, "sqlite3");
+}
+
+// @verifies REQ_INTEROP_088
+TEST_F(RosbagCaptureTest, NoUsableBackendDisablesCaptureWithoutCrashing) {
+  // When neither the configured format nor sqlite3 is usable, capture self-disables
+  // and the node keeps running (no throw out of the constructor).
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.format = "mcap";
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture::StorageProbeFn probe = [](const std::string &) -> std::optional<std::string> {
+    return std::string("simulated: backend unavailable");
+  };
+  std::shared_ptr<RosbagCapture> rb;
+  EXPECT_NO_THROW(
+      rb = std::make_shared<RosbagCapture>(node_.get(), storage_.get(), rosbag_config, snapshot_config, probe));
+  ASSERT_NE(rb, nullptr);
+  EXPECT_FALSE(rb->is_enabled());
+}
+
+// @verifies REQ_INTEROP_088
+TEST_F(RosbagCaptureTest, Sqlite3BaselineUnavailableDisablesCapture) {
+  // When the always-shipped sqlite3 baseline itself fails to load, capture
+  // self-disables rather than crashing the node.
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.format = "sqlite3";
+  auto snapshot_config = create_snapshot_config();
+  RosbagCapture::StorageProbeFn probe = [](const std::string &) -> std::optional<std::string> {
+    return std::string("simulated: rosbag2 base install broken");
+  };
+  std::shared_ptr<RosbagCapture> rb;
+  EXPECT_NO_THROW(
+      rb = std::make_shared<RosbagCapture>(node_.get(), storage_.get(), rosbag_config, snapshot_config, probe));
+  ASSERT_NE(rb, nullptr);
+  EXPECT_FALSE(rb->is_enabled());
 }
 
 // @verifies REQ_INTEROP_088
@@ -235,6 +300,45 @@ TEST_F(RosbagCaptureTest, ExcludeTopicsRespected) {
   rosbag_config.exclude_topics = {"/rosout", "/parameter_events"};
   auto snapshot_config = create_snapshot_config();
   EXPECT_NO_THROW(RosbagCapture(node_.get(), storage_.get(), rosbag_config, snapshot_config));
+}
+
+TEST_F(RosbagCaptureTest, EntityTopicsMode) {
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.topics = "entity";
+  auto snapshot_config = create_snapshot_config();
+  EXPECT_NO_THROW(RosbagCapture(node_.get(), storage_.get(), rosbag_config, snapshot_config));
+}
+
+TEST_F(RosbagCaptureTest, QosMatchDisabledFallsBackToSensorData) {
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.topics = "all";
+  rosbag_config.qos_match = false;
+  auto snapshot_config = create_snapshot_config();
+  EXPECT_NO_THROW(RosbagCapture(node_.get(), storage_.get(), rosbag_config, snapshot_config));
+}
+
+TEST_F(RosbagCaptureTest, SensorTopicsExcludedByDefaultInBroadMode) {
+  auto rosbag_config = create_rosbag_config();
+  rosbag_config.topics = "all";
+  rosbag_config.exclude_sensor_topics = true;
+  auto snapshot_config = create_snapshot_config();
+  EXPECT_NO_THROW(RosbagCapture(node_.get(), storage_.get(), rosbag_config, snapshot_config));
+}
+
+TEST(RosbagHighBandwidthTopicTest, MatchesSensorStreamsButNotLookalikes) {
+  // High-bandwidth sensor streams are classified as such.
+  EXPECT_TRUE(RosbagCapture::is_high_bandwidth_topic("/camera/image_raw"));
+  EXPECT_TRUE(RosbagCapture::is_high_bandwidth_topic("/image"));
+  EXPECT_TRUE(RosbagCapture::is_high_bandwidth_topic("/points"));
+  EXPECT_TRUE(RosbagCapture::is_high_bandwidth_topic("/camera/depth/points"));
+  EXPECT_TRUE(RosbagCapture::is_high_bandwidth_topic("/camera/image_raw/compressed"));
+
+  // Low-bandwidth lookalikes that merely contain the word must NOT be excluded.
+  EXPECT_FALSE(RosbagCapture::is_high_bandwidth_topic("/waypoints"));
+  EXPECT_FALSE(RosbagCapture::is_high_bandwidth_topic("/setpoints"));
+  EXPECT_FALSE(RosbagCapture::is_high_bandwidth_topic("/keypoints"));
+  EXPECT_FALSE(RosbagCapture::is_high_bandwidth_topic("/joint_states"));
+  EXPECT_FALSE(RosbagCapture::is_high_bandwidth_topic("/cmd_vel"));
 }
 
 // Fault lifecycle tests
