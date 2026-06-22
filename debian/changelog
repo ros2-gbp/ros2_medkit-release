@@ -1,0 +1,54 @@
+ros-lyrical-ros2-medkit-msgs (0.6.0-1resolute) resolute; urgency=high
+
+  * No functional changes; version bump for the coordinated 0.6.0 release.
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Sun, 21 Jun 2026 22:00:00 -0000
+
+ros-lyrical-ros2-medkit-msgs (0.5.0-1resolute) resolute; urgency=high
+
+  * New service definitions ``ListEntities.srv``, ``GetEntityData.srv``, ``GetCapabilities.srv`` and the ``EntityInfo.msg`` type for exposing the entity tree over ROS 2 services (#330 <https://github.com/selfpatch/ros2_medkit/issues/330>)
+  * ``ClearFault.srv`` request gains a ``bool skip_correlation_auto_clear`` field so callers can opt out of cascade-clearing correlated symptom fault codes; out-of-tree callers must rebuild against the new message (#395 <https://github.com/selfpatch/ros2_medkit/issues/395>)
+  * Contributors: @bburda, @mfaferek93
+
+ -- "bburda" <bartoszburda93@gmail.com>  Sun, 07 Jun 2026 22:00:00 -0000
+
+ros-lyrical-ros2-medkit-msgs (0.4.0-1resolute) resolute; urgency=high
+
+  * ``MedkitDiscoveryHint`` message type for beacon discovery publishers
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Thu, 19 Mar 2026 23:00:00 -0000
+
+ros-lyrical-ros2-medkit-msgs (0.3.0-1resolute) resolute; urgency=high
+
+  * Multi-distro CI support for ROS 2 Humble, Jazzy, and Rolling (#219 <https://github.com/selfpatch/ros2_medkit/pull/219>, #242 <https://github.com/selfpatch/ros2_medkit/pull/242>)
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Thu, 26 Feb 2026 23:00:00 -0000
+
+ros-lyrical-ros2-medkit-msgs (0.2.0-1resolute) resolute; urgency=high
+
+  * Initial rosdistro release
+  * Fault management messages:
+    
+      * Fault.msg - Core fault data model with severity levels (INFO/WARN/ERROR/CRITICAL)
+        and debounce-based status lifecycle (PREFAILED/PREPASSED/CONFIRMED/HEALED/CLEARED)
+      * FaultEvent.msg - Real-time event notifications (EVENT_CONFIRMED/EVENT_CLEARED/EVENT_UPDATED)
+        with auto-cleared correlation codes
+      * MutedFaultInfo.msg - Fault correlation muting metadata
+      * ClusterInfo.msg - Fault clustering information
+    
+  * Fault management services:
+    
+      * ReportFault.srv - Report fault events with FAILED/PASSED event model
+      * GetFaults.srv - Query faults with filtering by severity, status, and correlation data
+      * ClearFault.srv - Clear/acknowledge faults by fault_code
+      * GetSnapshots.srv - Retrieve topic snapshots captured at fault time
+      * GetRosbag.srv - Retrieve rosbag recordings associated with faults
+    
+  * Contributors: Bartosz Burda, Michal Faferek
+
+ -- "bburda" <bartoszburda93@gmail.com>  Fri, 06 Feb 2026 23:00:00 -0000
+
+
