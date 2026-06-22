@@ -168,6 +168,9 @@ Basic Snapshot Settings
          config_file: ""                   # Path to YAML config file
          recapture_cooldown_sec: 60.0      # Min seconds between snapshot captures per fault
          max_per_fault: 10                 # Max snapshots stored per fault code (0 = unlimited)
+         capture_pool_size: 2              # Max concurrent capture threads (>= 1)
+         capture_queue_depth: 16           # Max pending captures before policy applies (>= 1)
+         capture_queue_full_policy: reject_newest  # reject_newest | drop_oldest
 
 .. list-table::
    :header-rows: 1
@@ -202,6 +205,18 @@ Basic Snapshot Settings
      - ``10``
      - Maximum number of snapshots stored per fault code. When the limit is reached,
        new snapshots for that fault are rejected. Set to 0 for unlimited.
+   * - ``snapshots.capture_pool_size``
+     - ``2``
+     - Max concurrent capture threads under a fault storm (>= 1). The capture pool is
+       shared and created when snapshots **or** rosbag is enabled, so these parameters
+       bound both. ``capture_pool_size`` parallelizes freeze-frame snapshot capture
+       only; rosbag is single-writer and records one fault at a time regardless.
+   * - ``snapshots.capture_queue_depth``
+     - ``16``
+     - Max pending captures before the full-queue policy applies (>= 1).
+   * - ``snapshots.capture_queue_full_policy``
+     - ``reject_newest``
+     - Policy when the queue is full: ``reject_newest`` or ``drop_oldest``.
 
 Rosbag Recording
 ~~~~~~~~~~~~~~~~
@@ -217,12 +232,15 @@ Capture continuous rosbag recordings around fault events.
            enabled: false                  # Enable rosbag recording
            duration_sec: 5.0               # Pre-fault buffer duration
            duration_after_sec: 1.0         # Post-fault recording duration
-           topics: "config"                # Topic selection: "config", "all", or "none"
+           topics: "entity"                # Topic selection: "entity" (default), "config", "all", "explicit"
            include_topics: []              # Additional topics to include
            exclude_topics: []              # Topics to exclude
+           exclude_sensor_topics: true     # Auto-exclude image/points/depth/compressed in broad modes
            lazy_start: false               # Start recording on first fault
            format: "sqlite3"               # Storage format
+           qos_match: true                 # Match each topic's publisher QoS
            storage_path: ""                # Custom storage path
+           max_buffer_mb: 256              # Ring-buffer RAM cap
            max_bag_size_mb: 50             # Max size per bag file
            max_total_storage_mb: 500       # Max total storage
            auto_cleanup: true              # Auto-delete old bags
@@ -244,8 +262,21 @@ Capture continuous rosbag recordings around fault events.
      - ``1.0``
      - How long to record after fault.
    * - ``rosbag.topics``
-     - ``config``
-     - Topic selection mode: ``config`` (per-fault), ``all``, or ``none``.
+     - ``entity``
+     - Topic selection mode: ``entity`` (default; write only the faulting node's
+       topics + ``/tf``), ``config`` (per-fault), ``all``, or ``explicit``.
+   * - ``rosbag.exclude_sensor_topics``
+     - ``true``
+     - In broad modes (``all``/``entity``), auto-exclude high-bandwidth sensor
+       topics (image/points/depth/compressed) to bound memory. Excluded topics are
+       dropped silently; ``include_topics`` re-adds any you need.
+   * - ``rosbag.qos_match``
+     - ``true``
+     - Subscribe with each topic's publisher-offered QoS for faithful capture
+       instead of forcing best-effort.
+   * - ``rosbag.max_buffer_mb``
+     - ``256``
+     - Ring-buffer RAM cap; oldest buffered messages drop past it.
    * - ``rosbag.lazy_start``
      - ``false``
      - Start recording only when first fault occurs.
