@@ -83,6 +83,22 @@ Bridge node that converts ROS 2 /diagnostics messages to FaultManager faults.
 .. doxygenclass:: ros2_medkit_diagnostic_bridge::DiagnosticBridgeNode
    :members:
 
+ros2_medkit_log_bridge
+----------------------
+
+Bridge node that promotes ROS 2 /rosout log entries to FaultManager faults.
+
+.. doxygenclass:: ros2_medkit_log_bridge::LogBridgeNode
+   :members:
+
+ros2_medkit_action_status_bridge
+--------------------------------
+
+Bridge node that turns terminal ROS 2 action goal states into FaultManager faults.
+
+.. doxygenclass:: ros2_medkit_action_status_bridge::ActionStatusBridgeNode
+   :members:
+
 ros2_medkit_serialization
 -------------------------
 
