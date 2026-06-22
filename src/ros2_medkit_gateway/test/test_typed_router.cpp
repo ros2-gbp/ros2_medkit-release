@@ -19,11 +19,13 @@
 #include <variant>
 
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
+#include "ros2_medkit_gateway/dto/faults.hpp"
 #include "ros2_medkit_gateway/http/typed_router.hpp"
 
 namespace {
 
 using ros2_medkit_gateway::ErrorInfo;
+using ros2_medkit_gateway::dto::FaultListQuery;
 using ros2_medkit_gateway::http::Forwarded;
 using ros2_medkit_gateway::http::NoContent;
 using ros2_medkit_gateway::http::ResponseAttachments;
@@ -154,6 +156,52 @@ TEST(TypedRouter_TypedRequest, QueryParamReturnsValueWhenPresent) {
   ASSERT_TRUE(wrapper.query_param("context").has_value());
   EXPECT_EQ(*wrapper.query_param("context"), "my.logger");
   EXPECT_FALSE(wrapper.query_param("limit").has_value());
+}
+
+TEST(TypedRouter_TypedRequest, TypedQueryParsesPresentParamsIntoDto) {
+  httplib::Request req;
+  req.path = "/api/v1/faults";
+  req.params.emplace("status", "confirmed");
+  req.params.emplace("include_muted", "true");
+  TypedRequest wrapper(req);
+
+  const auto q = wrapper.query<FaultListQuery>();
+  ASSERT_TRUE(q.status.has_value());
+  EXPECT_EQ(*q.status, "confirmed");
+  EXPECT_TRUE(q.include_muted);
+  EXPECT_FALSE(q.include_clusters);  // absent boolean -> default false
+}
+
+TEST(TypedRouter_TypedRequest, TypedQueryLeavesAbsentParamsAtDefault) {
+  httplib::Request req;
+  req.path = "/api/v1/faults";
+  TypedRequest wrapper(req);
+
+  const auto q = wrapper.query<FaultListQuery>();
+  EXPECT_FALSE(q.status.has_value());
+  EXPECT_FALSE(q.include_muted);
+  EXPECT_FALSE(q.include_clusters);
+}
+
+TEST(TypedRouter_TypedRequest, TypedQueryParsesBooleanSpellings) {
+  // The schema advertises type: boolean; "true"/"1" (case-insensitive) are
+  // truthy, every other spelling - including "0", "false", and an empty
+  // flag-style value - parses as false.
+  auto parse_include_muted = [](const char * value) {
+    httplib::Request req;
+    req.path = "/api/v1/faults";
+    req.params.emplace("include_muted", value);
+    return TypedRequest(req).query<FaultListQuery>().include_muted;
+  };
+
+  EXPECT_TRUE(parse_include_muted("true"));
+  EXPECT_TRUE(parse_include_muted("TRUE"));
+  EXPECT_TRUE(parse_include_muted("True"));
+  EXPECT_TRUE(parse_include_muted("1"));
+  EXPECT_FALSE(parse_include_muted("false"));
+  EXPECT_FALSE(parse_include_muted("0"));
+  EXPECT_FALSE(parse_include_muted(""));
+  EXPECT_FALSE(parse_include_muted("yes"));
 }
 
 TEST(TypedRouter_TypedRequest, FanOutDisabledTrueOnlyWhenHeaderPresent) {
