@@ -90,6 +90,17 @@ Configure snapshot capture via fault manager parameters:
      - ``10``
      - Maximum number of snapshots stored per fault code. When the limit is reached,
        new snapshots for that fault are rejected. Set to 0 for unlimited.
+   * - ``snapshots.capture_pool_size``
+     - ``2``
+     - Max concurrent capture threads under a fault storm (>= 1). This parallelizes
+       freeze-frame snapshot capture only; rosbag capture is single-writer and
+       records one fault at a time regardless of this value.
+   * - ``snapshots.capture_queue_depth``
+     - ``16``
+     - Max pending captures before the full-queue policy applies (>= 1).
+   * - ``snapshots.capture_queue_full_policy``
+     - ``reject_newest``
+     - Policy when the queue is full: ``reject_newest`` or ``drop_oldest``.
 
 Advanced Configuration
 ----------------------
@@ -332,12 +343,27 @@ Rosbag Configuration Options
      - Post-fault recording duration. After a fault is confirmed, recording
        continues for this many seconds to capture immediate system response.
    * - ``snapshots.rosbag.topics``
-     - ``"config"``
+     - ``"entity"``
      - Topic selection mode:
 
+       - ``"entity"`` - Default. Subscribe broadly for pre-roll, but on fault
+         confirmation write only the faulting source node's topics (resolved from
+         the fault's reporting source) plus ``/tf`` and ``/tf_static``. Falls back
+         to the full buffer if the source is not a live node.
        - ``"config"`` - Use same topics as JSON snapshots (from config file)
        - ``"all"`` or ``"auto"`` - Auto-discover and record all available topics
        - ``"explicit"`` - Use only topics from ``include_topics`` list
+
+       .. note::
+
+          The default changed from ``"config"`` to ``"entity"`` so an enabled black
+          box produces a useful, fault-scoped bag with no per-topic configuration.
+          Set ``topics: "config"`` to restore the previous behavior.
+
+          Faults reported by the ``diagnostic_bridge`` carry the bridge's own node
+          as the source, so in ``entity`` mode the bag is scoped to the bridge
+          (e.g. ``/diagnostics``) rather than the node that actually failed. Use a
+          manual mode if you need a different scope for bridge-sourced faults.
    * - ``snapshots.rosbag.include_topics``
      - ``[]``
      - Explicit list of topics to record (only used when ``topics: "explicit"``).
@@ -346,6 +372,19 @@ Rosbag Configuration Options
      - ``[]``
      - Topics to exclude from recording (applies to all modes). Useful for
        filtering high-bandwidth topics like camera images.
+   * - ``snapshots.rosbag.exclude_sensor_topics``
+     - ``true``
+     - In broad modes (``all``/``entity``), auto-exclude high-bandwidth sensor
+       topics (image/points/depth/compressed) to bound memory. Dropped silently;
+       ``include_topics`` re-adds any you specifically need.
+   * - ``snapshots.rosbag.qos_match``
+     - ``true``
+     - Subscribe with each topic's publisher-offered QoS (reliable/transient-local
+       where offered) for faithful capture, instead of forcing best-effort.
+   * - ``snapshots.rosbag.max_buffer_mb``
+     - ``256``
+     - In-memory ring-buffer cap; oldest buffered messages drop once exceeded, so a
+       broad subscribe set cannot grow memory without bound.
    * - ``snapshots.rosbag.format``
      - ``"sqlite3"``
      - Bag storage format: ``"sqlite3"`` (default, widely compatible) or
@@ -454,7 +493,16 @@ Saves resources but may miss context if fault confirms before buffer fills.
 .. note::
 
    The ``"mcap"`` format requires ``rosbag2_storage_mcap`` to be installed.
-   If not available, use ``"sqlite3"`` (default).
+   ``"sqlite3"`` (the default) is always shipped with rosbag2 and needs no extra
+   package.
+
+   You do not have to switch formats manually: if a configured backend's plugin
+   is unavailable at startup, the FaultManager logs a warning naming the missing
+   package and automatically falls back to ``"sqlite3"`` for black-box capture.
+   If no storage backend is usable at all, rosbag capture self-disables (the node
+   keeps running and freeze-frame snapshots are unaffected) instead of crashing.
+
+   To use mcap (e.g. for Foxglove), install the plugin:
 
    .. code-block:: bash
 
