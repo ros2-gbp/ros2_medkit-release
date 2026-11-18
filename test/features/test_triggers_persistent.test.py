@@ -36,8 +36,8 @@ import time
 import unittest
 
 from launch import LaunchDescription
-from launch.actions import TimerAction
-import launch_ros.actions
+from launch.actions import ExecuteProcess, RegisterEventHandler, TimerAction
+from launch.event_handlers import OnProcessExit
 import launch_testing
 import launch_testing.actions
 import requests
@@ -48,7 +48,7 @@ from ros2_medkit_test_utils.constants import (
     get_test_port,
 )
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
-from ros2_medkit_test_utils.launch_helpers import create_demo_nodes
+from ros2_medkit_test_utils.launch_helpers import create_demo_nodes, create_gateway_node
 
 # ---------------------------------------------------------------------------
 # Port layout (stride-10 slot from CMake)
@@ -68,24 +68,33 @@ DB_PATH = os.path.join(
     f'test_triggers_persist_{os.getpid()}.db',
 )
 
+# The secondary gateway stands in for a restart, and a restart only restores
+# what the store already held: ``load_persistent_triggers()`` runs once, while
+# the gateway is being constructed. So the secondary must not be started until
+# the trigger exists in the shared DB, and the only thing that knows when that
+# is true is the test that created it. This path is the handshake - test_01
+# creates it, and the secondary's start is chained to a process that waits for
+# it - so the order is a consequence of the work rather than of how long
+# ``setUpClass`` happened to take.
+GATE_PATH = os.path.join(
+    tempfile.gettempdir(),
+    f'test_triggers_persist_gate_{os.getpid()}',
+)
+
 APP_ID = 'temp_sensor'
 RESOURCE_URI = f'/api/v1/apps/{APP_ID}/faults'
 
 
 def _make_gateway_node(port, *, on_restart_behavior):
     """Return a gateway_node launch action for the given port and DB path."""
-    return launch_ros.actions.Node(
-        package='ros2_medkit_gateway',
-        executable='gateway_node',
+    return create_gateway_node(
         name=f'ros2_medkit_gateway_{port}',
-        output='screen',
-        parameters=[{
-            'refresh_interval_ms': 1000,
-            'server.port': port,
+        port=port,
+        extra_params={
             'triggers.enabled': True,
             'triggers.storage.path': DB_PATH,
             'triggers.on_restart_behavior': on_restart_behavior,
-        }],
+        },
     )
 
 
@@ -103,17 +112,20 @@ def generate_test_description():
         actions=demo + [launch_testing.actions.ReadyToTest()],
     )
 
-    # Secondary gateway delayed 25s - tests 01-02 create the trigger on
-    # primary first, then secondary starts and loads it from shared DB.
-    # This simulates a gateway restart: primary creates trigger -> "restart"
-    # (secondary starts with same DB) -> secondary loads persistent triggers.
-    delayed_secondary = TimerAction(
-        period=25.0,
-        actions=[secondary],
+    # The secondary starts when the gate file appears, never on a clock: it
+    # simulates a gateway restart, and a restart that happens before the
+    # trigger is created restores nothing.
+    gate = ExecuteProcess(
+        cmd=['sh', '-c', f'while [ ! -e "{GATE_PATH}" ]; do sleep 0.2; done'],
+        name='secondary_start_gate',
+        output='screen',
+    )
+    gated_secondary = RegisterEventHandler(
+        OnProcessExit(target_action=gate, on_exit=[secondary]),
     )
 
     return (
-        LaunchDescription([primary, delayed_secondary, delayed_demo]),
+        LaunchDescription([primary, gate, gated_secondary, delayed_demo]),
         {'primary': primary, 'secondary': secondary},
     )
 
@@ -121,6 +133,15 @@ def generate_test_description():
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _remove_gate():
+    """Drop the gate file so a rerun does not inherit an open gate."""
+    if os.path.exists(GATE_PATH):
+        try:
+            os.unlink(GATE_PATH)
+        except OSError:
+            pass
+
 
 def _wait_for_health(base_url, *, timeout=30.0):
     """Poll /health until 200 or timeout."""
@@ -178,7 +199,11 @@ class TestTriggersPersistent(GatewayTestCase):
         _wait_for_app(BASE_URL_PRIMARY, APP_ID, timeout=60.0)
         # Allow a few discovery refresh cycles so the entity is stable
         time.sleep(3.0)
-        # Secondary gateway starts later (25s delay) - waited in test_03
+        # The secondary is not running yet: it starts once test_01 opens the
+        # gate, and test_03 waits for it there. The gate file is dropped at the
+        # end of the class so a rerun in the same temp directory cannot inherit
+        # an open one.
+        cls.addClassCleanup(_remove_gate)
 
     # ------------------------------------------------------------------
     # Test 01: create a persistent trigger on the PRIMARY gateway
@@ -214,6 +239,12 @@ class TestTriggersPersistent(GatewayTestCase):
 
         # Stash the ID for subsequent tests.
         TestTriggersPersistent._trigger_id = trig['id']
+
+        # The persistent trigger is now a row in the shared store, which is the
+        # precondition the secondary's restore path needs. Opening the gate
+        # starts it.
+        with open(GATE_PATH, 'w', encoding='utf-8') as gate:
+            gate.write(trig['id'])
 
     # ------------------------------------------------------------------
     # Test 02: trigger is listed on the PRIMARY gateway
@@ -253,8 +284,8 @@ class TestTriggersPersistent(GatewayTestCase):
             'test_01 must set _trigger_id before test_03 runs',
         )
 
-        # Wait for the secondary gateway to start (delayed 25s from launch)
-        # and discover the entity.
+        # The secondary starts only after test_01 opened the gate, so this is
+        # the first point at which it can be up at all.
         _wait_for_health(BASE_URL_SECONDARY, timeout=60.0)
         _wait_for_app(BASE_URL_SECONDARY, APP_ID, timeout=30.0)
         time.sleep(2.0)  # Allow discovery to stabilize
@@ -396,9 +427,13 @@ class TestShutdown(unittest.TestCase):
                 f'{info.process_name} exited with code {info.returncode}',
             )
 
-        # Clean up the shared SQLite DB if it was created.
-        if os.path.exists(DB_PATH):
-            try:
-                os.unlink(DB_PATH)
-            except OSError:
-                pass
+        # Clean up the shared SQLite DB if it was created. SQLite in WAL mode
+        # writes two sidecars next to it, and a run that leaves them behind
+        # leaves state a later run can find.
+        for path in (DB_PATH, f'{DB_PATH}-wal', f'{DB_PATH}-shm'):
+            if os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+        _remove_gate()
