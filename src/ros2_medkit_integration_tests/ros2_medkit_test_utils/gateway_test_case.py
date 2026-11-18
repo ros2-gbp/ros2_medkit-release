@@ -392,11 +392,11 @@ class GatewayTestCase(unittest.TestCase):
         response = requests.get(
             f'{self.BASE_URL}{endpoint}', timeout=timeout, **kwargs
         )
-        self.assertEqual(
-            response.status_code,
-            expected_status,
-            f'GET {endpoint} returned {response.status_code}: {response.text}',
-        )
+        # Only the head of the body, as UTF-8: response.text guesses the charset
+        # of a large binary download for minutes.
+        if response.status_code != expected_status:
+            head = response.content[:1024].decode('utf-8', errors='replace')
+            self.fail(f'GET {endpoint} returned {response.status_code}: {head}')
         return response
 
     def put_raw(self, endpoint, data, *, timeout=10, expected_status=200, **kwargs):
@@ -845,6 +845,63 @@ class GatewayTestCase(unittest.TestCase):
             f'{entity_endpoint}/operations within {max_wait}s'
         )
 
+    def wait_for_operation_type_info(
+        self, entity_endpoint, operation_id, required_keys, *, max_wait=15.0
+    ):
+        """Wait until an operation exposes a resolved ``type_info`` schema.
+
+        An operation appears under ``/operations`` as soon as it is discovered
+        by name, but its ``x-medkit.type_info`` is only populated once the
+        gateway has resolved the underlying ROS interface type: while
+        ``ros2.type`` is still empty, or the type-introspection lookup has not
+        yet loaded the type, the handler omits ``type_info`` entirely. Polling
+        the operation-name endpoint alone (``wait_for_operation``) races that
+        second resolution step, so wait until ``type_info`` actually carries the
+        expected schema keys (``goal``/``result``/``feedback`` for an action,
+        ``request``/``response`` for a service) before asserting on it.
+
+        Parameters
+        ----------
+        entity_endpoint : str
+            Entity path relative to ``BASE_URL`` (e.g. ``'/apps/long_calibration'``).
+        operation_id : str
+            The operation ID (matched against each item's ``id`` or ``name``).
+        required_keys : iterable of str
+            Schema keys that must all be present in ``type_info``.
+        max_wait : float
+            Maximum time to wait in seconds.
+
+        Returns
+        -------
+        dict
+            The operation item whose ``type_info`` carries all *required_keys*.
+
+        Raises
+        ------
+        AssertionError
+            If no such operation is found within *max_wait*.
+
+        """
+        required = tuple(required_keys)
+
+        def _resolved(data):
+            for op in data.get('items', []):
+                if op.get('id') != operation_id and op.get('name') != operation_id:
+                    continue
+                type_info = op.get('x-medkit', {}).get('type_info')
+                if isinstance(type_info, dict) and all(
+                    key in type_info for key in required
+                ):
+                    return op
+            return None
+
+        return self.poll_endpoint_until(
+            f'{entity_endpoint}/operations',
+            _resolved,
+            timeout=max_wait,
+            interval=0.5,
+        )
+
     def wait_for_data_item(self, entity_endpoint, direction, *, timeout=10.0):
         """Poll entity data until an item with the given direction appears.
 
@@ -1022,3 +1079,47 @@ class GatewayTestCase(unittest.TestCase):
         # Remove leading slash and encode the rest
         topic_path = topic_path[1:]
         return quote(topic_path, safe='')
+
+    def assert_declared_media_type(
+        self, served_content_type, declared_content, *, where, exact,
+    ):
+        """Assert a served ``Content-Type`` is one the document declares.
+
+        The Tier-2 half of the media-type contract: the OpenAPI ``content``
+        keys for a response are only worth anything if the bytes on the wire
+        actually arrive under one of them.
+
+        Parameters
+        ----------
+        served_content_type : str
+            Raw ``Content-Type`` response header. Any parameters
+            (``; charset=...``, ``; boundary=...``) are stripped before
+            matching, since OpenAPI ``content`` keys carry none.
+        declared_content : dict
+            The operation's ``responses[code]['content']`` mapping.
+        where : str
+            Human-readable location for the failure message.
+        exact : bool
+            ``True`` requires a named media-type key and explicitly rejects a
+            match that only succeeds via the ``*/*`` catch-all - that is what
+            keeps the derivable half of an open set from silently degrading
+            into "the wildcard covers it". ``False`` accepts the catch-all and
+            asserts it is present, which is the open half of the same set.
+
+        """
+        media_type = served_content_type.split(';')[0].strip().lower()
+        declared = {k.lower() for k in declared_content}
+        self.assertTrue(
+            declared, f'{where}: response declares no content at all')
+        if exact:
+            self.assertIn(
+                media_type, declared,
+                f'{where}: served {media_type!r}, which the document does not name '
+                f'(declares {sorted(declared)}). A wildcard does not count here - '
+                'this type is derivable from the code and must be declared.',
+            )
+            return
+        self.assertTrue(
+            media_type in declared or '*/*' in declared,
+            f'{where}: served {media_type!r}, not covered by {sorted(declared)}',
+        )

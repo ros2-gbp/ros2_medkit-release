@@ -83,7 +83,7 @@ class DocsHandlersTest : public ::testing::Test {
     AuthConfig auth_config;
     TlsConfig tls_config;
 
-    ctx_ = std::make_unique<handlers::HandlerContext>(node_.get(), cors_config, auth_config, tls_config, nullptr);
+    ctx_ = std::make_unique<handlers::HandlerContext>(*node_, cors_config, auth_config, tls_config, nullptr);
 
     route_registry_ = std::make_unique<openapi::RouteRegistry>();
     populate_docs_test_routes(*route_registry_);
@@ -109,17 +109,16 @@ TEST_F(DocsHandlersTest, DocsDisabledReturns501) {
   // Override docs.enabled to false (GatewayNode already declares it as true by default)
   node_->set_parameter(rclcpp::Parameter("docs.enabled", false));
 
-  handlers::DocsHandlers docs_handlers(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get());
+  handlers::DocsHandlers docs_handlers(
+      *ctx_, node_->get_plugin_manager(), route_registry_.get(), node_->get_parameter("docs.enabled").as_bool(),
+      node_->get_parameter("server.host").as_string(), node_->get_parameter("server.port").as_int());
 
   httplib::Request req;
-  httplib::Response res;
+  auto result = docs_handlers.handle_docs_root(http::TypedRequest(req));
 
-  docs_handlers.handle_docs_root(req, res);
-
-  EXPECT_EQ(res.status, 501);
-
-  auto body = nlohmann::json::parse(res.body);
-  EXPECT_TRUE(body.contains("error_code"));
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 501);
+  EXPECT_FALSE(result.error().code.empty());
 }
 
 // =============================================================================
@@ -128,17 +127,15 @@ TEST_F(DocsHandlersTest, DocsDisabledReturns501) {
 
 // @verifies REQ_INTEROP_002
 TEST_F(DocsHandlersTest, DocsRootReturnsValidJson) {
-  handlers::DocsHandlers docs_handlers(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get());
+  handlers::DocsHandlers docs_handlers(
+      *ctx_, node_->get_plugin_manager(), route_registry_.get(), node_->get_parameter("docs.enabled").as_bool(),
+      node_->get_parameter("server.host").as_string(), node_->get_parameter("server.port").as_int());
 
   httplib::Request req;
-  httplib::Response res;
+  auto result = docs_handlers.handle_docs_root(http::TypedRequest(req));
 
-  docs_handlers.handle_docs_root(req, res);
-
-  // send_json does not set res.status (httplib server framework does that),
-  // so verify the response body contains a valid OpenAPI spec
-  ASSERT_FALSE(res.body.empty());
-  auto body = nlohmann::json::parse(res.body);
+  ASSERT_TRUE(result.has_value()) << result.error().message;
+  auto body = nlohmann::json::parse(result.value());
   EXPECT_EQ(body["openapi"], "3.1.0");
   EXPECT_TRUE(body.contains("info"));
   EXPECT_TRUE(body.contains("paths"));
@@ -150,13 +147,56 @@ TEST_F(DocsHandlersTest, DocsRootReturnsValidJson) {
   EXPECT_TRUE(body["paths"].contains("/apps"));
 }
 
+// The handler answers with text now, and `docs_endpoint` writes that text
+// straight out instead of dumping a DOM. That is only wire-compatible while
+// the text is exactly what `write_json_body` would have produced, which is
+// `dump(2)`. Re-dumping the parse and comparing is the mechanical check:
+// indent width, key order and separators all have to agree.
+TEST_F(DocsHandlersTest, DocsRootBodyIsTheSameBytesADomWouldHaveWritten) {
+  handlers::DocsHandlers docs_handlers(
+      *ctx_, node_->get_plugin_manager(), route_registry_.get(), node_->get_parameter("docs.enabled").as_bool(),
+      node_->get_parameter("server.host").as_string(), node_->get_parameter("server.port").as_int());
+
+  httplib::Request req;
+  auto result = docs_handlers.handle_docs_root(http::TypedRequest(req));
+
+  ASSERT_TRUE(result.has_value()) << result.error().message;
+  EXPECT_EQ(result.value(), nlohmann::json::parse(result.value()).dump(2));
+}
+
+// Same contract on the scoped route, which reaches the response through
+// `write_json_text` rather than through the typed router.
+TEST_F(DocsHandlersTest, DocsAnyPathBodyIsTheSameBytesADomWouldHaveWritten) {
+  handlers::DocsHandlers docs_handlers(
+      *ctx_, node_->get_plugin_manager(), route_registry_.get(), node_->get_parameter("docs.enabled").as_bool(),
+      node_->get_parameter("server.host").as_string(), node_->get_parameter("server.port").as_int());
+
+  httplib::Request req;
+  httplib::Response res;
+  req.path = "/api/v1/apps/docs";
+  std::regex pattern(R"(/api/v1/(.*)/docs)");
+  std::smatch match;
+  std::regex_match(req.path, match, pattern);
+  req.matches = match;
+
+  docs_handlers.handle_docs_any_path(req, res);
+
+  ASSERT_EQ(res.status, 200);
+  EXPECT_EQ(res.body, nlohmann::json::parse(res.body).dump(2));
+  // The header a JSON client selects on. Serving pre-serialized text must not
+  // have moved it.
+  EXPECT_EQ(res.get_header_value("Content-Type"), "application/json");
+}
+
 // =============================================================================
 // Entity collection path returns 200 (happy path)
 // =============================================================================
 
 // @verifies REQ_INTEROP_002
 TEST_F(DocsHandlersTest, DocsAnyPathReturns200ForEntityCollection) {
-  handlers::DocsHandlers docs_handlers(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get());
+  handlers::DocsHandlers docs_handlers(
+      *ctx_, node_->get_plugin_manager(), route_registry_.get(), node_->get_parameter("docs.enabled").as_bool(),
+      node_->get_parameter("server.host").as_string(), node_->get_parameter("server.port").as_int());
 
   httplib::Request req;
   httplib::Response res;
@@ -190,7 +230,9 @@ TEST_F(DocsHandlersTest, DocsAnyPathReturns200ForEntityCollection) {
 
 // @verifies REQ_INTEROP_002
 TEST_F(DocsHandlersTest, DocsAnyPathReturns404ForInvalidPath) {
-  handlers::DocsHandlers docs_handlers(*ctx_, *node_, node_->get_plugin_manager(), route_registry_.get());
+  handlers::DocsHandlers docs_handlers(
+      *ctx_, node_->get_plugin_manager(), route_registry_.get(), node_->get_parameter("docs.enabled").as_bool(),
+      node_->get_parameter("server.host").as_string(), node_->get_parameter("server.port").as_int());
 
   httplib::Request req;
   httplib::Response res;
