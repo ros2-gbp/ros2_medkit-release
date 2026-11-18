@@ -19,7 +19,6 @@
 #include <iomanip>
 #include <memory>
 #include <nlohmann/json.hpp>
-#include <rclcpp/rclcpp.hpp>
 #include <set>
 #include <sstream>
 #include <string>
@@ -30,8 +29,10 @@
 #include "ros2_medkit_gateway/core/auth/auth_config.hpp"
 #include "ros2_medkit_gateway/core/auth/auth_manager.hpp"
 #include "ros2_medkit_gateway/core/config.hpp"
+#include "ros2_medkit_gateway/core/gateway_services.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/logging.hpp"
 #include "ros2_medkit_gateway/core/models/entity_capabilities.hpp"
 #include "ros2_medkit_gateway/core/models/entity_types.hpp"
 #include "ros2_medkit_gateway/core/models/error_info.hpp"
@@ -101,7 +102,6 @@ struct EntityInfo {
 };
 
 // Forward declarations
-class GatewayNode;
 class AuthManager;
 class BulkDataStore;
 class AggregationManager;
@@ -109,16 +109,32 @@ class AggregationManager;
 namespace handlers {
 
 /**
+ * @brief Where a request addressed to one member of an aggregating entity is
+ *        served.
+ *
+ * An aggregating entity - a merged Function, an Area, a Component with members -
+ * has no resources of its own; it lists what its members provide, under ids that
+ * name the member. Such an entity is deliberately absent from the routing table,
+ * because routing it whole to one peer would discard every member the other
+ * contributors hold. The member, however, has exactly one owner, and that owner
+ * is the only gateway whose ROS graph carries the topic or service behind the id.
+ */
+enum class MemberDispatch {
+  kServeLocally,  ///< This gateway owns the member; the handler continues.
+  kForwarded,     ///< The owning peer answered; the wire is committed.
+};
+
+/**
  * @brief Shared context for all HTTP handlers
  *
- * Provides access to gateway node, configuration, and common utilities
+ * Provides access to the gateway services, configuration, and common utilities
  * that handlers need to process requests.
  */
 class HandlerContext {
  public:
-  HandlerContext(GatewayNode * node, const CorsConfig & cors_config, const AuthConfig & auth_config,
+  HandlerContext(GatewayServices & services, const CorsConfig & cors_config, const AuthConfig & auth_config,
                  const TlsConfig & tls_config, AuthManager * auth_manager, BulkDataStore * bulk_data_store = nullptr)
-    : node_(node)
+    : services_(services)
     , cors_config_(cors_config)
     , auth_config_(auth_config)
     , tls_config_(tls_config)
@@ -126,9 +142,9 @@ class HandlerContext {
     , bulk_data_store_(bulk_data_store) {
   }
 
-  /// Get gateway node
-  GatewayNode * node() const {
-    return node_;
+  /// Get the gateway services
+  GatewayServices & services() const {
+    return services_;
   }
 
   /// Get CORS configuration
@@ -266,6 +282,38 @@ class HandlerContext {
                                                               const std::string & entity_id) const;
 
   /**
+   * @brief Serve a member-qualified request on the gateway that owns the member.
+   *
+   * `validate_entity_for_route` routes a whole entity, which is the wrong unit
+   * for an aggregating one: the entity is a view whose members can sit on
+   * different gateways, so the routing table deliberately holds no entry for it
+   * and every request lands here. The member is the unit that has an owner, so
+   * the request is re-addressed to the member's own entity route - `/apps/{id}/...`
+   * or `/components/{id}/...` - on that owner. Anything the local walk knows about
+   * a member another gateway runs is at best a declaration; the topic and the
+   * service themselves only exist over there.
+   *
+   * Reachability is answered before anything is sent. A member retained while
+   * its gateway is silent is still in the tree and still addressable, and the
+   * honest answer is that it cannot be reached - forwarding to a dead peer would
+   * dress that up as a 502, which blames this gateway for a link that is down.
+   *
+   * @param req Typed request supplying method, headers, body and query.
+   * @param member_id Member the id named. Empty means the id named none.
+   * @param member_resource_path Path below the member entity, without a leading
+   *        slash (e.g. `data/chassis/brakes/pressure`,
+   *        `operations/calibrate/executions`).
+   * @param error_params Parameters to attach to the `not-responding` body so a
+   *        caller learns which request could not be served.
+   * @return kServeLocally when the handler must carry on, kForwarded when the
+   *         peer's response is already on the wire, or a 504 ErrorInfo when the
+   *         member's gateway is silent.
+   */
+  http::Result<MemberDispatch> dispatch_to_member(const http::TypedRequest & req, const std::string & member_id,
+                                                  const std::string & member_resource_path,
+                                                  nlohmann::json error_params) const;
+
+  /**
    * @brief Build the framework-internal sentinel error that typed handlers
    *        return after the validator's Forwarded path already committed the
    *        proxied wire response.
@@ -290,6 +338,10 @@ class HandlerContext {
    * @param res HTTP response
    * @param origin Origin header value
    */
+  /// False when the entity is only present because a peer's declaration is
+  /// being retained while that peer is silent.
+  bool is_entity_available(const std::string & entity_id) const;
+
   void set_cors_headers(httplib::Response & res, const std::string & origin) const;
 
   /**
@@ -302,56 +354,47 @@ class HandlerContext {
   /**
    * @brief Get logger for handlers
    */
-  static rclcpp::Logger logger() {
-    return rclcpp::get_logger("rest_server");
+  static const log::Logger & logger() {
+    static const log::Logger instance("rest_server");
+    return instance;
   }
 
   /**
-   * @brief Resolve a list of app IDs to their non-empty effective FQNs.
+   * @brief Resolve a list of app IDs to the fault-reporting sources they own.
    *
-   * Apps that are missing from the cache or that have an empty effective_fqn()
-   * are skipped silently. The returned vector preserves the input app_ids order
-   * (minus skipped entries) and may be empty. Apps whose effective_fqn() is
-   * already present in the result are skipped, so duplicates from manifest /
-   * runtime double-binds do not produce repeated downstream queries.
+   * Each app resolves through `faults::resolve_app_source_fqn()`: its
+   * `effective_fqn()`, or its bare entity id when the app is external (a
+   * plugin-introspected asset that reports under that id). Apps that are
+   * missing from the cache or that own no source are skipped silently. The
+   * returned vector preserves the input app_ids order (minus skipped entries)
+   * and may be empty. Duplicate sources from manifest / runtime double-binds
+   * are collapsed so they do not produce repeated downstream queries.
    *
-   * Used by log_handlers and bulkdata_handlers to aggregate per-component /
-   * per-function resource queries from the entity's hosted apps. Static + public
-   * to enable direct unit testing without standing up a full GatewayNode fixture.
+   * Order-preserving wrapper over the shared per-app rule for callers that
+   * resolve an explicit app-id list; whole-entity resolution goes through
+   * `resolve_entity_source_fqns`. Static + public for direct unit testing
+   * without standing up a full GatewayNode fixture.
    *
    * @param cache Entity cache to look up apps in
    * @param app_ids App IDs to resolve
-   * @return Effective FQNs for the apps that resolved
+   * @return Source FQNs for the apps that resolved
    */
   static std::vector<std::string> resolve_app_host_fqns(const ThreadSafeEntityCache & cache,
                                                         const std::vector<std::string> & app_ids);
 
   /**
-   * @brief Resolve an entity to the set of source FQNs it owns.
+   * @brief Resolve an entity to the set of reporting sources it owns.
    *
-   * Returns the FQNs of every ROS 2 node within the entity's scope. Used by
-   * fault handlers to filter `reporting_sources` so that per-entity routes
-   * never expose faults reported from outside the addressed entity.
+   * Thin adapter over `faults::resolve_entity_source_fqns` (the per-type
+   * mapping - incl. the external bare-id rule, subarea recursion and
+   * component-hosted functions - is documented there). Used by fault, log and
+   * bulk-data handlers so per-entity routes never expose resources reported
+   * from outside the addressed entity.
    *
-   * Mapping per entity type:
-   * - App: the app's `effective_fqn()` (single entry, or empty set if unbound
-   *   or if `ros_binding.namespace_pattern` is a wildcard - by design
-   *   `effective_fqn()` returns "" for those, so the entity simply has no
-   *   addressable ROS node and the scope check excludes every fault).
-   * - Component: `effective_fqn()` of every hosted app via
-   *   `get_apps_for_component()`.
-   * - Area: `effective_fqn()` of every app under the area, walking
-   *   `get_subareas()` recursively so nested areas (e.g. ``powertrain ->
-   *   engine``) resolve to the union of their descendants' apps.
-   * - Function: `effective_fqn()` of every app the function hosts directly
-   *   plus, for hosts that are component IDs, the apps inside those
-   *   components.
-   * - Unknown: empty set.
+   * Apps that own no source are silently dropped from the set so the scope
+   * check cannot match arbitrary FQNs against an empty prefix.
    *
-   * Apps whose `effective_fqn()` is empty are silently dropped from the set
-   * so the scope check cannot match arbitrary FQNs against an empty prefix.
-   *
-   * An empty result means "no apps are in scope" and callers must NEVER
+   * An empty result means "no sources are in scope" and callers must NEVER
    * interpret that as "no filter" - any fault must be treated as out of
    * scope. The exact response (404 for per-fault routes, an empty `items`
    * array for collection lists, 204 for collection clears) is up to the
@@ -359,13 +402,13 @@ class HandlerContext {
    *
    * @param cache Entity cache for lookups
    * @param entity Resolved entity info (from `validate_entity_for_route`)
-   * @return Set of FQNs that uniquely scopes faults to this entity
+   * @return Set of sources that uniquely scopes faults to this entity
    */
   static std::set<std::string> resolve_entity_source_fqns(const ThreadSafeEntityCache & cache,
                                                           const EntityInfo & entity);
 
  private:
-  GatewayNode * node_;
+  GatewayServices & services_;
   CorsConfig cors_config_;
   AuthConfig auth_config_;
   TlsConfig tls_config_;
