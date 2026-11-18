@@ -1,0 +1,60 @@
+ros-jazzy-ros2-medkit-serialization (0.7.1-1noble) noble; urgency=high
+
+  * No changes. Version aligned with the rest of the stack
+
+ -- "bburda" <bartoszburda93@gmail.com>  Wed, 18 Nov 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-serialization (0.7.0-1noble) noble; urgency=high
+
+  * Build and test only: the package is instrumented for coverage (#582 <https://github.com/selfpatch/ros2_medkit/pull/582>), its ROS-dependent tests take a DDS domain at run time from the shared allocator while the pure-logic ones are opted out (#597 <https://github.com/selfpatch/ros2_medkit/pull/597>), and clang-tidy no longer reports findings in vendored headers that the header filter matched
+  * Contributors: @bburda, @mfaferek93
+
+ -- "bburda" <bartoszburda93@gmail.com>  Thu, 27 Aug 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-serialization (0.6.0-1noble) noble; urgency=high
+
+  * ``TypeIntrospection`` resolves service and action ``type_info`` schemas lazily and caches them as shared, immutable per-type objects, so discovery no longer rebuilds and deep-copies operation schemas on every refresh (#462 <https://github.com/selfpatch/ros2_medkit/pull/462>)
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Mon, 22 Jun 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-serialization (0.5.0-1noble) noble; urgency=high
+
+  * ``TypeIntrospection`` relocated into this package as part of the gateway core / ROS 2 layer split
+  * Build: adopt the centralized ``ROS2MedkitWarnings`` and ``ROS2MedkitSanitizers`` cmake modules
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Mon, 08 Jun 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-serialization (0.4.0-1noble) noble; urgency=high
+
+  * Enable ``POSITION_INDEPENDENT_CODE`` for MODULE target compatibility
+  * Build: use shared cmake modules from ``ros2_medkit_cmake`` package
+  * Build: auto-detect ccache, centralized clang-tidy configuration
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Fri, 20 Mar 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-serialization (0.3.0-1noble) noble; urgency=high
+
+  * Multi-distro CI support for ROS 2 Humble, Jazzy, and Rolling (#219 <https://github.com/selfpatch/ros2_medkit/pull/219>, #242 <https://github.com/selfpatch/ros2_medkit/pull/242>)
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Fri, 27 Feb 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-serialization (0.2.0-1noble) noble; urgency=high
+
+  * Initial rosdistro release
+  * Runtime JSON to ROS 2 message serialization using vendored dynmsg C++ API
+  * TypeCache - thread-safe caching of ROS type introspection data with shared_mutex
+    for read concurrency
+  * JsonSerializer - bidirectional JSON <-> ROS message conversion via dynmsg YAML bridge,
+    including CDR serialization/deserialization for GenericClient/GenericSubscription
+  * ServiceActionTypes - helper utilities for resolving service and action internal types
+    (request/response, goal/result/feedback)
+  * SerializationError exception hierarchy for structured error handling
+  * Contributors: Bartosz Burda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Sat, 07 Feb 2026 00:00:00 -0000
+
+
