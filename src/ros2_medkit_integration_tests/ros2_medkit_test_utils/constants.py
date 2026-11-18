@@ -18,8 +18,51 @@ import os
 
 API_BASE_PATH = '/api/v1'
 DEFAULT_PORT = int(os.environ.get('GATEWAY_TEST_PORT', '8080'))
-DEFAULT_DOMAIN_ID = int(os.environ.get('ROS_DOMAIN_ID', '0'))
 DEFAULT_BASE_URL = f'http://localhost:{DEFAULT_PORT}{API_BASE_PATH}'
+
+
+def get_time_scale():
+    """Return the multiplier for in-test wall-clock budgets.
+
+    CTest timeouts are stretched by the sanitizer CI jobs (a generic x3
+    rewrite of every declared ``TIMEOUT``), but budgets asserted *inside* a
+    test are invisible to that rewrite: an ASan/TSan-instrumented gateway can
+    blow a hard-coded "must answer within N seconds" assertion long before
+    ctest's own clock runs out, and the failure then reads as a regression
+    rather than as sanitizer overhead. Those jobs set
+    ``MEDKIT_TEST_TIME_SCALE`` to the same factor they apply to ctest.
+
+    Unset / unparseable / below 1.0 means "no scaling", so the normal jobs
+    keep the tight budgets that give the assertions their falsifying power.
+    """
+    try:
+        scale = float(os.environ.get('MEDKIT_TEST_TIME_SCALE', '1'))
+    except ValueError:
+        return 1.0
+    return scale if scale >= 1.0 else 1.0
+
+
+def sanitizers_enabled():
+    """Return True when running against a sanitizer-instrumented build.
+
+    Some resources are affordable in a normal build and not under ASan/TSan -
+    most obviously threads, which each carry shadow and history state and which
+    the runtime has to tear down one by one. A test that sizes such a resource
+    at its documented maximum can exceed launch_testing's shutdown grace period
+    under instrumentation and have the process SIGKILLed, which then reads as a
+    product failure rather than as instrumentation cost.
+
+    Detected from the sanitizer runtimes' own configuration variables, which
+    the ASan and TSan jobs already set, so a future sanitizer job cannot forget
+    to opt in. ``MEDKIT_TEST_SANITIZED`` forces it on for a local reproduction
+    (any value except empty / ``0`` / ``false``).
+    """
+    forced = os.environ.get('MEDKIT_TEST_SANITIZED', '').strip()
+    if forced and forced.lower() not in ('0', 'false'):
+        return True
+    return any(
+        os.environ.get(name) for name in ('ASAN_OPTIONS', 'TSAN_OPTIONS', 'UBSAN_OPTIONS')
+    )
 
 
 def get_test_port(offset=0):
@@ -32,51 +75,122 @@ def get_test_port(offset=0):
     return DEFAULT_PORT + offset
 
 
+def _secondary_domains():
+    """Return the extra DDS domains this test was given, beyond its own.
+
+    The domain wrapper allocates them when the test starts and publishes them as
+    ``MEDKIT_SECONDARY_DOMAINS``; it holds every one of them, through an open
+    socket, for as long as the test runs. Absent (a test run by hand outside
+    CTest), there is nothing to fall back on that would be safe, so say so.
+    """
+    raw = os.environ.get('MEDKIT_SECONDARY_DOMAINS', '')
+    return [int(part) for part in raw.split(',') if part.strip()]
+
+
+def _primary_domain():
+    """Return the domain the wrapper allocated for this test.
+
+    Deliberately not ``int(os.environ.get('ROS_DOMAIN_ID', '0'))``. Domain 0 is
+    the one value this whole scheme exists to keep tests off, and a default of
+    it cannot be caught downstream: a test that fell back to 0 is still behind
+    the wrapper and still carries MEDKIT_TEST_DOMAINS, so the registration gate
+    sees nothing wrong and the test quietly shares a domain with every process
+    on the machine. Refuse instead, the way the secondary domains already do.
+    """
+    raw = os.environ.get('ROS_DOMAIN_ID')
+    if raw is None or raw.strip() == '':
+        raise RuntimeError(
+            'ROS_DOMAIN_ID is not set, so this test has no domain of its own. CTest '
+            'runs every test behind medkit_domain_runner.py, which sets it. To run '
+            'this test by hand, run it through medkit_run_with_domain.py.'
+        )
+    domain = int(raw)
+    if domain == 0:
+        raise RuntimeError(
+            'ROS_DOMAIN_ID is 0, the ROS 2 default. A test on domain 0 sees every node '
+            'on the machine and is seen by all of them, which is what the domain '
+            'wrapper exists to prevent. Something exported it before the wrapper ran.'
+        )
+    return domain
+
+
+#: Backwards-compatible name. A module attribute so that importing this module
+#: outside CTest still works and only asking for the domain fails.
+def __getattr__(name):
+    if name == 'DEFAULT_DOMAIN_ID':
+        return _primary_domain()
+    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')
+
+
 def get_test_domain_id(offset=0):
     """Return a DDS domain ID for this test, optionally with an offset.
 
-    Each integration test gets a unique ``ROS_DOMAIN_ID`` from CMake
-    (stride of 1, range 140-229). For offset 0, returns the assigned
-    domain ID directly.
+    Every test gets a ``ROS_DOMAIN_ID`` of its own when it starts, from the
+    wrapper described in ``ROS2MedkitTestDomain.cmake``. For offset 0, returns
+    that domain.
 
-    For offset in 1..3 (multi-gateway tests needing extra DDS domains),
-    returns one of the three secondary domains 230, 231, 232 so each
-    offset produces a distinct domain. These three secondaries sit
-    outside the per-package allocation in
-    ``ROS2MedkitTestDomain.cmake`` and are shared across every
-    multi-gateway integration test; CTest serialises those tests via a
-    ``RESOURCE_LOCK`` (see ``CMakeLists.txt``) so two of them never
-    hold the same secondary domain simultaneously.
-
-    DDS max domain ID is 232 (UDP port formula: 7400 + 250 * domain_id).
-    Offsets above 3 would exceed that ceiling and are rejected up front.
+    Offsets above 0 are for multi-gateway tests that run a second or third
+    gateway at the same time. Those domains are allocated to this test alone -
+    ``DOMAINS <n>`` on its ``medkit_add_launch_test`` call is what asks for them -
+    so no other test can be on them while this one runs.
     """
     if offset == 0:
-        return DEFAULT_DOMAIN_ID
-    if not 1 <= offset <= 3:
-        raise ValueError(
-            f'secondary DDS domain offset {offset} out of range 1..3 '
-            '(only domains 230-232 are available; DDS max is 232). '
-            'Add a new offset only after extending the allocation scheme.'
+        return _primary_domain()
+    secondary = _secondary_domains()
+    if not secondary:
+        raise RuntimeError(
+            'MEDKIT_SECONDARY_DOMAINS is not set, so no secondary DDS domain can be '
+            'handed out. The domain wrapper sets it for a test registered with '
+            'DOMAINS greater than 1. To run this test by hand, run it through '
+            'medkit_run_with_domain.py --domains <n>, or set ROS_DOMAIN_ID and '
+            'MEDKIT_SECONDARY_DOMAINS yourself to domains nobody else is using.'
         )
-    return 229 + offset
+    if not 1 <= offset <= len(secondary):
+        raise ValueError(
+            f'secondary DDS domain offset {offset} out of range 1..{len(secondary)} '
+            f'(this test was given {secondary}). Raise DOMAINS on its '
+            'medkit_add_launch_test call in CMakeLists.txt before adding a new offset.'
+        )
+    return secondary[offset - 1]
 
+
+# Every budget below is multiplied by get_time_scale(), which is 1.0 unless a
+# sanitizer job asks for slack. These are exactly the "budgets asserted inside a
+# test" that function was written for: ctest's own TIMEOUT is rewritten x3 by
+# those jobs, and a wall-clock assertion inside the test never saw that factor.
+# PARAM_SERVICE_TIMEOUT below carries the evidence - it was raised by hand to 90
+# because a parameter service was still answering 503 more than 15s into a TSan
+# run.
+#
+# The polling INTERVALS are deliberately NOT scaled. They are not budgets: a
+# slower poll under a sanitizer would only find out later that the thing it
+# waits for is ready.
 
 # Gateway startup
-GATEWAY_STARTUP_TIMEOUT = 30.0
+GATEWAY_STARTUP_TIMEOUT = 30.0 * get_time_scale()
 GATEWAY_STARTUP_INTERVAL = 0.5
 
 # Discovery
-DISCOVERY_TIMEOUT = 60.0
+DISCOVERY_TIMEOUT = 60.0 * get_time_scale()
 DISCOVERY_INTERVAL = 0.5  # seconds between discovery polls
 
+# Parameter service readiness
+# A node's ROS 2 parameter service can lag its graph discovery, and the
+# configurations endpoint returns 503 until it responds. This lag is small
+# without instrumentation but grows under the TSan job, where the service was
+# still 503 more than 15s after discovery finished. Generous on purpose: a
+# larger timeout costs nothing on the passing path (the poll returns the moment
+# the endpoint answers 200) and only bounds how long a genuinely dead service
+# waits before failing, well inside the sanitizer jobs' 360s ctest budget.
+PARAM_SERVICE_TIMEOUT = 90.0 * get_time_scale()
+
 # Operations
-ACTION_TIMEOUT = 30.0
+ACTION_TIMEOUT = 30.0 * get_time_scale()
 
 # Faults
-FAULT_TIMEOUT = 30.0
-ROSBAG_TIMEOUT = 30.0
-SNAPSHOT_TIMEOUT = 30.0
+FAULT_TIMEOUT = 30.0 * get_time_scale()
+ROSBAG_TIMEOUT = 30.0 * get_time_scale()
+SNAPSHOT_TIMEOUT = 30.0 * get_time_scale()
 
 # Shutdown
 ALLOWED_EXIT_CODES = {0, -2, -15}  # OK, SIGINT, SIGTERM

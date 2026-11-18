@@ -22,13 +22,16 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/string.hpp>
 
 #include "ros2_medkit_gateway/ros2_common/ros2_subscription_executor.hpp"
+#include "ros2_medkit_gateway/test_support/spinning_executor.hpp"
 
 using ros2_medkit_gateway::ros2_common::Ros2SubscriptionExecutor;
+using ros2_medkit_gateway::test_support::SpinningExecutor;
 using std::chrono_literals::operator""ms;
 using std::chrono_literals::operator""s;
 
@@ -53,6 +56,10 @@ class Ros2SubscriptionExecutorTest : public ::testing::Test {
     spin_thread_ = std::thread([this] {
       executor_->spin();
     });
+    // A cancel() that lands before spin() starts is lost, and join() would block.
+    while (!executor_->is_spinning()) {
+      std::this_thread::yield();
+    }
 
     Ros2SubscriptionExecutor::Config cfg;
     cfg.max_queue_depth = 16;
@@ -153,7 +160,8 @@ TEST_F(Ros2SubscriptionExecutorTest, QueueFullReturnsBackpressure) {
 TEST_F(Ros2SubscriptionExecutorTest, NodeAccessibleWithSuffixedName) {
   auto * n = sub_exec_->node();
   ASSERT_NE(n, nullptr);
-  EXPECT_EQ(std::string(n->get_name()), std::string("test_gateway_node_sub"));
+  // Hidden helper node: leading underscore, then the gateway node name and the suffix.
+  EXPECT_EQ(std::string(n->get_name()), std::string("_test_gateway_node_sub"));
 }
 
 TEST_F(Ros2SubscriptionExecutorTest, StatsTrackCompletedTasks) {
@@ -208,13 +216,12 @@ TEST_F(Ros2SubscriptionExecutorTest, GraphCallbackFiresOnExternalGraphChange) {
   // Create publisher on a SEPARATE node to guarantee a graph event
   auto other_node = std::make_shared<rclcpp::Node>("other_node_for_graph_event");
   auto pub = other_node->create_publisher<std_msgs::msg::String>("/test_graph_topic", 10);
-  executor_->add_node(other_node);
+  SpinningExecutor other_spin({other_node});
 
   auto deadline = std::chrono::steady_clock::now() + 3s;
   while (fired.load() == 0 && std::chrono::steady_clock::now() < deadline) {
     std::this_thread::sleep_for(20ms);
   }
-  executor_->remove_node(other_node);
   sub_exec_->remove_graph_change(token);
 
   EXPECT_GE(fired.load(), 1);
@@ -229,10 +236,9 @@ TEST_F(Ros2SubscriptionExecutorTest, RemoveGraphChangeStopsFiring) {
 
   auto other_node = std::make_shared<rclcpp::Node>("other_node_removed_cb");
   auto pub = other_node->create_publisher<std_msgs::msg::String>("/removed_cb_topic", 10);
-  executor_->add_node(other_node);
+  SpinningExecutor other_spin({other_node});
 
   std::this_thread::sleep_for(500ms);
-  executor_->remove_node(other_node);
 
   EXPECT_EQ(fired.load(), 0);
 }
@@ -263,7 +269,7 @@ TEST_F(Ros2SubscriptionExecutorTest, RemoveGraphChangeWaitsForInFlightCallback) 
 
   auto other_node = std::make_shared<rclcpp::Node>("other_node_for_in_flight");
   auto pub = other_node->create_publisher<std_msgs::msg::String>("/in_flight_topic", 10);
-  executor_->add_node(other_node);
+  SpinningExecutor other_spin({other_node});
 
   {
     std::unique_lock<std::mutex> lk(m);
@@ -292,8 +298,6 @@ TEST_F(Ros2SubscriptionExecutorTest, RemoveGraphChangeWaitsForInFlightCallback) 
   remover.join();
   EXPECT_TRUE(exited.load());
   EXPECT_TRUE(remove_returned.load());
-
-  executor_->remove_node(other_node);
 }
 
 TEST_F(Ros2SubscriptionExecutorTest, WatchdogDetectsStuckTask) {
