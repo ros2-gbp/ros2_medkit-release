@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "ros2_medkit_gateway/http/handlers/cyclic_subscription_handlers.hpp"
+#include "ros2_medkit_gateway/core/logging.hpp"
 
 #include <regex>
 #include <string>
@@ -21,7 +22,6 @@
 #include <variant>
 
 #include <nlohmann/json.hpp>
-#include <rclcpp/rclcpp.hpp>
 
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
@@ -83,7 +83,7 @@ CyclicSubscriptionHandlers::CyclicSubscriptionHandlers(HandlerContext & ctx, Sub
 // ---------------------------------------------------------------------------
 // POST - create subscription
 // ---------------------------------------------------------------------------
-http::Result<std::pair<dto::CyclicSubscription, http::ResponseAttachments>>
+http::Result<std::pair<http::Created<dto::CyclicSubscription>, http::ResponseAttachments>>
 CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
                                               dto::CyclicSubscriptionCreateRequest body) {
   auto id_result = read_entity_id(req);
@@ -177,11 +177,23 @@ CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
     }
   }
 
+  // GET refuses an update id that fails the entity-id rules; so does a subscription.
+  if (parsed->collection == "updates") {
+    if (auto id_ok = ctx_.validate_entity_id(parsed->resource_path); !id_ok) {
+      return tl::unexpected(make_error(400, ERR_X_MEDKIT_INVALID_RESOURCE_URI, id_ok.error(),
+                                       json{{"parameter", "resource"}, {"value", resource}}));
+    }
+  }
+
   // Check sampler is registered
   if (!sampler_registry_.has_sampler(parsed->collection)) {
     return tl::unexpected(make_error(400, ERR_X_MEDKIT_COLLECTION_NOT_AVAILABLE,
                                      "No data provider for collection '" + parsed->collection + "'",
                                      json{{"collection", parsed->collection}}));
+  }
+
+  if (auto path_ok = validate_resource_path_support(sampler_registry_, *parsed, resource); !path_ok) {
+    return tl::unexpected(path_ok.error());
   }
 
   // Create subscription
@@ -193,7 +205,7 @@ CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
 
   // Start transport delivery
   auto sampler = sampler_registry_.get_sampler(parsed->collection);
-  auto event_source_result = transport->start(*result, *sampler, ctx_.node());
+  auto event_source_result = transport->start(*result, *sampler, ctx_.services().ros_node());
   if (!event_source_result) {
     sub_mgr_.remove(result->id);
     return tl::unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, event_source_result.error()));
@@ -201,8 +213,10 @@ CyclicSubscriptionHandlers::post_subscription(const http::TypedRequest & req,
 
   auto sub_dto = subscription_to_dto(*result, *event_source_result);
   http::ResponseAttachments att;
-  att.with_status(201);
-  return std::make_pair(std::move(sub_dto), std::move(att));
+  // The subscription is a child of the POST target, and `req.path()` already
+  // carries the API prefix, so this is the same absolute form every `href` uses.
+  att.with_location(child_resource_path(req.path(), sub_dto.id));
+  return std::make_pair(http::Created<dto::CyclicSubscription>{std::move(sub_dto)}, std::move(att));
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +449,7 @@ std::string CyclicSubscriptionHandlers::extract_entity_type(const std::string & 
     case SovdEntityType::AREA:
     case SovdEntityType::UNKNOWN:
     default:
-      RCLCPP_WARN(HandlerContext::logger(), "Unexpected entity type in cyclic subscription path: %s", path.c_str());
+      MEDKIT_LOG_WARN(HandlerContext::logger(), "Unexpected entity type in cyclic subscription path: %s", path.c_str());
       return "apps";
   }
 }
@@ -450,7 +464,8 @@ CyclicSubscriptionHandlers::parse_resource_uri(const std::string & resource) {
     parsed.entity_type = match[1].str();
     parsed.entity_id = match[2].str();
     parsed.collection = match[3].str();
-    parsed.resource_path = match[4].matched ? match[4].str() : "";
+    // Decoded as the GET path is, so a subscription reads the item GET reads. Before the '..' check.
+    parsed.resource_path = match[4].matched ? httplib::detail::decode_url(match[4].str(), false) : "";
 
     // Security: reject '..' as a path segment (not as substring of e.g. '/..foo')
     if (!parsed.resource_path.empty()) {
@@ -476,13 +491,26 @@ CyclicSubscriptionHandlers::parse_resource_uri(const std::string & resource) {
     parsed.entity_type = "";  // server-level, no entity
     parsed.entity_id = "";
     parsed.collection = "updates";
-    parsed.resource_path = match[1].str();  // update package ID
+    parsed.resource_path = httplib::detail::decode_url(match[1].str(), false);  // update package ID
     return parsed;
   }
 
   return tl::make_unexpected(
       "Resource URI must match /api/v1/{apps|components|functions}/{id}/{collection}[/{path}] "
       "or /api/v1/updates/{id}/status");
+}
+
+tl::expected<void, ErrorInfo> CyclicSubscriptionHandlers::validate_resource_path_support(
+    const ResourceSamplerRegistry & registry, const ParsedResourceUri & parsed, const std::string & resource) {
+  if (parsed.resource_path.empty() || registry.honours_resource_path(parsed.collection)) {
+    return {};
+  }
+  return tl::unexpected(make_error(
+      400, ERR_X_MEDKIT_INVALID_RESOURCE_URI,
+      "Collection '" + parsed.collection +
+          "' is streamed as a whole and does not support a resource path. Subscribe to the collection URI without a "
+          "trailing resource path.",
+      json{{"parameter", "resource"}, {"value", resource}, {"collection", parsed.collection}}));
 }
 
 }  // namespace handlers
