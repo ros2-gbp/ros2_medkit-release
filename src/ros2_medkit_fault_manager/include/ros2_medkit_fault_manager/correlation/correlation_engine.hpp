@@ -115,6 +115,11 @@ class CorrelationEngine {
   /// Get count of muted faults
   uint32_t get_muted_count() const;
 
+  /// Whether a fault code is currently muted as a symptom.
+  /// @param fault_code Code to test
+  /// @return True while the code is suppressed by a root cause
+  bool is_muted(const std::string & fault_code) const;
+
   /// Get all active clusters
   /// @return List of cluster data
   std::vector<ClusterData> get_clusters() const;
@@ -144,6 +149,15 @@ class CorrelationEngine {
   /// Generate unique cluster ID
   std::string generate_cluster_id(const std::string & rule_id);
 
+  /// Record a re-reported member's severity and update the representative if it changes
+  void update_member_severity(const CorrelationRule & rule, ClusterData & cluster,
+                              std::map<std::string, std::string> & fault_severities, const std::string & fault_code,
+                              const std::string & severity) const;
+
+  /// Reassign cluster representative from remaining fault_codes and their severities
+  void reassign_representative(ClusterData & cluster,
+                               const std::map<std::string, std::string> & fault_severities) const;
+
   CorrelationConfig config_;
   std::unique_ptr<PatternMatcher> matcher_;
 
@@ -164,6 +178,9 @@ class CorrelationEngine {
 
   /// Active clusters (cluster_id -> data)
   std::map<std::string, ClusterData> active_clusters_;
+
+  /// Per-fault severities for active clusters (cluster_id -> (fault_code -> severity))
+  std::map<std::string, std::map<std::string, std::string>> active_cluster_severities_;
 
   /// Mapping from fault code to cluster ID (for faults in clusters)
   std::map<std::string, std::string> fault_to_cluster_;

@@ -14,8 +14,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -95,7 +97,10 @@ TEST(EntityTypes, ToStringReturnsCorrectValues) {
 TEST(EntityTypes, ResourceCollectionToString) {
   EXPECT_EQ(to_string(ResourceCollection::CONFIGURATIONS), "configurations");
   EXPECT_EQ(to_string(ResourceCollection::DATA), "data");
+  EXPECT_EQ(to_string(ResourceCollection::DATA_CATEGORIES), "data-categories");
+  EXPECT_EQ(to_string(ResourceCollection::DATA_GROUPS), "data-groups");
   EXPECT_EQ(to_string(ResourceCollection::FAULTS), "faults");
+  EXPECT_EQ(to_string(ResourceCollection::FAULT_TRIGGERS), "fault-triggers");
   EXPECT_EQ(to_string(ResourceCollection::OPERATIONS), "operations");
   EXPECT_EQ(to_string(ResourceCollection::BULK_DATA), "bulk-data");
   EXPECT_EQ(to_string(ResourceCollection::DATA_LISTS), "data-lists");
@@ -106,9 +111,23 @@ TEST(EntityTypes, ParseResourceCollection) {
   ASSERT_TRUE(configs.has_value());
   EXPECT_EQ(*configs, ResourceCollection::CONFIGURATIONS);
 
+  // Recognised even though no entity lists it as a capability: parsing a path
+  // segment and advertising a collection are separate questions.
   auto data_lists = parse_resource_collection("data-lists");
   ASSERT_TRUE(data_lists.has_value());
   EXPECT_EQ(*data_lists, ResourceCollection::DATA_LISTS);
+
+  auto categories = parse_resource_collection("data-categories");
+  ASSERT_TRUE(categories.has_value());
+  EXPECT_EQ(*categories, ResourceCollection::DATA_CATEGORIES);
+
+  auto groups = parse_resource_collection("data-groups");
+  ASSERT_TRUE(groups.has_value());
+  EXPECT_EQ(*groups, ResourceCollection::DATA_GROUPS);
+
+  auto fault_triggers = parse_resource_collection("fault-triggers");
+  ASSERT_TRUE(fault_triggers.has_value());
+  EXPECT_EQ(*fault_triggers, ResourceCollection::FAULT_TRIGGERS);
 
   auto invalid = parse_resource_collection("invalid");
   EXPECT_FALSE(invalid.has_value());
@@ -127,12 +146,75 @@ TEST(EntityTypes, ParseEntityType) {
 // EntityCapabilities Tests
 // ============================================================================
 
-TEST(EntityCapabilities, ServerSupportsAllCollections) {
+TEST(EntityCapabilities, ServerSupportsOnlyTheRootMountedCollections) {
+  // `/faults` and `/updates` are the only collections mounted at the API root.
+  // Everything else in the enum is entity-scoped, so listing it here would put
+  // an href into a 404 on the server capability surface.
   auto caps = EntityCapabilities::for_type(SovdEntityType::SERVER);
-  EXPECT_TRUE(caps.supports_collection(ResourceCollection::CONFIGURATIONS));
-  EXPECT_TRUE(caps.supports_collection(ResourceCollection::DATA));
   EXPECT_TRUE(caps.supports_collection(ResourceCollection::FAULTS));
-  EXPECT_TRUE(caps.supports_collection(ResourceCollection::OPERATIONS));
+  EXPECT_TRUE(caps.supports_collection(ResourceCollection::UPDATES));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::CONFIGURATIONS));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::DATA));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::OPERATIONS));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::LOGS));
+  EXPECT_FALSE(caps.supports_collection(ResourceCollection::LOCKS));
+  EXPECT_FALSE(caps.supports_resource("logs"));
+  EXPECT_FALSE(caps.supports_resource("depends-on"));
+}
+
+// The three collections with no entity-scoped route anywhere. This is the
+// invariant the phantom hrefs violated: `/x/{id}/data-lists`, `/x/{id}/modes`
+// and `/x/{id}/updates` are registered for no entity type, so no capability
+// list may name them.
+TEST(EntityCapabilities, NoEntityAdvertisesACollectionWithoutARoute) {
+  for (auto type : {SovdEntityType::AREA, SovdEntityType::COMPONENT, SovdEntityType::APP, SovdEntityType::FUNCTION}) {
+    auto caps = EntityCapabilities::for_type(type);
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::DATA_LISTS)) << to_string(type);
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::MODES)) << to_string(type);
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::UPDATES)) << to_string(type);
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::COMMUNICATION_LOGS)) << to_string(type);
+  }
+}
+
+// The four-entity-type loop in rest_server.cpp registers these for every type.
+TEST(EntityCapabilities, EveryEntityTypeAdvertisesTheUnconditionalCollections) {
+  for (auto type : {SovdEntityType::AREA, SovdEntityType::COMPONENT, SovdEntityType::APP, SovdEntityType::FUNCTION}) {
+    auto caps = EntityCapabilities::for_type(type);
+    for (auto col : {ResourceCollection::DATA, ResourceCollection::DATA_CATEGORIES, ResourceCollection::DATA_GROUPS,
+                     ResourceCollection::OPERATIONS, ResourceCollection::CONFIGURATIONS, ResourceCollection::FAULTS,
+                     ResourceCollection::LOGS, ResourceCollection::BULK_DATA, ResourceCollection::TRIGGERS}) {
+      EXPECT_TRUE(caps.supports_collection(col)) << to_string(type) << " / " << to_string(col);
+    }
+  }
+}
+
+// Routes registered behind an entity-type check: locks and scripts for
+// components and apps, cyclic-subscriptions for everything but areas, and
+// fault-triggers for apps alone.
+TEST(EntityCapabilities, TypeGatedCollectionsMatchTheirRegistrations) {
+  auto area = EntityCapabilities::for_type(SovdEntityType::AREA);
+  auto component = EntityCapabilities::for_type(SovdEntityType::COMPONENT);
+  auto app = EntityCapabilities::for_type(SovdEntityType::APP);
+  auto function = EntityCapabilities::for_type(SovdEntityType::FUNCTION);
+
+  EXPECT_FALSE(area.supports_collection(ResourceCollection::CYCLIC_SUBSCRIPTIONS));
+  EXPECT_TRUE(component.supports_collection(ResourceCollection::CYCLIC_SUBSCRIPTIONS));
+  EXPECT_TRUE(app.supports_collection(ResourceCollection::CYCLIC_SUBSCRIPTIONS));
+  EXPECT_TRUE(function.supports_collection(ResourceCollection::CYCLIC_SUBSCRIPTIONS));
+
+  for (const auto & caps : {component, app}) {
+    EXPECT_TRUE(caps.supports_collection(ResourceCollection::LOCKS));
+    EXPECT_TRUE(caps.supports_collection(ResourceCollection::SCRIPTS));
+  }
+  for (const auto & caps : {area, function}) {
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::LOCKS));
+    EXPECT_FALSE(caps.supports_collection(ResourceCollection::SCRIPTS));
+  }
+
+  EXPECT_TRUE(app.supports_collection(ResourceCollection::FAULT_TRIGGERS));
+  EXPECT_FALSE(component.supports_collection(ResourceCollection::FAULT_TRIGGERS));
+  EXPECT_FALSE(area.supports_collection(ResourceCollection::FAULT_TRIGGERS));
+  EXPECT_FALSE(function.supports_collection(ResourceCollection::FAULT_TRIGGERS));
 }
 
 TEST(EntityCapabilities, AreaSupportsCollectionsViaAggregation) {
@@ -158,6 +240,9 @@ TEST(EntityCapabilities, AreaSupportsContains) {
   EXPECT_TRUE(caps.supports_resource("contains"));
   EXPECT_TRUE(caps.supports_resource("subareas"));
   EXPECT_TRUE(caps.supports_resource("docs"));
+  // The route is /areas/{area_id}/components; "related-components" named none.
+  EXPECT_TRUE(caps.supports_resource("components"));
+  EXPECT_FALSE(caps.supports_resource("related-components"));
 }
 
 TEST(EntityCapabilities, ComponentSupportsOperations) {
@@ -178,6 +263,15 @@ TEST(EntityCapabilities, AppSupportsIsLocatedOn) {
 TEST(EntityCapabilities, AppSupportsBelongsTo) {
   auto caps = EntityCapabilities::for_type(SovdEntityType::APP);
   EXPECT_TRUE(caps.supports_resource("belongs-to"));
+}
+
+TEST(EntityCapabilities, FunctionHasNoDependsOnResource) {
+  // /depends-on is registered for components and apps only.
+  auto caps = EntityCapabilities::for_type(SovdEntityType::FUNCTION);
+  EXPECT_TRUE(caps.supports_resource("hosts"));
+  EXPECT_FALSE(caps.supports_resource("depends-on"));
+  EXPECT_TRUE(EntityCapabilities::for_type(SovdEntityType::COMPONENT).supports_resource("depends-on"));
+  EXPECT_TRUE(EntityCapabilities::for_type(SovdEntityType::APP).supports_resource("depends-on"));
 }
 
 TEST(EntityCapabilities, FunctionAggregatesCollections) {
@@ -743,6 +837,128 @@ TEST_F(DataAggregationTest, UnknownEntityReturnsEmptyData) {
   EXPECT_TRUE(result.topics.empty());
   EXPECT_TRUE(result.source_ids.empty());
   EXPECT_TRUE(result.aggregation_level.empty());
+}
+
+// =============================================================================
+// Member resolution
+//
+// A grouping entity - an Area, a Function, or a Component with children - owns
+// no resources beyond what its members provide. Resolving an item to its owner
+// and listing the grouping's items therefore have to walk the same graph, or
+// the gateway advertises what it will not serve. These cases pin that one walk.
+// =============================================================================
+
+class MemberResolutionTest : public ::testing::Test {
+ protected:
+  /// Members compared as a set: the walk fixes no order and no caller needs one.
+  static std::vector<std::string> sorted(std::vector<std::string> v) {
+    std::sort(v.begin(), v.end());
+    return v;
+  }
+
+  ThreadSafeEntityCache cache_;
+};
+
+TEST_F(MemberResolutionTest, AreaMembersAreItsComponentsAndTheirApps) {
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  std::vector<Component> components{
+      make_component("primary-ecu", "Primary", "vehicle"),
+      make_component("secondary-ecu", "Secondary", "vehicle"),
+  };
+  std::vector<App> apps{
+      make_app("temp_sensor", "Temp", "primary-ecu"),
+      make_app("pressure_sensor", "Pressure", "secondary-ecu"),
+  };
+  cache_.update_all(areas, components, apps, {});
+
+  EXPECT_EQ(sorted(cache_.get_members(SovdEntityType::AREA, "vehicle")),
+            sorted({"primary-ecu", "secondary-ecu", "temp_sensor", "pressure_sensor"}));
+}
+
+TEST_F(MemberResolutionTest, AreaMembersDescendIntoSubareas) {
+  // The operations walk that predates this one stops at the area's own
+  // components, so a subarea's apps were invisible to any caller that asked the
+  // parent area what it contains.
+  Area parent = make_area("vehicle", "Vehicle");
+  Area child = make_area("powertrain", "Powertrain");
+  child.parent_area_id = "vehicle";
+
+  std::vector<Component> components{make_component("engine-ecu", "Engine", "powertrain")};
+  std::vector<App> apps{make_app("rpm_sensor", "RPM", "engine-ecu")};
+  cache_.update_all({parent, child}, components, apps, {});
+
+  EXPECT_EQ(sorted(cache_.get_members(SovdEntityType::AREA, "vehicle")), sorted({"engine-ecu", "rpm_sensor"}));
+}
+
+TEST_F(MemberResolutionTest, FunctionMembersIncludeHostsThatAreComponents) {
+  // A Function host id may name an App or a Component. Only the App half was
+  // indexed, and a Component host was dropped without a word, so a Function
+  // hosting a Component reported none of that Component's resources.
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  std::vector<Component> components{make_component("brake-ecu", "Brake", "vehicle")};
+  std::vector<App> apps{
+      make_app("actuator", "Actuator", "brake-ecu"),
+      make_app("temp_sensor", "Temp", "brake-ecu"),
+  };
+
+  Function func;
+  func.id = "vehicle_health";
+  func.hosts = {"temp_sensor", "brake-ecu"};
+  cache_.update_all(areas, components, apps, {func});
+
+  const auto members = sorted(cache_.get_members(SovdEntityType::FUNCTION, "vehicle_health"));
+  for (const char * expected : {"actuator", "brake-ecu", "temp_sensor"}) {
+    EXPECT_NE(std::find(members.begin(), members.end(), expected), members.end())
+        << "function member missing: " << expected;
+  }
+}
+
+TEST_F(MemberResolutionTest, ComponentIsAMemberOfItselfAndCarriesItsChildren) {
+  // Two things this pins. A Component is its own member because, unlike an Area
+  // or a Function, it can expose services and actions directly - the operations
+  // aggregation already counts those before its apps. And a parent Component's
+  // children were not reachable from the cache at all before: nothing indexed
+  // that direction.
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  Component parent = make_component("vehicle-ecu", "Vehicle ECU", "vehicle");
+  parent.services = {make_service("reset", "/vehicle/reset")};
+  Component child = make_component("brake-ecu", "Brake ECU", "vehicle");
+  child.parent_component_id = "vehicle-ecu";
+
+  std::vector<App> apps{make_app("actuator", "Actuator", "brake-ecu")};
+  cache_.update_all(areas, {parent, child}, apps, {});
+
+  EXPECT_EQ(sorted(cache_.get_members(SovdEntityType::COMPONENT, "vehicle-ecu")),
+            sorted({"vehicle-ecu", "brake-ecu", "actuator"}));
+}
+
+TEST_F(MemberResolutionTest, ComponentParentCycleTerminates) {
+  // Parent-component cycles are representable: the manifest validator checks
+  // only that a parent exists, not that the graph is acyclic, and the
+  // aggregation classifier handles cycles explicitly because they occur. A walk
+  // without a visited set would not return.
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  Component first = make_component("ecu-a", "A", "vehicle");
+  first.parent_component_id = "ecu-b";
+  Component second = make_component("ecu-b", "B", "vehicle");
+  second.parent_component_id = "ecu-a";
+  cache_.update_all(areas, {first, second}, {}, {});
+
+  EXPECT_EQ(sorted(cache_.get_members(SovdEntityType::COMPONENT, "ecu-a")), sorted({"ecu-a", "ecu-b"}));
+}
+
+TEST_F(MemberResolutionTest, LeafReturnsOnlyItself) {
+  std::vector<Area> areas{make_area("vehicle", "Vehicle")};
+  std::vector<Component> components{make_component("primary-ecu", "Primary", "vehicle")};
+  std::vector<App> apps{make_app("temp_sensor", "Temp", "primary-ecu")};
+  cache_.update_all(areas, components, apps, {});
+
+  EXPECT_EQ(cache_.get_members(SovdEntityType::APP, "temp_sensor"), std::vector<std::string>{"temp_sensor"});
+}
+
+TEST_F(MemberResolutionTest, UnknownGroupingHasNoMembers) {
+  cache_.update_all({}, {}, {}, {});
+  EXPECT_TRUE(cache_.get_members(SovdEntityType::AREA, "nope").empty());
 }
 
 int main(int argc, char ** argv) {
