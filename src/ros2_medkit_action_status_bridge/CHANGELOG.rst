@@ -2,6 +2,19 @@
 Changelog for package ros2_medkit_action_status_bridge
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.1 (2026-11-18)
+------------------
+* Exits 0 when ``SIGINT`` lands during startup, in a timer or in a status callback. ``SIGINT`` and ``SIGTERM`` are held until the node and its executor are built
+* Waits for the action server's node name before the first report, so the first fault is attributed to the right node
+* Contributors: @bburda
+
+0.7.0 (2026-08-27)
+------------------
+* A deferred fault report is retried instead of dropped, and delivered promptly through a fast retry timer rather than waiting for the next ordinary cycle (`#472 <https://github.com/selfpatch/ros2_medkit/pull/472>`_)
+* Silent parameter coercion is closed off, including a NaN that passed a ``FloatingPointRange`` descriptor and two integer narrowing paths where an out-of-range value wrapped back into the legal band before its own check ran. A value the node refuses or corrects is now reported rather than applied quietly (`#607 <https://github.com/selfpatch/ros2_medkit/pull/607>`_)
+* Build and test only: the package is instrumented for coverage (`#582 <https://github.com/selfpatch/ros2_medkit/pull/582>`_), every integration launch test runs on its own DDS domain taken at run time (`#551 <https://github.com/selfpatch/ros2_medkit/pull/551>`_, `#597 <https://github.com/selfpatch/ros2_medkit/pull/597>`_), and the suite synchronises on bridge discovery before raising a fault instead of assuming the graph has settled (`#504 <https://github.com/selfpatch/ros2_medkit/pull/504>`_)
+* Contributors: @bburda, @mfaferek93
+
 0.6.0 (2026-06-22)
 ------------------
 * Initial release: generic action-status bridge. Watches every

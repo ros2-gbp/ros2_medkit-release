@@ -82,11 +82,97 @@ When ``filter_internal_nodes`` is true (the default), ROS 2 nodes whose names
 start with an underscore (``_``) are excluded from the entity tree. This
 filters out ROS 2 internal infrastructure nodes such as ``_ros2cli_*``,
 ``_param_client_node``, and similar system nodes that should not appear as
-SOVD entities. The filter applies to both locally discovered Apps and
-peer-discovered Apps (after stripping the peer prefix).
+SOVD entities. For an App that runtime discovery found, only the node name
+decides. A bare name shared across namespaces gives the App a
+namespace-qualified id, such as ``line_a__ros2_medkit_gateway_sub`` for a hidden
+node or ``_ops_camera`` for the visible ``/_ops/camera``, and that id does not
+change the outcome. An App declared by a manifest or a plugin is judged by its
+id. Apps that a peer reports are not filtered again: each gateway filters its own
+nodes, so a peer that runs with ``filter_internal_nodes: false`` shows its hidden
+nodes through the aggregator too.
+
+The same switch also excludes the helper nodes the gateway runs inside its own
+process. Three of them exist in every deployment, named after the gateway node
+and placed in its namespace:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Node
+     - What it is
+   * - ``_<gateway>_sub``
+     - The subscription executor that serves ``/data`` reads and cyclic
+       subscriptions.
+   * - ``_<gateway>_fault_clients``
+     - The service clients that talk to the fault manager.
+   * - ``_<gateway>_lifecycle_state_reader``
+     - The client that reads managed nodes' lifecycle state.
+   * - ``_<gateway>_lifecycle_watcher``
+     - graph_watchdog's own lifecycle state client. It exists only while that
+       plugin is loaded.
+
+Their names begin with an underscore, so the convention above already keeps
+them out of runtime discovery. The gateway also recognises them by fully
+qualified name, so an App bound to one of them is left out whatever its id.
+They carry no parameters, services or actions of their own, so there is nothing
+on them to diagnose.
+
+A manifest- or plugin-declared App bound to one of this gateway's own helper
+nodes is not served, and the gateway logs a warning naming it: bind the App to
+the node you meant, or drop the declaration.
+
+While this setting is ``true`` they are also left out of the linking report on
+``GET /health`` - ``discovery.linking.orphan_count``, and the
+``ros_node_fqns`` of the ``unmanifested_nodes`` warning raised under
+``unmanifested_nodes: error``: a node that can never be an App is not a node to
+declare in a manifest. That report exists only in ``hybrid`` mode, where
+manifest apps are linked to runtime nodes; ``runtime_only`` has no linking block
+at all.
+
+**The helper rule leaves the gateway's own node an App.** Its ROS parameters
+are what the gateway serves as that App's configurations, so
+``/apps/<gateway>/configurations`` is where a client reads and writes them -
+there is no other entity carrying, for instance,
+``aggregation.peer_auth_header``. Two gateways watching one graph also have to
+agree about what is on it, which they cannot do if each hides a different node.
+A gateway whose node name starts with ``_`` is the exception: runtime discovery
+hides that node like any other such node, so no runtime App carries those
+parameters. A declared App bound to it is judged by its id: one whose id does
+not start with ``_`` is served and carries the parameters.
+
+Names and namespaces: each helper node is created in the gateway's namespace,
+and a node-local remap fixes its name. A process-wide namespace remap
+(``-r __ns:=/line_a``) and a remap naming the gateway alone
+(``-r ros2_medkit_gateway:__ns:=/line_a``) both move all four nodes together. A
+process-wide name remap (``-r __node:=gateway_a``, which launch_ros
+``Node(name=...)`` passes) renames the gateway node only, and the helper nodes
+take the new name as the base of their own (``_gateway_a_sub`` and so on).
+
+Several gateways on one graph: every helper node starts with an underscore, so
+each gateway leaves out all of them, its own and the other gateways', also when
+the gateways share a node name and differ only in namespace. With runtime
+discovery and the same configuration, the gateways list the same Apps. A
+declared App bound to another gateway's helper node is judged by its id like
+any other declared App, so it is served, and no warning is logged. In
+``hybrid`` mode the linking report leaves out only the reporting gateway's own
+helper nodes. Another gateway's helper nodes count as undeclared, like any
+other hidden node such as ``_param_client_node``.
+
+Give each gateway its own node name when several run on one ROS graph. With a
+shared name, the App id of a gateway outside the root namespace depends on the
+graph: it is the bare name while no other node has that name, and
+namespace-qualified (``line_a_ros2_medkit_gateway``) while one does. Either
+remap gives the gateway its own name: ``-r __node:=gateway_a``, or
+``-r ros2_medkit_gateway:__node:=gateway_a``.
 
 Set to ``false`` if you need to expose all ROS 2 nodes regardless of naming
-convention.
+convention. That re-exposes the underscore nodes, the three helper nodes among
+them, and in ``hybrid`` mode the linking report follows: a helper node the
+gateway serves as an App is also an undeclared one, so it is counted in
+``discovery.linking.orphan_count`` and, under ``unmanifested_nodes: error``,
+named in the ``ros_node_fqns`` of the ``unmanifested_nodes`` warning. With
+``true`` it appears in neither.
 
 Function Entities from Namespaces
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -99,8 +185,33 @@ Function Entities from Namespaces
 
 When ``create_functions_from_namespaces`` is true (the default), each ROS 2
 namespace becomes a Function entity that groups the Apps in that namespace.
-This is the SOVD-correct mapping where Functions represent logical capabilities
-(what the software does) rather than deployment topology.
+The Function takes the first namespace segment as its id, so ``/line_a/cell_2``
+belongs to ``line_a``, and the Apps in the root namespace form the Function
+``root``. This is the SOVD-correct mapping where Functions represent logical
+capabilities (what the software does) rather than deployment topology.
+
+.. _discovery-function-hosts:
+
+**One rule for Function hosts.** After every filter and merge has run, each
+Function keeps only the hosts that name an App or a Component this gateway
+serves. A Function that only runtime discovery created is not served once it
+has no host left, on ``GET /functions/{id}`` and on ``GET /functions/{id}/hosts``
+alike. A namespace with no served App therefore has no Function, the root
+namespace included. A Function that a manifest, a plugin or a peer also
+contributes stays, also when it loses every host. The rule does not depend on
+why a host is not served: ``filter_internal_nodes``, a node linked to a
+manifest App (served under the manifest id), ``unmanifested_nodes: ignore``,
+``allow_heuristic_apps: false``, a namespace blacklist or whitelist, or a
+declared host that names nothing. A peer host that names a peer App renamed
+for an id collision is listed under the new id, ``<peer>__<id>``.
+
+The rule covers the Functions this gateway answers itself. A Function that only
+a peer contributes is forwarded: ``GET /functions/{id}`` answers with the peer's
+view, so the peer's own ``filter_internal_nodes`` decides which hosts that answer
+lists. ``GET /functions/{id}/hosts`` is answered here and lists only Apps this
+gateway serves. A Function's resource collections (data, operations and the
+others) fan out to every peer that contributes to it, and each peer answers with
+its own view.
 
 Merge Pipeline (Hybrid Mode)
 -----------------------------
@@ -132,6 +243,34 @@ This is useful when running beacon plugins as the sole enrichment source
 When a layer is disabled, its entities are not discovered and its merge
 contributions are skipped. Plugins always run regardless of these flags.
 
+Manifest Loading
+^^^^^^^^^^^^^^^^
+
+.. list-table::
+   :header-rows: 1
+   :widths: 34 8 14 44
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``discovery.manifest_strict_validation``
+     - bool
+     - ``true``
+     - Treat manifest validation WARNINGS as fatal. Validation errors (broken
+       references, circular dependencies, duplicate bindings) always abort the
+       load whatever this is set to, and a manifest is only ever applied whole,
+       so turning this off never loads a partly-valid manifest - it only lets
+       warnings through. Turn it off to bring up a manifest that is still being
+       written.
+   * - ``discovery.manifest.fragments_dir``
+     - string
+     - ``""``
+     - Directory of manifest fragment YAML files. Every load and reload of the
+       manifest scans it and merges the apps, components and functions it finds
+       on top of the base manifest, so a fleet can ship one base file plus
+       per-robot fragments. Empty disables fragment loading.
+
 Field Groups
 ^^^^^^^^^^^^
 
@@ -150,7 +289,10 @@ Field Groups
    * - ``status``
      - is_online, bound_fqn
    * - ``metadata``
-     - source, ros_binding, external, x-medkit extensions, custom metadata fields
+     - ros_binding, external, x-medkit extensions, custom metadata fields.
+       **Not** ``source``: an entity's provenance decides whether the orphan
+       filter may delete it, so it is never negotiated between layers and
+       setting ``layers.manifest.metadata`` does not move it.
 
 Merge Policies
 ^^^^^^^^^^^^^^
@@ -174,6 +316,25 @@ Each layer declares a policy per field-group:
 
 - Manifest: ``authoritative`` for identity/hierarchy/metadata, ``enrichment`` for live_data, ``fallback`` for status
 - Runtime: ``authoritative`` for live_data/status, ``enrichment`` for metadata, ``fallback`` for identity/hierarchy
+
+.. note::
+
+   The app ``external`` classification is tri-state (unset / ``true`` /
+   ``false``), so it follows the policy table with one refinement: a layer that
+   does not classify the app (a manifest entry that omits ``external:``) never
+   clears or shadows a classification another layer contributed. A manifest stub
+   that omits ``external:`` therefore keeps a protocol plugin's introspected
+   ``external: true`` (so the app still owns its faults via bare-id fault scope
+   in hybrid mode). An *explicit* value is authoritative and resolves by normal
+   layer priority: an authoritative manifest ``external: false`` overrides a
+   plugin's ``external: true``. Only omission is a no-op; an explicit value is
+   never silently discarded.
+
+   The same tri-state field and merge priority apply to Components: an
+   external Component with no bound child Apps owns its fault-scope by entity
+   id, so an Area or Function hosting it rolls up its faults without a
+   synthetic child App. Components have no ``ros_binding``, so there is no
+   equivalent to the App's R013 contradiction check.
 
 Override per-layer policies in ``gateway_params.yaml``. Empty string means
 "use layer default". Policy values are **case-sensitive** and must be lowercase
@@ -243,31 +404,47 @@ Health Endpoint
 ^^^^^^^^^^^^^^^
 
 ``GET /api/v1/health`` includes a ``discovery`` section in hybrid mode with
-pipeline stats, linking results, and merge warnings:
+pipeline stats and linking results. The ``warnings`` array and
+``warning_schema_version`` are unconditional - they are served in every mode,
+and an empty array means the gateway has no anomaly to report (see
+:doc:`/api/warning_codes`). ``discovery.linking`` is the conditional part: it
+appears only when a manifest is loaded, and ``unmanifested_policy`` carries the
+configured :ref:`unmanifested_nodes <manifest-unmanifested-nodes>` value so a
+client can evaluate ``orphan_count > 0 && unmanifested_policy == "error"``
+without parsing prose.
 
 .. code-block:: json
 
    {
      "status": "healthy",
+     "warnings": [],
+     "warning_schema_version": 2,
      "discovery": {
        "mode": "hybrid",
        "strategy": "hybrid",
        "pipeline": {
-         "layers": ["manifest", "runtime", "plugin"],
-         "total_entities": 6,
-         "enriched_count": 5,
+         "layers": ["manifest", "runtime"],
+         "total_entities": 9,
+         "enriched_count": 1,
          "conflict_count": 0,
          "conflicts": [],
          "id_collisions": 0,
          "filtered_by_gap_fill": 0
        },
        "linking": {
-         "linked_count": 5,
-         "orphan_count": 1,
-         "binding_conflicts": 0
+         "linked_count": 2,
+         "orphan_count": 5,
+         "binding_conflicts": 0,
+         "unmanifested_policy": "warn"
        }
      }
    }
+
+The response also carries the ``x-medkit-data-provider``,
+``x-medkit-entity-cache`` and ``x-medkit-subscription-executor`` statistics
+objects, omitted here. ``layers`` lists one entry per active layer, and a
+discovery plugin contributes under its own registered name (for example
+``"opcua"``) rather than a literal ``"plugin"``.
 
 Configuration Example
 ---------------------
@@ -379,6 +556,17 @@ Configuration
        # Rate limit for incoming beacon messages
        # Default: 100
        plugins.topic_beacon.max_messages_per_second: 100
+
+``beacon_ttl_sec`` takes 0.1 to 2147483647 s, ``beacon_expiry_sec`` 1.0 to 2147483647 s, and
+``max_messages_per_second`` 1 to 10000. A value above its maximum, including ``.inf`` in a
+parameter file, becomes the maximum. NaN, ``-.inf`` and a value below the minimum become the
+minimum. The gateway logs a warning naming the key, the value and what replaced it. Messages
+over the rate limit are dropped without a log.
+
+``max_hints`` takes an integer from 1 to 2147483647. A 64-bit integer outside that range
+becomes the nearer bound, with the same warning. The parameter parser reads an integer that
+does not fit in 64 bits as a double. A double, such as ``1.0e12`` or ``.nan``, is refused with
+a warning and the default 10000 is used.
 
 Beacon Lifecycle
 ^^^^^^^^^^^^^^^^
@@ -534,6 +722,36 @@ Configuration
        # Maximum number of hints to keep in memory
        # Default: 10000
        plugins.parameter_beacon.max_hints: 10000
+
+Every duration takes its minimum - 0.1 s, and 1.0 s for ``beacon_expiry_sec`` - up to
+2147483647 s. Fast DDS keeps the seconds of a wait in a 32-bit signed integer, and a longer
+``param_timeout_sec`` would make the poll thread spin. A value above the maximum, including
+``.inf`` in a parameter file, becomes the maximum. NaN, ``-.inf`` and a value below the
+minimum become the minimum. The gateway logs a warning naming the key, the value and what
+replaced it.
+
+``max_hints`` takes an integer from 1 to 2147483647. A 64-bit integer outside that range
+becomes the nearer bound, with the same warning. The parameter parser reads an integer that
+does not fit in 64 bits as a double. A double, such as ``1.0e12`` or ``.nan``, is refused with
+a warning and the default 10000 is used.
+
+In ``runtime_only`` and ``manifest_only`` mode the plugin reads its poll targets from the
+ROS graph. In ``hybrid`` mode the merge pipeline passes it the discovered Apps, but the
+gateway's refresh then calls it again with no Apps, which clears them. So a poll cycle mostly
+reads the graph there too; only a cycle that starts between the two calls polls the nodes of
+the online Apps that discovery bound to a node. A graph read skips hidden nodes (a name
+starting with ``_``, the gateway's helper nodes among them) and the gateway's own node: they
+carry no beacon.
+
+A parameter request that gets no answer within ``param_timeout_sec`` - waiting for the
+service, listing parameters or getting their values - is given up and removed from its
+client, and the node is skipped for the next 1, 2, 4 and then 8 poll cycles while it keeps
+timing out. A node that answers is polled on every cycle, also when its answer carries no
+values: rclpy answers so when one of the parameters asked for is declared with a type and no
+value, and the plugin then stores no hint for the node. None of this is logged.
+
+Each node keeps one parameter client across poll cycles. A node that is no longer a poll
+target, also when no node is, loses its client and its skip count.
 
 Parameter Naming
 ^^^^^^^^^^^^^^^^

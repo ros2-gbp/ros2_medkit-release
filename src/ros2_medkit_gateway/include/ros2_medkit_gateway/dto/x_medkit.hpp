@@ -24,6 +24,7 @@
 
 #include "ros2_medkit_gateway/dto/aggregation.hpp"
 #include "ros2_medkit_gateway/dto/contract.hpp"
+#include "ros2_medkit_gateway/dto/entity_capability.hpp"
 
 namespace ros2_medkit_gateway {
 namespace dto {
@@ -99,7 +100,9 @@ inline constexpr std::string_view dto_name<XMedkitArea> = "XMedkitArea";
 //   variant           <- comp.variant           (via ext.add())
 //   description       <- comp.description       (via ext.add())
 //   contributors      <- comp.contributors
-//   capabilities      <- capabilities JSON array (via ext.add())
+//   capabilities      <- the same EntityCapability array the response carries at root level
+//   external          <- comp.external, non-ROS external asset classification; emitted true-only on every
+//                        route that carries the component x-medkit, so "absence == not external" holds (#516)
 //
 // Also used in sub-collection responses (depends-on, subcomponents, hosts, contains, etc.):
 //   missing           <- true when component reference cannot be resolved
@@ -117,8 +120,15 @@ struct XMedkitComponent {
   std::optional<std::string> variant;
   std::optional<std::string> description;
   std::optional<std::vector<std::string>> contributors;
-  std::optional<nlohmann::json> capabilities;  // free-form JSON array
-  std::optional<bool> missing;                 // broken reference sentinel
+  std::optional<std::vector<EntityCapability>> capabilities;
+  // Asset-identity nameplate (AssetIdentity::to_json shape: camelCase fields +
+  // "_provenance"). Free-form JSON so the DTO layer reuses the exact
+  // serialization emitted by Component::to_json and consumed by peer parsing.
+  std::optional<nlohmann::json> identity;
+  std::optional<bool> missing;   // broken reference sentinel
+  std::optional<bool> external;  // non-ROS external asset classification (#516)
+  // Emitted only when false; an absent field means reachable.
+  std::optional<bool> available;
 };
 
 template <>
@@ -128,7 +138,8 @@ inline constexpr auto dto_fields<XMedkitComponent> = std::make_tuple(
     field("dependsOn", &XMedkitComponent::depends_on), field("area", &XMedkitComponent::area),
     field("variant", &XMedkitComponent::variant), field("description", &XMedkitComponent::description),
     field("contributors", &XMedkitComponent::contributors), field("capabilities", &XMedkitComponent::capabilities),
-    field("missing", &XMedkitComponent::missing));
+    field("identity", &XMedkitComponent::identity), field("missing", &XMedkitComponent::missing),
+    field("external", &XMedkitComponent::external), field("available", &XMedkitComponent::available));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitComponent> = "XMedkitComponent";
@@ -142,6 +153,8 @@ inline constexpr std::string_view dto_name<XMedkitComponent> = "XMedkitComponent
 //   ros2.node     <- app.bound_fqn
 //   component_id  <- app.component_id
 //   contributors  <- app.contributors  (detail only)
+//   external      <- app.external, non-ROS external asset classification; emitted true-only on every route
+//                    that carries the app x-medkit, so "absence == not external" holds (#516/#517)
 //
 // Also used in sub-collection responses (depends-on, hosts, function-hosts):
 //   missing       <- true when app reference cannot be resolved
@@ -152,14 +165,20 @@ struct XMedkitApp {
   std::optional<bool> is_online;
   std::optional<std::string> component_id;
   std::optional<std::vector<std::string>> contributors;
-  std::optional<bool> missing;  // broken reference sentinel
+  std::optional<bool> missing;   // broken reference sentinel
+  std::optional<bool> external;  // non-ROS external asset classification (#516/#517)
+  /// Absent while the entity is reachable. False marks an entity retained from
+  /// a peer's last known declaration while that peer is not answering, so a
+  /// client can tell "declared but unreachable" from "gone".
+  std::optional<bool> available;
 };
 
 template <>
 inline constexpr auto dto_fields<XMedkitApp> =
     std::make_tuple(field("ros2", &XMedkitApp::ros2), field("source", &XMedkitApp::source),
                     field("is_online", &XMedkitApp::is_online), field("component_id", &XMedkitApp::component_id),
-                    field("contributors", &XMedkitApp::contributors), field("missing", &XMedkitApp::missing));
+                    field("contributors", &XMedkitApp::contributors), field("missing", &XMedkitApp::missing),
+                    field("external", &XMedkitApp::external), field("available", &XMedkitApp::available));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitApp> = "XMedkitApp";
@@ -198,6 +217,7 @@ inline constexpr std::string_view dto_name<XMedkitFunction> = "XMedkitFunction";
 //   contributors       <- (optional aggregation provenance, included for completeness)
 //   partial            <- true when a fan-out peer request failed
 //   failed_peers       <- list of peer URLs that returned errors
+//   peer_failures      <- why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items <- per-peer items dropped due to malformed JSON
 //                         (observability for invisible drift)
 // ---------------------------------------------------------------------------
@@ -206,6 +226,10 @@ struct XMedkitCollection {
   std::optional<std::vector<std::string>> contributors;
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
@@ -213,6 +237,7 @@ template <>
 inline constexpr auto dto_fields<XMedkitCollection> = std::make_tuple(
     field("total_count", &XMedkitCollection::total_count), field("contributors", &XMedkitCollection::contributors),
     field("partial", &XMedkitCollection::partial), field("failed_peers", &XMedkitCollection::failed_peers),
+    field("peer_failures", &XMedkitCollection::peer_failures),
     field("peer_dropped_items", &XMedkitCollection::peer_dropped_items));
 
 template <>
