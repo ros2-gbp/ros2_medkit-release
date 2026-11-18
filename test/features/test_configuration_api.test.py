@@ -26,7 +26,10 @@ import launch_testing
 import launch_testing.actions
 import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
+from ros2_medkit_test_utils.constants import (
+    ALLOWED_EXIT_CODES,
+    PARAM_SERVICE_TIMEOUT,
+)
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
 
@@ -43,6 +46,40 @@ class TestConfigurationApi(GatewayTestCase):
 
     MIN_EXPECTED_APPS = 1
     REQUIRED_APPS = {'temp_sensor'}
+
+    # Monotonic param-service readiness, cached across this class's tests.
+    _param_service_ready = False
+    _param_service_dead = False
+
+    def setUp(self):
+        """Wait for the node's parameter service before each test.
+
+        The configurations endpoints read the ROS 2 parameter service on the
+        temp_sensor node, which can be briefly unavailable just after discovery
+        (the endpoint returns 503 until it is ready) - more likely under the
+        slowdown of the sanitizer jobs. Gate every test on it being ready.
+
+        Readiness is monotonic, so cache it on the class: only the first test
+        polls (up to PARAM_SERVICE_TIMEOUT); the rest return immediately. On a
+        genuinely dead service the first poll times out and marks the class dead
+        so the remaining tests fail fast, instead of each paying the full
+        timeout (which would blow the ctest job budget).
+        """
+        super().setUp()
+        cls = type(self)
+        if cls._param_service_ready:
+            return
+        if cls._param_service_dead:
+            self.fail('parameter service was not ready (cached from an earlier test)')
+        try:
+            self.poll_endpoint_until(
+                '/apps/temp_sensor/configurations',
+                timeout=PARAM_SERVICE_TIMEOUT,
+            )
+        except AssertionError:
+            cls._param_service_dead = True
+            raise
+        cls._param_service_ready = True
 
     def test_01_list_configurations(self):
         """GET /apps/{app_id}/configurations lists all parameters.
@@ -233,6 +270,39 @@ class TestConfigurationApi(GatewayTestCase):
         self.assertIn('parameters', data)
         self.assertEqual(data['parameters'].get('id'), 'nonexistent_param')
 
+    def test_06b_every_verb_rejects_an_oversized_config_id(self):
+        """GET, PUT and DELETE all enforce the 512-character `config_id` bound.
+
+        The OpenAPI document publishes `maxLength: 512` on every route carrying
+        `{config_id}`, from one table keyed by the parameter name - so it cannot
+        distinguish a route whose handler checks from one whose handler does
+        not. DELETE was that route: it read the capture and never measured it,
+        while GET and PUT both rejected. All three verbs are driven here so the
+        published bound is backed on each of them rather than on two out of
+        three. The `fault_code` half of the same table is covered by
+        `test_faults_api.test.py`.
+
+        @verifies REQ_INTEROP_049
+        @verifies REQ_INTEROP_050
+        @verifies REQ_INTEROP_052
+        """
+        oversized = 'p' * 513
+        base = f'{self.BASE_URL}/apps/temp_sensor/configurations/{oversized}'
+        for verb, call in (
+            ('GET', lambda: requests.get(base, timeout=10)),
+            ('PUT', lambda: requests.put(base, json={'data': 1.0}, timeout=10)),
+            ('DELETE', lambda: requests.delete(base, timeout=10)),
+        ):
+            with self.subTest(verb=verb):
+                response = call()
+                self.assertEqual(response.status_code, 400, f'{verb}: {response.text}')
+                self.assertIn('error_code', response.json())
+
+        # A 512-character id is inside the bound, so the rejection above is the
+        # length check and not the route refusing every long-ish name.
+        at_limit = f'{self.BASE_URL}/apps/temp_sensor/configurations/{"p" * 512}'
+        self.assertEqual(requests.get(at_limit, timeout=10).status_code, 404)
+
     def test_07_set_configuration_missing_value(self):
         """PUT configurations/{param_name} returns 400 when value missing.
 
@@ -249,6 +319,39 @@ class TestConfigurationApi(GatewayTestCase):
         self.assertIn('error_code', data)
         # SOVD format expects "data" field
         self.assertIn('data', data['message'].lower())
+
+    def test_07b_set_configuration_unconvertible_value(self):
+        """A value that cannot become the parameter's type is 400, not 500.
+
+        A mixed-type array makes the JSON->ParameterValue conversion throw, and
+        the throw used to land in the transport's outer catch, which reports
+        INTERNAL_ERROR and so answers 500 - the gateway taking the blame for a
+        body the caller chose. Both write paths are covered: temp_sensor is a
+        remote node (parameter service round trip) and the gateway node is its
+        own, and the conversion sits on both.
+
+        @verifies REQ_INTEROP_050
+        """
+        remote = requests.put(
+            f'{self.BASE_URL}/apps/temp_sensor/configurations/publish_rate',
+            json={'data': [1, 'not-a-number']},
+            timeout=10
+        )
+        self.assertEqual(remote.status_code, 400, remote.text)
+        self.assertEqual(remote.json()['error_code'], 'invalid-parameter')
+
+        own = requests.put(
+            f'{self.BASE_URL}/apps/ros2_medkit_gateway/configurations'
+            '/refresh_interval_ms',
+            json={'data': [1, 'not-a-number']},
+            timeout=10
+        )
+        self.assertEqual(own.status_code, 400, own.text)
+        self.assertEqual(own.json()['error_code'], 'invalid-parameter')
+
+        # The rejected write must not have changed anything.
+        after = self.get_json('/apps/temp_sensor/configurations/publish_rate')
+        self.assertEqual(after['x-medkit']['parameter']['value'], 2.0)
 
     def test_08_root_endpoint_includes_configurations(self):
         """Root endpoint lists configurations endpoints and capability.
