@@ -24,8 +24,10 @@
 
 namespace ros2_medkit_gateway::ros2 {
 
-Ros2ServiceTransport::Ros2ServiceTransport(rclcpp::Node * node)
-  : node_(node), serializer_(std::make_shared<ros2_medkit_serialization::JsonSerializer>()) {
+Ros2ServiceTransport::Ros2ServiceTransport(rclcpp::Node * node, rclcpp::CallbackGroup::SharedPtr rpc_group)
+  : node_(node)
+  , rpc_group_(std::move(rpc_group))
+  , serializer_(std::make_shared<ros2_medkit_serialization::JsonSerializer>()) {
   RCLCPP_INFO(node_->get_logger(), "Ros2ServiceTransport initialised (native serialization)");
 }
 
@@ -61,7 +63,7 @@ compat::GenericServiceClient::SharedPtr Ros2ServiceTransport::get_or_create_clie
     return it->second;
   }
 
-  auto client = compat::create_generic_service_client(node_, service_path, service_type);
+  auto client = compat::create_generic_service_client(node_, service_path, service_type, rpc_group_);
   clients_[key] = client;
 
   RCLCPP_DEBUG(node_->get_logger(), "Created generic client for %s (%s)", service_path.c_str(), service_type.c_str());
@@ -84,6 +86,7 @@ ServiceCallResult Ros2ServiceTransport::call(const std::string & service_path, c
     const auto wait_timeout = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout);
     if (!client->wait_for_service(wait_timeout)) {
       result.success = false;
+      result.outcome = CallOutcome::kServiceUnavailable;
       result.error_message = "Service not available: " + service_path;
       return result;
     }
@@ -120,6 +123,7 @@ ServiceCallResult Ros2ServiceTransport::call(const std::string & service_path, c
       // Format the wait budget with millisecond precision so a sub-second
       // timeout (e.g. 0.1s) is not silently rendered as "0s".
       const auto timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(timeout_secs).count();
+      result.outcome = CallOutcome::kTimeout;
       result.error_message = "Service call timed out (" + std::to_string(timeout_ms) + "ms): " + service_path;
       return result;
     }
@@ -133,6 +137,7 @@ ServiceCallResult Ros2ServiceTransport::call(const std::string & service_path, c
         if (type_info != nullptr) {
           result.response = serializer_->to_json(type_info, response_ptr.get());
           result.success = true;
+          result.outcome = CallOutcome::kOk;
           RCLCPP_DEBUG(node_->get_logger(), "Service call succeeded: %s", result.response.dump().c_str());
         } else {
           result.success = false;
