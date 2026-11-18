@@ -22,7 +22,10 @@
 #include <tuple>
 #include <vector>
 
+#include "ros2_medkit_gateway/core/http/warning_codes.hpp"
+#include "ros2_medkit_gateway/dto/aggregation.hpp"
 #include "ros2_medkit_gateway/dto/contract.hpp"
+#include "ros2_medkit_gateway/dto/enums.hpp"
 
 namespace ros2_medkit_gateway {
 namespace dto {
@@ -37,21 +40,27 @@ namespace dto {
 //                       NOTE: the old health_schema() declared this as
 //                       array<string>, but the handler always emitted size_t.
 //                       The DTO matches the actual wire format.
+//   unmanifested_policy - configured ManifestConfig::unmanifested_nodes value
+//                       ("ignore" | "warn" | "error" | "include_as_orphan"),
+//                       so a monitor can evaluate orphan_count > 0 &&
+//                       unmanifested_policy == "error" without parsing prose
 //   warnings          - optional list of diagnostic warning strings
 // =============================================================================
 struct HealthDiscoveryLinking {
   int64_t linked_count{0};
   int64_t orphan_count{0};
   int64_t binding_conflicts{0};
+  std::string unmanifested_policy;
   std::optional<std::vector<std::string>> warnings;
 };
 
 template <>
-inline constexpr auto dto_fields<HealthDiscoveryLinking> =
-    std::make_tuple(field("linked_count", &HealthDiscoveryLinking::linked_count),
-                    field("orphan_count", &HealthDiscoveryLinking::orphan_count),
-                    field("binding_conflicts", &HealthDiscoveryLinking::binding_conflicts),
-                    field("warnings", &HealthDiscoveryLinking::warnings));
+inline constexpr auto dto_fields<HealthDiscoveryLinking> = std::make_tuple(
+    field("linked_count", &HealthDiscoveryLinking::linked_count),
+    field("orphan_count", &HealthDiscoveryLinking::orphan_count),
+    field("binding_conflicts", &HealthDiscoveryLinking::binding_conflicts),
+    field_enum("unmanifested_policy", &HealthDiscoveryLinking::unmanifested_policy, kUnmanifestedPolicyValues),
+    field("warnings", &HealthDiscoveryLinking::warnings));
 
 template <>
 inline constexpr std::string_view dto_name<HealthDiscoveryLinking> = "HealthDiscoveryLinking";
@@ -81,30 +90,48 @@ template <>
 inline constexpr std::string_view dto_name<HealthDiscovery> = "HealthDiscovery";
 
 // =============================================================================
-// HealthAggregationWarning - single item inside Health::warnings array.
+// HealthWarning - single item inside Health::warnings array.
 //
-// Wire shape (from health_handlers.cpp handle_health agg-warning loop):
-//   code       - stable machine-readable warning code string (required)
-//   message    - human-readable description with remediation hints (required)
-//   entity_ids - SOVD entity IDs affected by the warning (required, array)
-//   peer_names - aggregation peers involved in the anomaly (required, array)
+// Wire shape (from health_handlers.cpp get_health):
+//   code          - stable machine-readable warning code string (required)
+//   message       - human-readable description with remediation hints (required)
+//   entity_ids    - SOVD entity ids this warning is about (required, array)
+//   ros_node_fqns - ROS node fully-qualified names this warning is about
+//                   (required, array)
+//   peer_names    - aggregation peers involved in the anomaly (required, array)
+//
+// INVARIANT, true for every code present and future: every element of
+// `entity_ids` is an addressable SOVD entity id - it satisfies
+// validate_entity_id() and `GET /{collection}/{id}` can be built from it. That
+// forbids ROS node FQNs there: validate_entity_id rejects '/' precisely
+// because it "conflicts with URL routing" (entity_validation.cpp), so a FQN in
+// `entity_ids` is a value no client can address. Node identifiers go in
+// `ros_node_fqns` instead. A warning that is not about ROS nodes leaves that
+// array empty, exactly as a warning that is not about aggregation leaves
+// `peer_names` empty.
+//
+// The three id arrays are plain vectors rather than std::optional on purpose:
+// SchemaWriter maps std::optional to anyOf:[T,null] (schema_writer.hpp), which
+// would publish a null state the server can never emit and hand every
+// generated client a tri-state to unpack. Empty array is the "none" value.
 // =============================================================================
-struct HealthAggregationWarning {
+struct HealthWarning {
   std::string code;
   std::string message;
   std::vector<std::string> entity_ids;
+  std::vector<std::string> ros_node_fqns;
   std::vector<std::string> peer_names;
 };
 
 template <>
-inline constexpr auto dto_fields<HealthAggregationWarning> =
-    std::make_tuple(field("code", &HealthAggregationWarning::code),
-                    field("message", &HealthAggregationWarning::message),
-                    field("entity_ids", &HealthAggregationWarning::entity_ids),
-                    field("peer_names", &HealthAggregationWarning::peer_names));
+inline constexpr auto dto_fields<HealthWarning> =
+    std::make_tuple(field_enum("code", &HealthWarning::code, kHealthWarningCodeValues),
+                    field("message", &HealthWarning::message), field("entity_ids", &HealthWarning::entity_ids),
+                    field("ros_node_fqns", &HealthWarning::ros_node_fqns),
+                    field("peer_names", &HealthWarning::peer_names));
 
 template <>
-inline constexpr std::string_view dto_name<HealthAggregationWarning> = "HealthAggregationWarning";
+inline constexpr std::string_view dto_name<HealthWarning> = "HealthWarning";
 
 // =============================================================================
 // Health - response for GET /health.
@@ -117,9 +144,13 @@ inline constexpr std::string_view dto_name<HealthAggregationWarning> = "HealthAg
 //                                   (from Ros2TopicDataProvider::x_medkit_stats())
 //   x-medkit-subscription-executor - optional free-form JSON stats object
 //                                    (from Ros2TopicDataProvider::x_medkit_stats())
+//   x-medkit-sse                  - optional free-form JSON object:
+//                                   {connected_clients, max_clients}
 //   peers                         - optional free-form JSON array (agg peer status)
-//   warning_schema_version        - optional integer (agg schema contract version)
-//   warnings                      - optional array of HealthAggregationWarning
+//   warning_schema_version        - integer warnings-contract version; always
+//                                   emitted, aggregation or not
+//   warnings                      - array of HealthWarning; always emitted,
+//                                   empty when nothing is flagged
 //
 // The x-medkit-* keys use hyphens (endpoint-level vendor extensions, NOT the
 // nested "x-medkit" pattern). They are free-form nlohmann::json objects because
@@ -133,17 +164,41 @@ struct Health {
   std::optional<nlohmann::json> x_medkit_data_provider;          // wire key: "x-medkit-data-provider"
   std::optional<nlohmann::json> x_medkit_subscription_executor;  // wire key: "x-medkit-subscription-executor"
   std::optional<nlohmann::json> x_medkit_entity_cache;           // wire key: "x-medkit-entity-cache"
-  std::optional<nlohmann::json> peers;                           // free-form array of peer status objects
-  std::optional<int64_t> warning_schema_version;
-  std::optional<std::vector<HealthAggregationWarning>> warnings;
+  /// How much of `sse.max_clients` is in use. Wire key: "x-medkit-sse".
+  ///
+  /// The cap is small - two by default - and an aggregating gateway now
+  /// consumes one slot on each of its peers for as long as somebody is
+  /// watching its own fault stream. Without this an operator has no way to see
+  /// why a peer refused their stream with 503.
+  std::optional<nlohmann::json> x_medkit_sse;
+  std::optional<nlohmann::json> peers;  // free-form array of peer status objects
+  /// Random id of this gateway process, present when aggregation is on. Wire
+  /// key: "x-medkit-instance-id". An aggregating peer reads it in its health
+  /// check, so a global fault-list fan-out can skip a gateway it already passed.
+  std::optional<std::string> x_medkit_instance_id;
+  // NOT optional: these two are emitted in every mode, aggregation or not, so
+  // the generated schema must list them in `required` and let a typed client
+  // read them without a presence check. An empty `warnings` array is the
+  // "nothing flagged" answer - absence is not a value this endpoint has.
+  int64_t warning_schema_version{kWarningSchemaVersion};
+  std::vector<HealthWarning> warnings;
 };
 
 template <>
 inline constexpr auto dto_fields<Health> = std::make_tuple(
-    field("status", &Health::status), field("timestamp", &Health::timestamp), field("discovery", &Health::discovery),
-    field("x-medkit-data-provider", &Health::x_medkit_data_provider),
+    field("status", &Health::status),
+    field("timestamp", &Health::timestamp,
+          "Gateway wall-clock reading taken while the response was being built, in nanoseconds since the Unix "
+          "epoch. Not monotonic: it follows the host clock, so two readings can move backwards across an NTP "
+          "step and the difference between them is not a reliable elapsed time."),
+    field("discovery", &Health::discovery), field("x-medkit-data-provider", &Health::x_medkit_data_provider),
     field("x-medkit-subscription-executor", &Health::x_medkit_subscription_executor),
-    field("x-medkit-entity-cache", &Health::x_medkit_entity_cache), field("peers", &Health::peers),
+    field("x-medkit-entity-cache", &Health::x_medkit_entity_cache), field("x-medkit-sse", &Health::x_medkit_sse),
+    field("peers", &Health::peers),
+    field("x-medkit-instance-id", &Health::x_medkit_instance_id,
+          "Random id of this gateway process, present when aggregation is enabled. Generated at startup and "
+          "carried on X-Medkit-Fan-Out-Visited by the global fault list, so a gateway already asked is not asked "
+          "again."),
     field("warning_schema_version", &Health::warning_schema_version), field("warnings", &Health::warnings));
 
 template <>
@@ -154,7 +209,7 @@ inline constexpr std::string_view dto_name<Health> = "HealthStatus";
 //
 // Wire shape (from health_handlers.cpp handle_version_info):
 //   version - gateway version string (required)
-//   name    - gateway name string, always "ros2_medkit" (required)
+//   name    - vendor name the host configured, "ros2_medkit" by default (required)
 // =============================================================================
 struct VersionInfoVendor {
   std::string version;
@@ -199,6 +254,7 @@ inline constexpr std::string_view dto_name<VersionInfoEntry> = "VersionInfoEntry
 // Wire keys (from merge_peer_items in fan_out_helpers.hpp):
 //   partial      - true when one or more peers failed during fan-out (optional)
 //   failed_peers - list of peer addresses that returned errors (optional)
+//   peer_failures - why each of those peers failed (timeout, unreachable, ...)
 //
 // Both fields are optional so the DTO is correctly empty (no "x-medkit" key
 // in the response) when there are no aggregation peers or the fan-out succeeds
@@ -207,11 +263,17 @@ inline constexpr std::string_view dto_name<VersionInfoEntry> = "VersionInfoEntry
 struct XMedkitVersionInfo {
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
 };
 
 template <>
-inline constexpr auto dto_fields<XMedkitVersionInfo> = std::make_tuple(
-    field("partial", &XMedkitVersionInfo::partial), field("failed_peers", &XMedkitVersionInfo::failed_peers));
+inline constexpr auto dto_fields<XMedkitVersionInfo> =
+    std::make_tuple(field("partial", &XMedkitVersionInfo::partial),
+                    field("failed_peers", &XMedkitVersionInfo::failed_peers),
+                    field("peer_failures", &XMedkitVersionInfo::peer_failures));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitVersionInfo> = "XMedkitVersionInfo";
@@ -328,7 +390,7 @@ inline constexpr std::string_view dto_name<RootTls> = "RootTls";
 // RootOverview - response for GET / (API root).
 //
 // Wire shape (from health_handlers.cpp handle_root):
-//   name         - "ROS 2 Medkit Gateway" (required)
+//   name         - server name the host configured, "ROS 2 Medkit Gateway" by default (required)
 //   version      - gateway version string (required)
 //   api_base     - API base path string (required)
 //   endpoints    - array of endpoint description strings (required)
