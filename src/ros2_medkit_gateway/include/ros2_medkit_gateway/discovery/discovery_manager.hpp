@@ -15,6 +15,8 @@
 #pragma once
 
 #include "ros2_medkit_gateway/core/discovery/discovery_enums.hpp"
+#include "ros2_medkit_gateway/core/discovery/entity_discovery.hpp"
+#include "ros2_medkit_gateway/core/discovery/layers/manifest_layer.hpp"
 #include "ros2_medkit_gateway/core/discovery/merge_types.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/app.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/area.hpp"
@@ -26,6 +28,7 @@
 #include "ros2_medkit_gateway/discovery/manifest/manifest_manager.hpp"
 #include "ros2_medkit_gateway/discovery/merge_pipeline.hpp"
 #include "ros2_medkit_gateway/ros2/providers/ros2_runtime_introspection.hpp"
+#include "ros2_medkit_gateway/ros2_common/graph_node_list.hpp"
 
 #include <map>
 #include <memory>
@@ -33,6 +36,7 @@
 #include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace ros2_medkit_serialization {
@@ -60,6 +64,12 @@ struct DiscoveryConfig {
   /// scripts, capabilities, lock_overrides) are reserved for the base
   /// manifest. See `ManifestManager::set_fragments_dir`.
   std::string manifest_fragments_dir;
+
+  /// CSV file describing manually inventoried assets. When non-empty, each row
+  /// becomes a Component (identity populated) appended to the manifest on every
+  /// load / reload and merged into the tree by id. Empty = disabled. See
+  /// `ManifestManager::set_inventory_csv_path`.
+  std::string inventory_csv_path;
 
   /**
    * @brief Runtime (heuristic) discovery options
@@ -135,7 +145,7 @@ struct DiscoveryConfig {
  * @see discovery::MergePipeline
  * @see discovery::ManifestManager
  */
-class DiscoveryManager : public ServiceActionResolver {
+class DiscoveryManager : public ServiceActionResolver, public EntityDiscovery {
  public:
   /**
    * @brief Construct the discovery manager
@@ -176,6 +186,9 @@ class DiscoveryManager : public ServiceActionResolver {
    */
   std::vector<App> discover_apps();
 
+  /// The ROS graph's node list through runtime discovery's reader, without its leftovers. Logs nothing.
+  ros2_common::GraphNodeList read_graph_nodes();
+
   /**
    * @brief Discover all functions
    * @return Vector of discovered Function entities (empty in runtime-only mode)
@@ -194,6 +207,17 @@ class DiscoveryManager : public ServiceActionResolver {
    */
   std::vector<Function> discover_functions(const std::vector<App> & apps);
 
+  /**
+   * @brief Ids of the given Functions that only runtime introspection created
+   *
+   * Takes the same branch as discover_functions(): every Function runtime
+   * discovery returns, none from a manifest, and in hybrid mode the ids only
+   * the runtime layer contributed to the last merge.
+   *
+   * @param functions What discover_functions() returned in this refresh
+   */
+  std::unordered_set<std::string> introspection_only_function_ids(const std::vector<Function> & functions);
+
   // =========================================================================
   // Entity lookup by ID
   // =========================================================================
@@ -203,28 +227,28 @@ class DiscoveryManager : public ServiceActionResolver {
    * @param id Area identifier
    * @return Area if found
    */
-  std::optional<Area> get_area(const std::string & id);
+  std::optional<Area> get_area(const std::string & id) override;
 
   /**
    * @brief Get component by ID
    * @param id Component identifier
    * @return Component if found
    */
-  std::optional<Component> get_component(const std::string & id);
+  std::optional<Component> get_component(const std::string & id) override;
 
   /**
    * @brief Get app by ID
    * @param id App identifier
    * @return App if found
    */
-  std::optional<App> get_app(const std::string & id);
+  std::optional<App> get_app(const std::string & id) override;
 
   /**
    * @brief Get function by ID
    * @param id Function identifier
    * @return Function if found
    */
-  std::optional<Function> get_function(const std::string & id);
+  std::optional<Function> get_function(const std::string & id) override;
 
   // =========================================================================
   // Relationship queries
@@ -359,6 +383,28 @@ class DiscoveryManager : public ServiceActionResolver {
    */
   discovery::ManifestManager * get_manifest_manager();
 
+  /**
+   * @brief Get the discovery configuration the manifest asked for
+   *
+   * Answers in every mode. There is no manifest manager in runtime_only, and
+   * a hybrid manifest that fails to load resets it, so this returns a
+   * default-constructed ManifestConfig in those cases - the same values the
+   * pipeline itself runs with.
+   */
+  discovery::ManifestConfig get_manifest_config() const override;
+
+  /**
+   * @brief Re-read the manifest configuration into the running pipeline
+   *
+   * Call after a successful manifest reload. `/health` reads the config live
+   * from the ManifestManager, but the pipeline captured it when it was built,
+   * so without this the served `unmanifested_policy` and the policy the
+   * orphan filter actually runs drift apart. Keeps the existing layers - in
+   * particular plugin layers added at runtime - and only refreshes the config
+   * and the manifest layer's policies.
+   */
+  void refresh_manifest_config();
+
   // =========================================================================
   // Status
   // =========================================================================
@@ -379,7 +425,7 @@ class DiscoveryManager : public ServiceActionResolver {
    * @brief Get current discovery mode
    * @return Active discovery mode
    */
-  DiscoveryMode get_mode() const {
+  DiscoveryMode get_mode() const override {
     return config_.mode;
   }
 
@@ -387,19 +433,19 @@ class DiscoveryManager : public ServiceActionResolver {
    * @brief Get a human-readable name for the active discovery configuration.
    * @return One of "runtime", "manifest", "hybrid".
    */
-  std::string get_strategy_name() const;
+  std::string get_strategy_name() const override;
 
   /**
    * @brief Get the last merge pipeline report (hybrid mode only)
    * @return MergeReport if in hybrid mode, nullopt otherwise
    */
-  std::optional<discovery::MergeReport> get_merge_report() const;
+  std::optional<discovery::MergeReport> get_merge_report() const override;
 
   /**
    * @brief Get the last linking result (hybrid mode only)
    * @return LinkingResult if in hybrid mode, nullopt otherwise
    */
-  std::optional<discovery::LinkingResult> get_linking_result() const;
+  std::optional<discovery::LinkingResult> get_linking_result() const override;
 
  private:
   /**
@@ -424,6 +470,11 @@ class DiscoveryManager : public ServiceActionResolver {
    */
   template <typename LayerT>
   void apply_layer_policy_overrides(const std::string & layer_name, LayerT & layer);
+
+  /// Apply the manifest layer's two policy sources in their required order:
+  /// the `allow_manifest_override` blanket demotion first, then the per-group
+  /// gateway parameters, so an explicit parameter keeps beating the flag.
+  void apply_manifest_layer_policies(discovery::ManifestLayer & manifest_layer);
 
   rclcpp::Node * node_;
   DiscoveryConfig config_;

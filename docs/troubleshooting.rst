@@ -73,6 +73,34 @@ For network access, set host to 0.0.0.0:
 
    ros2 launch ros2_medkit_gateway gateway.launch.py server_host:=0.0.0.0
 
+**"Connection reset by peer" or "Empty reply from server" from a container**
+
+.. code-block:: text
+
+   curl: (56) Recv failure: Connection reset by peer
+   curl: (52) Empty reply from server
+
+The gateway runs in a container on a bridge network with a published port
+(``-p 8080:8080``), ``curl`` inside the container works, and ``curl`` on the host
+fails. The gateway listens on the container's loopback: ``bringup.launch.py`` and
+``gateway.launch.py`` default to ``server_host:=127.0.0.1``. The startup log shows
+the bind address:
+
+.. code-block:: text
+
+   Configuration: REST API at 127.0.0.1:8080, backstop refresh interval: 30000ms
+
+Bind all interfaces inside the container:
+
+.. code-block:: bash
+
+   ros2 launch ros2_medkit_gateway bringup.launch.py server_host:=0.0.0.0
+
+Publish the port as ``-p 127.0.0.1:8080:8080`` to keep the API off the LAN;
+authentication is off by default. With ``--network host`` the default bind is
+enough, because the container shares the host's loopback. The Docker image's
+default command already binds ``0.0.0.0``.
+
 **Topic data returns empty or timeout**
 
 Possible causes:
@@ -163,9 +191,19 @@ For development, try ``network_mode: host``.
 
 **Web UI can't connect to gateway in container**
 
-1. Gateway must listen on ``0.0.0.0``, not ``127.0.0.1``
-2. CORS must allow the UI origin
-3. Port must be exposed in docker-compose
+1. Gateway must listen on ``0.0.0.0``, not ``127.0.0.1``. The image's default
+   command does; a launch file needs the argument:
+
+   .. code-block:: bash
+
+      ros2 launch ros2_medkit_gateway bringup.launch.py server_host:=0.0.0.0
+
+2. CORS must allow the UI origin exactly as the browser sends it (scheme, host
+   and port): ``http://127.0.0.1:3000`` is not ``http://localhost:3000``. The
+   defaults are ``http://localhost:3000`` and ``http://localhost:5173``. Pass
+   ``cors_allowed_origins:=<origin>,<origin>`` to the launch file for others; it
+   replaces the defaults, so list every origin you need.
+3. Port must be published (``-p 8080:8080`` or ``ports`` in docker-compose)
 
 Fault Manager Issues
 --------------------
@@ -183,6 +221,51 @@ The Faults API requires ``ros2_medkit_fault_manager`` node:
 Components must use ``ros2_medkit_fault_reporter`` to report faults.
 The REST API is read-only for fault status.
 
+.. _graph-provider-pending-troubleshooting:
+
+Graph Provider Issues
+---------------------
+
+**Every edge shows "pending" / no metrics**
+
+The ``x-medkit-graph`` metrics model has exactly one source of live data: a
+``/diagnostics`` producer whose ``DiagnosticStatus.name`` matches the topic's
+fully-qualified name byte-for-byte. With no such producer running, every
+edge's ``metrics_status`` stays ``"pending"`` forever - it never transitions
+to ``"active"`` or ``"error"`` on its own.
+
+Possible causes:
+
+1. **No ``/diagnostics`` producer is running** - nothing publishes
+   ``DiagnosticStatus`` messages for the topic at all.
+2. **The producer's monitored-topic list omits this topic** - many producers
+   (including the reference ``greenwave_monitor``) resolve their monitored
+   topics once at startup and never re-resolve; a topic added or renamed
+   afterward is silently skipped forever.
+3. **Name mismatch** - ``DiagnosticStatus.name`` must equal the ROS topic name
+   exactly (leading ``/``, no aliasing, no shortened form). Any other string
+   never matches, however close.
+4. **Producer started before its publishers existed** - a producer that
+   resolves its monitored topics once at startup (see cause 2) must be
+   started strictly after the topics it monitors already have live
+   publishers in the ROS graph.
+
+Check what is actually being published:
+
+.. code-block:: bash
+
+   ros2 topic echo /diagnostics --once
+
+If nothing appears, no producer is running - start one (see
+:doc:`/tutorials/graph-provider` for the reference ``greenwave_monitor``
+invocation). If a ``DiagnosticStatus`` for the topic IS present but the edge
+still reads ``pending``, compare its ``name`` field character-for-character
+against the topic's fully-qualified ROS name.
+
+See :doc:`/tutorials/graph-provider` for the full producer contract, and
+:doc:`/config/graph-provider` for the freshness/degradation thresholds that
+govern the ``active`` / ``error`` states once data does arrive.
+
 Performance Issues
 ------------------
 
@@ -191,15 +274,17 @@ Performance Issues
 Possible causes:
 
 1. **Many topics** - Response time scales with topic count
-2. **Slow publishers** - 3-second timeout per topic by default
-3. **Low parallelism** - Increase ``max_parallel_topic_samples``
+2. **Slow publishers** - the per-topic timeout applies (declared default 1.0 s,
+   2.0 s with the shipped ``gateway_params.yaml``)
+3. **Low parallelism** - Increase ``data_provider.max_parallel_samples``
 
 Optimize with:
 
 .. code-block:: yaml
 
-   max_parallel_topic_samples: 20  # Increase from default 10
-   topic_sample_timeout_sec: 0.5   # Decrease from default 1.0
+   data_provider:
+     max_parallel_samples: 32      # Increase from default 8
+   topic_sample_timeout_sec: 0.5   # Decrease from default 2.0
 
 **High CPU usage**
 

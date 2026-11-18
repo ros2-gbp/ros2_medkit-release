@@ -11,9 +11,9 @@ preserve topic data when faults are confirmed, enabling post-mortem debugging.
 Overview
 --------
 
-When a fault transitions to CONFIRMED status, the system can automatically
-capture data from configured ROS 2 topics. This snapshot preserves the
-system state at the moment of fault occurrence, similar to:
+When a fault transitions to CONFIRMED status, the system automatically
+captures data from ROS 2 topics. This snapshot preserves the system state
+at the moment of fault occurrence, similar to:
 
 - **AUTOSAR DEM freeze frames** - diagnostic data captured at fault detection
 - **SOVD environment data** - system context for fault analysis
@@ -24,10 +24,40 @@ Snapshots are useful for:
 - Understanding system state when a fault occurred
 - Post-mortem analysis without real-time access to the robot
 
+Capture works out of the box with **zero configuration**: when no explicit
+snapshot config matches a fault code, the faulting entity's own data is
+captured by default (see :ref:`entity-default-freeze-frames`). Explicit
+configuration always overrides the zero-config fallback when present.
+
 .. note::
 
-   Snapshots are automatically deleted when a fault is cleared via the
-   ``DELETE /api/v1/faults/{code}`` endpoint or ``~/clear_fault`` service.
+   By default, clearing a fault deletes its **value snapshots**, the per-topic
+   JSON captures this tutorial configures. Every clear reaches storage the same
+   way, whatever asked for it: the per-fault
+   ``DELETE /api/v1/apps/{app_id}/faults/{fault_code}`` route (``components``,
+   ``areas`` and ``functions`` carry the same one, though there is no global
+   ``DELETE /api/v1/faults/{code}``), the bulk
+   ``DELETE /api/v1/apps/{app_id}/faults`` and ``DELETE /api/v1/faults``, the
+   ``~/clear_fault`` service, and the correlation cascade, which clears a root
+   cause's symptoms with no clear addressed to them. The OPC UA plugin calls
+   that same service when a threshold alarm de-asserts, so a value going back
+   in range clears the fault the way an operator does; a native AlarmCondition
+   clears that way only once the operator has acknowledged it (and confirmed
+   it, unless ``require_confirm_for_clear`` is off), and stays CONFIRMED until
+   then. A plugin that de-asserts with a PASSED report instead, as the graph
+   watchdog does, goes through debounce and healing, and nothing on that path
+   deletes the snapshots: with ``healing_enabled`` the fault heals once its
+   counter reaches ``healing_threshold``, without it (the default) it stays
+   CONFIRMED, and its snapshots stay either way. Starting with healing disabled, globally or for
+   a code through its own ``healing_enabled: false``, takes the value snapshots
+   of that code's leftover HEALED rows as it reclassifies them, without a clear
+   at all. ``snapshots.retain_on_clear: true`` keeps the value snapshots
+   across all of it, and only those. The rosbag recording is not covered by that
+   setting. A clear deletes the recording under
+   ``snapshots.rosbag.auto_cleanup``, unless that is off or
+   ``snapshots.rosbag.max_bags_per_fault`` keeps a history. The cap then governs
+   retention, except at ``0`` (unlimited), where only
+   ``snapshots.rosbag.max_total_storage_mb`` bounds it.
 
 Quick Start
 -----------
@@ -46,11 +76,13 @@ Quick Start
 
       ros2 launch ros2_medkit_gateway gateway.launch.py
 
-3. **When a fault is confirmed, query its snapshots:**
+3. **When a fault is confirmed, read its snapshots from the fault itself:**
+
+   They are returned inline, under ``environment_data.snapshots``.
 
    .. code-block:: bash
 
-      curl http://localhost:8080/api/v1/faults/MOTOR_OVERHEAT/snapshots
+      curl http://localhost:8080/api/v1/apps/motor_controller/faults/MOTOR_OVERHEAT
 
 Configuration Options
 ---------------------
@@ -69,7 +101,12 @@ Configure snapshot capture via fault manager parameters:
      - Enable/disable snapshot capture
    * - ``snapshots.default_topics``
      - ``[]``
-     - Topics to capture for all faults
+     - Topics to capture for all faults (empty entries are ignored)
+   * - ``snapshots.entity_default``
+     - ``true``
+     - Zero-config fallback: when no explicit config matches a fault code,
+       capture the reporting source node's own published topics. Set to
+       ``false`` to opt out (unconfigured faults then get no freeze-frame).
    * - ``snapshots.config_file``
      - ``""``
      - Path to YAML config for fault-specific topics
@@ -81,20 +118,33 @@ Configure snapshot capture via fault manager parameters:
      - Maximum message size in bytes (larger messages skipped)
    * - ``snapshots.background_capture``
      - ``false``
-     - Use background subscriptions (caches latest message)
+     - Use background subscriptions (caches latest message). A topic that
+       appears after the fault manager starts is subscribed once it does.
    * - ``snapshots.recapture_cooldown_sec``
      - ``60.0``
      - Minimum seconds between snapshot captures for the same fault code.
        Prevents snapshot storms when a fault is reported repeatedly. Set to 0 to disable.
    * - ``snapshots.max_per_fault``
      - ``10``
-     - Maximum number of snapshots stored per fault code. When the limit is reached,
-       new snapshots for that fault are rejected. Set to 0 for unlimited.
+     - Maximum number of snapshot rows stored per fault code. One confirmation
+       writes one row per configured topic, and those rows are evicted together:
+       past the limit the OLDEST capture set is dropped whole. A capture larger
+       than the cap is kept anyway rather than torn, since half a freeze frame
+       is indistinguishable from topics that were silent. Set to 0 for
+       unlimited.
+   * - ``snapshots.retain_on_clear``
+     - ``false``
+     - Keep a fault's value snapshots when it is acknowledged. ``false`` is the
+       historical behaviour: clearing a fault deletes them. Turn it on together
+       with ``rosbag.max_bags_per_fault``, or acknowledging leaves the fault
+       holding recordings whose matching readings are gone. Independent of
+       ``max_per_fault``, which still bounds growth either way.
    * - ``snapshots.capture_pool_size``
      - ``2``
      - Max concurrent capture threads under a fault storm (>= 1). This parallelizes
-       freeze-frame snapshot capture only; rosbag capture is single-writer and
-       records one fault at a time regardless of this value.
+       freeze-frame snapshot capture only; rosbag capture stays single-writer
+       regardless of this value - correlated faults confirming inside one
+       post-roll window share a single recording.
    * - ``snapshots.capture_queue_depth``
      - ``16``
      - Max pending captures before the full-queue policy applies (>= 1).
@@ -130,6 +180,8 @@ For fault-specific topic capture, create a YAML configuration file:
 1. ``fault_specific`` - Exact match for fault code
 2. ``patterns`` - Regex pattern match (first matching pattern wins)
 3. ``default_topics`` - Fallback for all faults
+4. Entity-default - zero-config fallback when nothing above matches
+   (``snapshots.entity_default``, on by default)
 
 **Launch with config file:**
 
@@ -139,6 +191,94 @@ For fault-specific topic capture, create a YAML configuration file:
      -p snapshots.enabled:=true \
      -p snapshots.config_file:=/path/to/snapshots.yaml \
      -p snapshots.default_topics:="['/diagnostics']"
+
+.. _entity-default-freeze-frames:
+
+Zero-Config Entity Freeze-Frames
+--------------------------------
+
+With no snapshot configuration at all, every confirmed fault still carries
+at-fault-time context: the faulting entity's own current data. Two paths
+cover the two kinds of entities, both on by default with an opt-out flag,
+and explicit config (``fault_specific`` / ``patterns`` / ``default_topics``)
+always wins when it matches.
+
+**ROS-backed entities** (``snapshots.entity_default``, fault manager): when
+no explicit config matches the fault code, the fault manager captures the
+topics *published by the fault's reporting source node(s)* (resolved from
+``source_id``), excluding per-node noise (``/rosout``,
+``/parameter_events``) and capped at 16 topics. These captures always sample
+on demand, even when ``snapshots.background_capture`` is enabled, because
+the topics are not known until the fault confirms. If the source is not a
+live node (e.g. a plugin entity id) or publishes nothing, no freeze-frame
+row is written.
+
+**Plugin-backed entities** (``entity_freeze_frame.enabled``, gateway): PLC
+apps bridged by protocol plugins report faults under their bare SOVD entity
+id and their live values are not ROS topics, so the fault manager cannot
+capture them. Instead, the gateway snapshots the entity's data values as
+served by the owning plugin (its ``DataProvider``, i.e. the latest polled
+values) when the fault confirms, and merges them into the fault detail's
+``environment_data.snapshots`` as a standard ``freeze_frame`` entry named
+after the entity - unless the fault manager already captured a freeze-frame
+for that fault (explicit config wins). When the entity reports its link down
+(the loss-of-comms case), the frozen values are the plugin's last known ones
+and may predate the confirmation by the length of the outage; the entry's
+``x-medkit`` block then carries ``connected: false`` and, when the plugin's
+payload includes one, ``source_timestamp`` (the payload's own timestamp)
+alongside ``captured_at``.
+
+Faults that are already confirmed when the gateway starts are caught up at
+startup: the gateway lists the confirmed faults and captures a frame for each
+plugin-backed one, so a device standing in fault across a gateway restart
+still gets a frame. Catch-up frames carry ``"capture_origin": "startup"`` in
+their ``x-medkit`` block because their values were read at gateway start, not
+when the fault confirmed (which may be long before, since the fault manager
+persists faults); ``captured_at`` always stamps the moment the values were
+read. Frames without the marker were captured on the confirm edge. Disable
+with:
+
+.. code-block:: bash
+
+   ros2 run ros2_medkit_gateway gateway_node --ros-args \
+     -p entity_freeze_frame.enabled:=false
+
+A plugin entity's values are not a ROS message, so ``topic`` and
+``message_type`` are empty on these frames. ``x-medkit.source`` names the
+capture path instead, so a consumer can still tell where the values came
+from:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - ``x-medkit.source``
+     - Meaning
+   * - ``plugin_data_provider``
+     - Read through the owning plugin's ``DataProvider::list_data``.
+   * - ``plugin_x_plc_data_route``
+     - Read by dispatching the owning plugin's own ``x-plc-data`` route
+       in-process (plugins that export no ``DataProvider``).
+
+The field is absent on freeze-frames captured by the fault manager from a ROS
+topic. Those carry a real ``topic`` and ``message_type`` instead.
+
+Example plugin-entity freeze-frame in the fault response:
+
+.. code-block:: json
+
+   {
+     "type": "freeze_frame",
+     "name": "beckhoff_plc_app",
+     "data": {"tank_level": 87.5, "pump_running": true},
+     "x-medkit": {
+       "topic": "",
+       "message_type": "",
+       "source": "plugin_x_plc_data_route",
+       "full_data": {"tank_level": 87.5, "pump_running": true},
+       "captured_at": "2026-07-14T12:00:00.000Z"
+     }
+   }
 
 Querying Snapshots
 ------------------
@@ -186,7 +326,7 @@ Snapshots are included inline in the fault response as ``environment_data``:
          {
            "type": "rosbag",
            "name": "fault_recording",
-           "bulk_data_uri": "/apps/motor_controller/bulk-data/rosbags/550e8400-e29b-41d4-a716-446655440000",
+           "bulk_data_uri": "/apps/motor_controller/bulk-data/rosbags/fault_MOTOR_OVERHEAT_1738664999000",
            "size_bytes": 1234567,
            "duration_sec": 6.0,
            "format": "mcap"
@@ -201,8 +341,15 @@ Snapshots are included inline in the fault response as ``environment_data``:
 
 **Snapshot Types:**
 
-- ``freeze_frame``: Topic data captured at fault confirmation (JSON format)
-- ``rosbag``: Recording file available via bulk-data endpoint (binary format)
+- ``freeze_frame``: Data captured at fault confirmation (JSON format). Entity
+  frames caught up for faults that predate the gateway are captured at
+  gateway start instead, marked ``x-medkit.capture_origin: startup``; a
+  plugin entity that reports its link down contributes its last known values,
+  marked ``connected: false`` in ``x-medkit``
+- ``rosbag``: Recording file available via bulk-data endpoint (binary format).
+  One entry per recording the fault kept, newest first, each addressed by its own
+  ``bulk_data_uri``. With the default ``max_bags_per_fault`` of ``1`` there is at
+  most one.
 
 **Get snapshots from fault response using jq:**
 
@@ -261,7 +408,8 @@ Troubleshooting
 
 **Empty topics object in response**
 
-- The fault may have been cleared (snapshots are deleted on clear)
+- The fault may have been cleared (value snapshots are deleted on clear unless
+  ``snapshots.retain_on_clear`` is enabled)
 - No topics were configured for this fault code
 - All configured topics timed out or exceeded size limit
 
@@ -280,7 +428,10 @@ Rosbag Capture (Time-Window Recording)
 
 In addition to JSON snapshots, you can enable **rosbag capture** for "black box"
 style recording. This continuously buffers messages in memory and flushes them
-to a bag file when a fault is confirmed.
+to a bag file when a fault is confirmed. The recording is deleted when the fault
+is cleared, unless ``snapshots.rosbag.auto_cleanup`` is off or
+``snapshots.rosbag.max_bags_per_fault`` keeps a history, which takes over the
+retention decision.
 
 **Key differences from JSON snapshots:**
 
@@ -342,6 +493,12 @@ Rosbag Configuration Options
      - ``1.0``
      - Post-fault recording duration. After a fault is confirmed, recording
        continues for this many seconds to capture immediate system response.
+       A fault confirming while this window is still running attaches to the
+       in-flight recording and shares its bag, with one metadata entry per
+       fault. At most 32 faults attach on top of the first; any beyond that
+       are recorded in the bag's data but get no per-fault entry (logged as
+       a warning). A fault confirming just *after* the window closes gets a
+       post-fault-only bag - see `Bursts and the Window Boundary`_ below.
    * - ``snapshots.rosbag.topics``
      - ``"entity"``
      - Topic selection mode:
@@ -349,7 +506,9 @@ Rosbag Configuration Options
        - ``"entity"`` - Default. Subscribe broadly for pre-roll, but on fault
          confirmation write only the faulting source node's topics (resolved from
          the fault's reporting source) plus ``/tf`` and ``/tf_static``. Falls back
-         to the full buffer if the source is not a live node.
+         to the full buffer if the source is not a live node. A fault attaching
+         to an in-flight recording adds its own node's topics from that point
+         on (or widens the recording to all topics if its scope is unresolved).
        - ``"config"`` - Use same topics as JSON snapshots (from config file)
        - ``"all"`` or ``"auto"`` - Auto-discover and record all available topics
        - ``"explicit"`` - Use only topics from ``include_topics`` list
@@ -386,28 +545,145 @@ Rosbag Configuration Options
      - In-memory ring-buffer cap; oldest buffered messages drop once exceeded, so a
        broad subscribe set cannot grow memory without bound.
    * - ``snapshots.rosbag.format``
-     - ``"sqlite3"``
-     - Bag storage format: ``"sqlite3"`` (default, widely compatible) or
-       ``"mcap"`` (more efficient compression, requires plugin).
+     - ``"mcap"``
+     - Bag storage format: ``"mcap"`` (default; opens directly in Foxglove and
+       Lichtblick) or ``"sqlite3"`` (also what an unknown format string lands
+       on). Neither is privileged: whichever is configured, an unavailable
+       plugin falls back automatically to the other one, and capture disables
+       itself only if neither loads. Both plugins are runtime dependencies of
+       the package.
    * - ``snapshots.rosbag.storage_path``
      - ``""``
      - Directory for bag files. Empty string uses system temp directory
-       (``/tmp``). Bags are named ``fault_{code}_{timestamp}/``.
+       (``/tmp``). Bags are named ``fault_{code}_{timestamp}/`` after the first
+       fault of the recording; faults that attached during its post-roll window
+       are served from that same directory. From a fault code of about 224
+       characters the name keeps only a leading slice of the code, followed by
+       a digest of the whole of it, so two long codes sharing a prefix are
+       overwhelmingly unlikely to land on one directory. The threshold is not
+       the 255-byte limit on a path component - at 224 the directory name is
+       still only 244 bytes - but the room reserved inside that limit for the
+       data file rosbag2 writes *within* the directory, which is named after
+       it. Nothing reconstructs this name - the path is recorded in the
+       database when the bag is written - so the shortening is not something
+       callers need to reproduce.
    * - ``snapshots.rosbag.auto_cleanup``
      - ``true``
-     - Automatically delete bag files when faults are cleared. Set to ``false``
-       to retain bags for manual analysis.
+     - Automatically delete a fault's bag when it is cleared. A recording
+       shared by a burst of faults is deleted when the last fault referencing
+       it clears. Set to ``false`` to retain bags for manual analysis. Has no
+       effect once ``max_bags_per_fault`` is anything other than ``1``: a
+       history someone configured must not be what an acknowledgement takes
+       away, so the cap governs retention there instead.
    * - ``snapshots.rosbag.lazy_start``
      - ``false``
      - Controls when the ring buffer starts recording. See diagram below.
    * - ``snapshots.rosbag.max_bag_size_mb``
      - ``50``
      - Maximum size per bag file in MB. When exceeded, rosbag2 creates
-       additional segment files.
+       additional segment files. A recording split this way is fetched file by
+       file, see :ref:`below <tutorial-split-recording>`.
    * - ``snapshots.rosbag.max_total_storage_mb``
      - ``500``
      - Total storage limit for all bag files. Oldest bags are automatically
-       deleted when this limit is exceeded.
+       deleted when this limit is exceeded. The recording that was just written
+       is never one of them: when it alone is over the limit it is kept, a
+       warning is logged, and every older bag is deleted. A recording shared by a burst of
+       faults counts once towards the total, and eviction removes a whole
+       burst's bag at a time.
+   * - ``snapshots.rosbag.max_bags_per_fault``
+     - ``1``
+     - Recordings kept per fault code; ``0`` means unlimited. Past the cap the
+       fault's oldest recording is dropped, and a bag is deleted only once no
+       fault still references it (a burst shares one recording). ``1`` is the
+       historical behaviour - each re-confirmation replaces the previous bag;
+       ``3`` is a good starting point for an intermittent fault you are
+       chasing. This is a fairness knob rather than a depth knob:
+       ``max_total_storage_mb`` is the real disk bound, and a high value lets
+       one flapping fault consume the budget and evict every other fault's
+       recording.
+
+Bursts and the Window Boundary
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Faults rarely arrive alone. One root cause produces a burst, and where each fault
+of that burst lands relative to the previous ``duration_after_sec`` window decides
+what it gets. There is only ever one recording open (one ring buffer, one writer),
+so the three cases are:
+
+.. list-table::
+   :widths: 30 70
+   :header-rows: 1
+
+   * - When the fault confirms
+     - What it gets
+   * - No recording open, buffer holding history
+     - A **full bag**: the buffered pre-fault history plus the post-fault window.
+   * - Inside an open window
+     - **Attached** to the in-flight recording - the same bag, with its own
+       metadata entry. Up to 32 faults attach on top of the first.
+   * - No recording open, buffer empty
+     - A **post-fault-only bag**: its own recording holding just its
+       ``duration_after_sec`` window. Usually because a window has just closed;
+       also at startup, before anything has been published on a captured topic.
+
+What decides between the first and the third case is simply whether anything is in
+the buffer. Nothing is buffered while a window is open (messages go straight into the
+open bag), and the flush that opened that bag had already emptied the buffer, so the
+next fault to confirm can genuinely have no pre-fault history available.
+
+How often that happens depends on ``topics``. The broad modes - ``all``, ``auto`` and
+``entity``, which is the default - capture everything on the graph, including
+``/fault_manager/events``; reporting a fault publishes an event there, so the act of
+reporting refills the buffer and the next fault usually finds history after all. With
+a narrowed capture (``explicit``, a topic list, ``config``, or a broad mode listing
+``/fault_manager/events`` in ``exclude_topics``) the empty buffer is the normal shape
+of a burst. It still gets a black box
+covering how the system behaved *after* it failed, which is what the second fault
+of a burst is usually investigated for. A fault that confirms before any captured
+topic has published - right after startup, or under ``lazy_start`` - lands in the
+same case for the same reason. The log names the cause:
+
+.. code-block:: text
+
+   No pre-fault data buffered for fault 'BRAKE_PRESSURE_LOW' - recording post-fault window only
+
+Two consequences worth knowing:
+
+- **With** ``duration_after_sec: 0`` **there is no window**, so a fault landing on
+  an empty buffer gets no bag at all - there is neither history to write nor a
+  window to record into. If bursts matter to you, keep a non-zero post-fault
+  window.
+- **A post-fault-only bag may contain zero messages** if nothing publishes during
+  the window (a quiet system, or a narrow ``topics`` filter). It still finalises
+  and downloads normally on both storage formats; only the payload is empty.
+
+The stored ``duration_sec`` is the span the recording was open, not the configured
+windows, so the two kinds of bag are easy to tell apart:
+
+.. code-block:: bash
+
+   ros2 service call /fault_manager/get_rosbag ros2_medkit_msgs/srv/GetRosbag \
+     "{fault_code: 'BRAKE_PRESSURE_LOW'}"
+   # duration_sec ~= duration_after_sec -> post-fault-only bag
+   # anything longer                    -> the recording also holds pre-fault history
+
+The rule is a hint, not a test. A full bag flushed from a buffer holding only the
+last few milliseconds reports about as much as a post-fault-only one, so the two
+overlap; read it together with the bag's contents rather than on its own.
+
+Note the second rule has no upper bound, deliberately. The span can exceed
+``duration_sec + duration_after_sec``: pruning is driven by message arrival rather
+than by a timer, so when every captured topic stops publishing nothing prunes and the
+buffer keeps its last window
+until the next confirmation flushes it. That is intentional - the final messages
+before a topic died are exactly what a black box is for - and the reported
+duration reflects it.
+
+It is a *recording* span and not a *content* span: a post-fault-only bag whose
+window stayed quiet still reports its window rather than zero, because the useful
+statement is "the black box covered these seconds and nothing was published"
+rather than a bare ``0.0`` that would be indistinguishable from a broken artifact.
 
 Understanding lazy_start Mode
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -492,22 +768,19 @@ Saves resources but may miss context if fault confirms before buffer fills.
 
 .. note::
 
-   The ``"mcap"`` format requires ``rosbag2_storage_mcap`` to be installed.
-   ``"sqlite3"`` (the default) is always shipped with rosbag2 and needs no extra
-   package.
+   ``"mcap"`` (the default) opens directly in Foxglove and Lichtblick with no
+   conversion step. ``"sqlite3"`` is also what an unknown format string lands
+   on. Both ``rosbag2_storage_mcap`` and ``rosbag2_storage_default_plugins``
+   (which carries the sqlite3 plugin) are runtime dependencies of the package,
+   so both are installed alongside it, and neither is privileged over the
+   other.
 
    You do not have to switch formats manually: if a configured backend's plugin
-   is unavailable at startup, the FaultManager logs a warning naming the missing
-   package and automatically falls back to ``"sqlite3"`` for black-box capture.
-   If no storage backend is usable at all, rosbag capture self-disables (the node
-   keeps running and freeze-frame snapshots are unaffected) instead of crashing.
-
-   To use mcap (e.g. for Foxglove), install the plugin:
-
-   .. code-block:: bash
-
-      # Install MCAP support (optional)
-      sudo apt install ros-${ROS_DISTRO}-rosbag2-storage-mcap
+   is somehow still unavailable at startup, the FaultManager logs a warning
+   naming the missing package and automatically falls back to the other
+   backend for black-box capture. If neither storage backend is usable at all,
+   rosbag capture self-disables (the node keeps running and freeze-frame
+   snapshots are unaffected) instead of crashing.
 
 Downloading Rosbag Files
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -520,6 +793,12 @@ Rosbag files are downloaded via SOVD bulk-data endpoints.
 
    curl http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags
 
+One item per **recording**, not per fault. A burst of correlated faults shares a
+single recording and appears once, with every fault it covers listed in
+``x-medkit.fault_codes``. A fault that confirmed several times contributes one
+item per recording it kept (see ``max_bags_per_fault`` in the configuration
+table above).
+
 **Response:**
 
 .. code-block:: json
@@ -527,13 +806,14 @@ Rosbag files are downloaded via SOVD bulk-data endpoints.
    {
      "items": [
        {
-         "id": "550e8400-e29b-41d4-a716-446655440000",
-         "name": "MOTOR_OVERHEAT recording",
+         "id": "fault_MOTOR_OVERHEAT_1738664999000",
+         "name": "fault_MOTOR_OVERHEAT_1738664999000 recording 2026-02-04T10:30:00.000Z",
          "mimetype": "application/x-mcap",
          "size": 1234567,
          "creation_date": "2026-02-04T10:30:00.000Z",
          "x-medkit": {
-           "fault_code": "MOTOR_OVERHEAT",
+           "fault_codes": ["MOTOR_OVERHEAT"],
+           "recording_id": "fault_MOTOR_OVERHEAT_1738664999000",
            "duration_sec": 6.0,
            "format": "mcap"
          }
@@ -543,20 +823,64 @@ Rosbag files are downloaded via SOVD bulk-data endpoints.
 
 **2. Download a specific rosbag:**
 
-Use the ``bulk_data_uri`` from the fault response, or construct from listing:
+Use the ``bulk_data_uri`` from the fault response, or the descriptor ``id`` from
+the listing. A URL carrying a bare fault code instead of a recording id still
+resolves and serves that fault's newest recording, so addresses built before
+recordings had their own identity keep working.
 
 .. code-block:: bash
 
    # Using bulk_data_uri from fault response
-   curl -O -J http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags/550e8400-e29b-41d4-a716-446655440000
+   curl -O -J http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags/fault_MOTOR_OVERHEAT_1738664999000
 
 The ``-J`` flag uses the server-provided filename from ``Content-Disposition`` header.
 
-**3. Play back the rosbag:**
+.. _tutorial-split-recording:
+
+**A recording split across several files.** A recording larger than
+``max_bag_size_mb`` is several storage files, and the download above serves the
+first of them. The fault manager writes a ``manifest.json`` next to the files
+when it closes the recording. It lists the files in order, with the size and
+sha256 of each. In the listing, ``x-medkit.storage_files`` gives the number of
+files, and ``"manifest": true`` says that the recording has a manifest. Fetch the
+manifest, then each file by its position in it:
 
 .. code-block:: bash
 
-   ros2 bag play MOTOR_OVERHEAT.mcap
+   BASE=http://localhost:8080/api/v1/apps/motor_controller/bulk-data/rosbags/fault_MOTOR_OVERHEAT_1738664999000
+
+   curl -s $BASE/manifest -o manifest.json
+   mkdir fault_MOTOR_OVERHEAT_1738664999000
+   for i in $(seq 0 $(($(jq '.files | length' manifest.json) - 1))); do
+     name=$(jq -r ".files[$i].name" manifest.json)
+     curl -s $BASE/files/$i -o fault_MOTOR_OVERHEAT_1738664999000/$name
+     echo "$(jq -r ".files[$i].sha256" manifest.json)  fault_MOTOR_OVERHEAT_1738664999000/$name" | sha256sum -c
+   done
+
+The directory now holds the storage files but no ``metadata.yaml``, so ROS 2
+cannot open it as a bag yet. ``ros2 bag reindex`` reads the files and writes
+``metadata.yaml`` again:
+
+.. code-block:: bash
+
+   ros2 bag reindex -s $(jq -r .format manifest.json) fault_MOTOR_OVERHEAT_1738664999000
+   ros2 bag info fault_MOTOR_OVERHEAT_1738664999000
+
+An interrupted file download resumes with ``Range: bytes=<offset>-``. See
+:ref:`rest-rosbag-recording-files` for the manifest fields and the error
+answers.
+
+**3. Play back the rosbag:**
+
+A recording downloaded as one file plays from that file. A split recording
+plays from its directory, once it is reindexed, so every file is played in
+order:
+
+.. code-block:: bash
+
+   ros2 bag play fault_MOTOR_OVERHEAT_1738664999000.mcap
+
+   ros2 bag play fault_MOTOR_OVERHEAT_1738664999000
 
 **Via ROS 2 service (alternative):**
 
@@ -579,7 +903,6 @@ For production use with conservative resource usage:
      duration_after_sec: 0.5
      topics: "config"           # Use same topics as JSON snapshots
      lazy_start: true           # Save resources until fault detected
-     format: "sqlite3"
      max_bag_size_mb: 25
      max_total_storage_mb: 200
      auto_cleanup: true
@@ -602,7 +925,6 @@ For development with maximum context:
      duration_after_sec: 2.0    # 2 seconds after
      topics: "config"
      lazy_start: false          # Always recording
-     format: "sqlite3"
      storage_path: "/var/log/ros2_medkit/rosbags"
      max_bag_size_mb: 100
      max_total_storage_mb: 1000
