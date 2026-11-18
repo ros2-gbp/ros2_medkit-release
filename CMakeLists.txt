@@ -18,16 +18,22 @@ project(ros2_medkit_graph_provider)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Without this the package exports no compile_commands.json, so clang-tidy run
+# standalone - as the pre-push hook runs it - cannot resolve the gateway headers
+# this plugin includes and reports them as missing on files that compile clean.
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # Shared cmake modules (multi-distro compat)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
+include(ROS2MedkitCoverage)
+include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
 find_package(ros2_medkit_gateway REQUIRED)
-find_package(ros2_medkit_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
@@ -45,7 +51,6 @@ target_include_directories(ros2_medkit_graph_provider_plugin PRIVATE
 )
 
 medkit_target_dependencies(ros2_medkit_graph_provider_plugin
-  ros2_medkit_msgs
   ros2_medkit_gateway
   rclcpp
   diagnostic_msgs
@@ -82,8 +87,9 @@ if(BUILD_TESTING)
     file(GLOB_RECURSE _format_files
       "include/*.hpp" "src/*.cpp" "test/*.cpp"
     )
+    medkit_lint_config(.clang-format _clang_format_config)
     ament_clang_format(${_format_files}
-      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+      CONFIG_FILE "${_clang_format_config}")
   endif()
 
   find_package(ament_cmake_gtest REQUIRED)
@@ -97,9 +103,8 @@ if(BUILD_TESTING)
   unset(_gw_vendored)
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 120 END 129)
 
-  ament_add_gtest(test_graph_provider_plugin
+  medkit_add_gtest(test_graph_provider_plugin
     test/test_graph_provider_plugin.cpp
     src/graph_provider_plugin.cpp
   )
@@ -110,7 +115,6 @@ if(BUILD_TESTING)
     ros2_medkit_gateway
     rclcpp
     diagnostic_msgs
-    ros2_medkit_msgs
   )
   target_compile_definitions(test_graph_provider_plugin PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
   target_link_libraries(test_graph_provider_plugin
@@ -118,7 +122,6 @@ if(BUILD_TESTING)
     cpp_httplib_target
     OpenSSL::SSL OpenSSL::Crypto
   )
-  medkit_set_test_domain(test_graph_provider_plugin)
   ros2_medkit_relax_vendor_warnings()
 endif()
 
