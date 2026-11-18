@@ -31,6 +31,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "null_gateway_services.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/handlers/discovery_handlers.hpp"
 #include "ros2_medkit_gateway/dto/entities.hpp"
@@ -78,6 +79,13 @@ components:
     description: "Vehicle control unit"
     tags: ["compute", "control"]
     depends_on: ["lidar_unit", "ghost_component"]
+    identity:
+      manufacturer: "Acme Robotics"
+      model: "ECU-9000"
+      serial_number: "SN-MAIN-001"
+      role: "controller"
+      extra:
+        slot: "1"
   - id: "lidar_unit"
     name: "Lidar Unit"
     namespace: "/sensors"
@@ -85,6 +93,18 @@ components:
     parent_component_id: "main_ecu"
     description: "Lidar aggregation"
     tags: ["sensor"]
+  - id: ext_plc
+    name: "External PLC"
+    external: true
+    identity:
+      manufacturer: "Siemens"
+      serial_number: "SN-1"
+  - id: ext_sensor
+    name: "External Sensor"
+    parent_component_id: "main_ecu"
+    external: true
+    identity:
+      manufacturer: "Bosch"
 apps:
   - id: "planner"
     name: "Planner"
@@ -97,6 +117,10 @@ apps:
   - id: "standalone"
     name: "Standalone"
     description: "Standalone app without a hosting component"
+  - id: ext_app
+    name: "External App"
+    external: true
+    is_located_on: ext_plc
 functions:
   - id: "navigation"
     name: "Navigation"
@@ -186,7 +210,7 @@ class DiscoveryHandlersValidationTest : public ::testing::Test {
   CorsConfig cors_{};
   AuthConfig auth_{};
   TlsConfig tls_{};
-  HandlerContext ctx_{nullptr, cors_, auth_, tls_, nullptr};
+  HandlerContext ctx_{ros2_medkit_gateway::test_support::null_services(), cors_, auth_, tls_, nullptr};
   DiscoveryHandlers handlers_{ctx_};
 };
 
@@ -251,7 +275,7 @@ class DiscoveryHandlersFixtureTest : public ::testing::Test {
     auto apps = suite_node_->get_discovery_manager()->discover_apps();
     auto functions = suite_node_->get_discovery_manager()->discover_functions();
 
-    ASSERT_EQ(apps.size(), 3u);
+    ASSERT_EQ(apps.size(), 4u);
     apps[0].is_online = true;
     apps[0].bound_fqn = "/vehicle/main_ecu/planner";
     apps[1].bound_fqn = "/sensors/lidar_unit/mapper";
@@ -259,7 +283,7 @@ class DiscoveryHandlersFixtureTest : public ::testing::Test {
     auto & cache = const_cast<ThreadSafeEntityCache &>(suite_node_->get_thread_safe_cache());
     cache.update_all(areas, components, apps, functions);
 
-    ctx_ = std::make_unique<HandlerContext>(suite_node_.get(), cors_, auth_, tls_, nullptr);
+    ctx_ = std::make_unique<HandlerContext>(*suite_node_, cors_, auth_, tls_, nullptr);
     handlers_ = std::make_unique<DiscoveryHandlers>(*ctx_);
   }
 
@@ -428,11 +452,104 @@ TEST_F(DiscoveryHandlersFixtureTest, ListComponentsReturnsMetadata) {
 
   auto result = handlers_->get_components(typed_req);
   auto body = body_json(result);
-  // lidar_unit has parent_component_id, so it's filtered from top-level list
-  ASSERT_EQ(body["items"].size(), 1u);
-  EXPECT_EQ(body["items"][0]["id"], "main_ecu");
-  EXPECT_EQ(body["items"][0]["description"], "Vehicle control unit");
-  EXPECT_EQ(body["items"][0]["x-medkit"]["source"], "manifest");
+  // lidar_unit has parent_component_id, so it's filtered from top-level list.
+  ASSERT_EQ(body["items"].size(), 2u);
+  // get_components() does not sort; find main_ecu by id rather than assuming order.
+  const auto & items = body["items"];
+  size_t main_ecu_idx = items.size();
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (items[i]["id"] == "main_ecu") {
+      main_ecu_idx = i;
+      break;
+    }
+  }
+  ASSERT_LT(main_ecu_idx, items.size()) << "main_ecu not found in /components list";
+  const auto & main_ecu = items[main_ecu_idx];
+  EXPECT_EQ(main_ecu["description"], "Vehicle control unit");
+  EXPECT_EQ(main_ecu["x-medkit"]["source"], "manifest");
+}
+
+// @verifies REQ_INTEROP_003
+// INV2: manifest-driven asset identity surfaces over SOVD with per-field
+// provenance. The list handler emits x-medkit.identity for a component whose
+// manifest declares an identity block.
+TEST_F(DiscoveryHandlersFixtureTest, ListComponentsIncludesManifestIdentity) {
+  httplib::Request req;
+  TypedRequest typed_req(req);
+
+  auto result = handlers_->get_components(typed_req);
+  auto body = body_json(result);
+  ASSERT_EQ(body["items"].size(), 2u);
+  // get_components() does not sort; find main_ecu by id rather than assuming order.
+  const auto & items = body["items"];
+  size_t main_ecu_idx = items.size();
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (items[i]["id"] == "main_ecu") {
+      main_ecu_idx = i;
+      break;
+    }
+  }
+  ASSERT_LT(main_ecu_idx, items.size()) << "main_ecu not found in /components list";
+  const auto & identity = items[main_ecu_idx]["x-medkit"]["identity"];
+  // Typed fields serialize camelCase (AssetIdentity::to_json).
+  EXPECT_EQ(identity["manufacturer"], "Acme Robotics");
+  EXPECT_EQ(identity["model"], "ECU-9000");
+  EXPECT_EQ(identity["serialNumber"], "SN-MAIN-001");
+  EXPECT_EQ(identity["role"], "controller");
+  EXPECT_EQ(identity["extra"]["slot"], "1");
+  // Provenance keys use the internal snake_case field names.
+  EXPECT_EQ(identity["_provenance"]["manufacturer"], "manifest");
+  EXPECT_EQ(identity["_provenance"]["serial_number"], "manifest");
+  EXPECT_EQ(identity["_provenance"]["extra.slot"], "manifest");
+}
+
+// @verifies REQ_INTEROP_003
+// INV2: the same identity is present on the component detail endpoint.
+TEST_F(DiscoveryHandlersFixtureTest, GetComponentIncludesManifestIdentity) {
+  httplib::Request req;
+  auto typed_req = make_typed_request(req, "/api/v1/components/main_ecu", R"(/api/v1/components/([^/]+))");
+
+  auto result = handlers_->get_component(typed_req);
+  auto body = body_json(result);
+  const auto & identity = body["x-medkit"]["identity"];
+  EXPECT_EQ(identity["manufacturer"], "Acme Robotics");
+  EXPECT_EQ(identity["role"], "controller");
+  EXPECT_EQ(identity["_provenance"]["model"], "manifest");
+}
+
+// @verifies REQ_INTEROP_003
+// A component without a manifest identity block emits no x-medkit.identity.
+TEST_F(DiscoveryHandlersFixtureTest, GetComponentWithoutIdentityOmitsField) {
+  httplib::Request req;
+  auto typed_req = make_typed_request(req, "/api/v1/components/lidar_unit", R"(/api/v1/components/([^/]+))");
+
+  auto result = handlers_->get_component(typed_req);
+  auto body = body_json(result);
+  EXPECT_FALSE(body["x-medkit"].contains("identity"));
+}
+
+// @verifies REQ_INTEROP_003
+// A manifest component explicitly marked `external: true` surfaces
+// x-medkit.external on the wire (#516).
+TEST_F(DiscoveryHandlersFixtureTest, GetComponentEmitsExternalOnWire) {
+  httplib::Request req;
+  auto typed_req = make_typed_request(req, "/api/v1/components/ext_plc", R"(/api/v1/components/([^/]+))");
+
+  auto result = handlers_->get_component(typed_req);
+  auto body = body_json(result);
+  EXPECT_EQ(body["x-medkit"]["external"], true);
+}
+
+// @verifies REQ_INTEROP_003
+// A ROS-native manifest component omits x-medkit.external entirely (absence
+// means "not external", never emitted as an explicit `false`) (#516).
+TEST_F(DiscoveryHandlersFixtureTest, GetComponentOmitsExternalForRosComponent) {
+  httplib::Request req;
+  auto typed_req = make_typed_request(req, "/api/v1/components/main_ecu", R"(/api/v1/components/([^/]+))");
+
+  auto result = handlers_->get_component(typed_req);
+  auto body = body_json(result);
+  EXPECT_FALSE(body["x-medkit"].contains("external"));
 }
 
 // @verifies REQ_INTEROP_003
@@ -467,8 +584,60 @@ TEST_F(DiscoveryHandlersFixtureTest, GetSubcomponentsReturnsChildren) {
 
   auto result = handlers_->get_subcomponents(typed_req);
   auto body = body_json(result);
+  // main_ecu has two subcomponents: lidar_unit (ROS) and ext_sensor (external).
+  ASSERT_EQ(body["items"].size(), 2u);
+  bool has_lidar = false;
+  bool has_ext_sensor = false;
+  for (const auto & item : body["items"]) {
+    if (item["id"] == "lidar_unit") {
+      has_lidar = true;
+    }
+    if (item["id"] == "ext_sensor") {
+      has_ext_sensor = true;
+    }
+  }
+  EXPECT_TRUE(has_lidar);
+  EXPECT_TRUE(has_ext_sensor);
+}
+
+// A device Component browsed via a relationship/sub-collection route must still
+// read as external (the "absence == not external" invariant), so the external
+// subcomponent carries x-medkit.external while the plain ROS one does not.
+TEST_F(DiscoveryHandlersFixtureTest, SubcomponentsEmitExternalForExternalChild) {
+  httplib::Request req;
+  auto typed_req = make_typed_request(req, "/api/v1/components/main_ecu/subcomponents",
+                                      R"(/api/v1/components/([^/]+)/subcomponents)");
+
+  auto result = handlers_->get_subcomponents(typed_req);
+  auto body = body_json(result);
+  const auto & items = body["items"];
+  size_t ext_idx = items.size();
+  size_t lidar_idx = items.size();
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (items[i]["id"] == "ext_sensor") {
+      ext_idx = i;
+    }
+    if (items[i]["id"] == "lidar_unit") {
+      lidar_idx = i;
+    }
+  }
+  ASSERT_LT(ext_idx, items.size()) << "ext_sensor not found in subcomponents";
+  ASSERT_LT(lidar_idx, items.size()) << "lidar_unit not found in subcomponents";
+  EXPECT_EQ(items[ext_idx]["x-medkit"]["external"], true);
+  EXPECT_FALSE(items[lidar_idx]["x-medkit"].contains("external"));
+}
+
+// The hosts (App) projection must also carry x-medkit.external: ext_plc hosts
+// the external app ext_app, so a consumer browsing hosts sees the classification.
+TEST_F(DiscoveryHandlersFixtureTest, ComponentHostsEmitExternalForExternalApp) {
+  httplib::Request req;
+  auto typed_req = make_typed_request(req, "/api/v1/components/ext_plc/hosts", R"(/api/v1/components/([^/]+)/hosts)");
+
+  auto result = handlers_->get_component_hosts(typed_req);
+  auto body = body_json(result);
   ASSERT_EQ(body["items"].size(), 1u);
-  EXPECT_EQ(body["items"][0]["id"], "lidar_unit");
+  EXPECT_EQ(body["items"][0]["id"], "ext_app");
+  EXPECT_EQ(body["items"][0]["x-medkit"]["external"], true);
 }
 
 // @verifies REQ_INTEROP_005
@@ -580,7 +749,7 @@ TEST_F(DiscoveryHandlersFixtureTest, ListAppsReturnsSeededMetadata) {
 
   auto result = handlers_->get_apps(typed_req);
   auto body = body_json(result);
-  ASSERT_EQ(body["items"].size(), 3u);
+  ASSERT_EQ(body["items"].size(), 4u);
   EXPECT_EQ(body["items"][0]["id"], "planner");
   EXPECT_EQ(body["items"][0]["x-medkit"]["component_id"], "main_ecu");
   EXPECT_EQ(body["items"][0]["x-medkit"]["is_online"], true);
@@ -595,6 +764,18 @@ TEST_F(DiscoveryHandlersFixtureTest, GetAppUnknownIdReturns404) {
   auto result = handlers_->get_app(typed_req);
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().http_status, 404);
+}
+
+// @verifies REQ_INTEROP_003
+// A manifest app explicitly marked `external: true` surfaces
+// x-medkit.external on the wire (#516).
+TEST_F(DiscoveryHandlersFixtureTest, GetAppEmitsExternalOnWire) {
+  httplib::Request req;
+  auto typed_req = make_typed_request(req, "/api/v1/apps/ext_app", R"(/api/v1/apps/([^/]+))");
+
+  auto result = handlers_->get_app(typed_req);
+  auto body = body_json(result);
+  EXPECT_EQ(body["x-medkit"]["external"], true);
 }
 
 // @verifies REQ_INTEROP_003
@@ -902,14 +1083,24 @@ TEST_F(DiscoveryHandlersFixtureTest, GetFunctionUnknownIdReturns404) {
 }
 
 // @verifies REQ_INTEROP_003
-TEST_F(DiscoveryHandlersFixtureTest, GetFunctionReturnsCapabilitiesAndGraphLink) {
+// The `x-medkit-graph` link is emitted off the entity's capability list, and
+// nothing in the gateway puts that capability there - only a plugin does. This
+// fixture loads none, so the key must be absent: it used to be written
+// unconditionally, which published a URI that answered 404 on every gateway
+// running without the graph provider. The other half of the pair - the link
+// present, and equal to the capability href, with the plugin loaded - is
+// `test_graph_provider_plugin.test.py::test_01_function_detail_includes_graph_capability`,
+// because registering a plugin capability needs a real loaded plugin.
+//
+// @verifies REQ_INTEROP_003
+TEST_F(DiscoveryHandlersFixtureTest, GetFunctionOmitsGraphLinkWithoutAPlugin) {
   httplib::Request req;
   auto typed_req = make_typed_request(req, "/api/v1/functions/navigation", R"(/api/v1/functions/([^/]+))");
 
   auto result = handlers_->get_function(typed_req);
   auto body = body_json(result);
   EXPECT_EQ(body["hosts"], "/api/v1/functions/navigation/hosts");
-  EXPECT_EQ(body["x-medkit-graph"], "/api/v1/functions/navigation/x-medkit-graph");
+  EXPECT_FALSE(body.contains("x-medkit-graph"));
   EXPECT_EQ(body["_links"]["self"], "/api/v1/functions/navigation");
   EXPECT_EQ(body["x-medkit"]["source"], "manifest");
 }

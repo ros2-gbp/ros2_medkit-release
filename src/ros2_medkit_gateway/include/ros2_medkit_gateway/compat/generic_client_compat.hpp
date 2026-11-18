@@ -26,6 +26,12 @@
 /// When HAS_GENERIC_CLIENT is false (Humble), GenericServiceClient is a custom class
 /// that replicates GenericClient's behavior using rcl C APIs and the same
 /// rosidl_typesupport_introspection infrastructure available in all distros.
+///
+/// Both paths take the callback group the client's response callback should
+/// be dispatched on (issue #575: the gateway registers its blocking-RPC
+/// clients into a shared Reentrant group so responses are not serialized
+/// behind the node's default MutuallyExclusive group). Passing nullptr falls
+/// back to the node's default group on every distro.
 
 #pragma once
 
@@ -49,15 +55,21 @@
 
 #include <rclcpp/generic_client.hpp>
 
+#include <utility>
+
 namespace ros2_medkit_gateway {
 namespace compat {
 
 using GenericServiceClient = rclcpp::GenericClient;
 
-/// Create a GenericServiceClient (delegates to Node::create_generic_client)
-inline GenericServiceClient::SharedPtr
-create_generic_service_client(rclcpp::Node * node, const std::string & service_name, const std::string & service_type) {
-  return node->create_generic_client(service_name, service_type);
+/// Create a GenericServiceClient (delegates to Node::create_generic_client).
+/// @param group Callback group handling the reply callbacks; nullptr resolves
+///              to the node's default group inside rclcpp.
+inline GenericServiceClient::SharedPtr create_generic_service_client(rclcpp::Node * node,
+                                                                     const std::string & service_name,
+                                                                     const std::string & service_type,
+                                                                     rclcpp::CallbackGroup::SharedPtr group) {
+  return node->create_generic_client(service_name, service_type, rclcpp::ServicesQoS(), std::move(group));
 }
 
 }  // namespace compat
@@ -294,23 +306,27 @@ class GenericServiceClient : public rclcpp::ClientBase {
   }
 
   /// Send a request asynchronously. Returns a FutureAndRequestId.
+  ///
+  /// The pending-request mutex is held ACROSS `rcl_send_request`, not just
+  /// around the insertion. The caller is an HTTP thread while `handle_response`
+  /// runs on an executor thread, so a reply to a fast service can arrive before
+  /// this function reaches the insertion. `handle_response` would then find no
+  /// entry, drop the reply, and the caller's future would only end on timeout.
+  /// Sending under the lock makes the reply callback wait for the entry that
+  /// names it. This is what `rclcpp::Client::async_send_request_impl` does with
+  /// its own pending map, and the reason is the same.
   /// @param request Pointer to the deserialized request message (void*)
   FutureAndRequestId async_send_request(const Request request) {
     Promise promise;
     auto future = promise.get_future();
 
-    // Send the request via rcl
     int64_t sequence_number;
+    std::lock_guard<std::mutex> lock(pending_requests_mutex_);
     rcl_ret_t ret = rcl_send_request(get_client_handle().get(), request, &sequence_number);
     if (ret != RCL_RET_OK) {
       rclcpp::exceptions::throw_from_rcl_error(ret, "Failed to send request");
     }
-
-    // Store promise for later fulfillment when handle_response is called
-    {
-      std::lock_guard<std::mutex> lock(pending_requests_mutex_);
-      pending_requests_.emplace(sequence_number, std::move(promise));
-    }
+    pending_requests_.emplace(sequence_number, std::move(promise));
 
     return FutureAndRequestId(std::move(future), sequence_number);
   }
@@ -333,17 +349,22 @@ class GenericServiceClient : public rclcpp::ClientBase {
   std::map<int64_t, Promise> pending_requests_;
 };
 
-/// Create a GenericServiceClient for Humble
-inline GenericServiceClient::SharedPtr
-create_generic_service_client(rclcpp::Node * node, const std::string & service_name, const std::string & service_type) {
+/// Create a GenericServiceClient for Humble.
+/// @param group Callback group handling the reply callbacks; nullptr resolves
+///              to the node's default group inside NodeServices::add_client.
+inline GenericServiceClient::SharedPtr create_generic_service_client(rclcpp::Node * node,
+                                                                     const std::string & service_name,
+                                                                     const std::string & service_type,
+                                                                     rclcpp::CallbackGroup::SharedPtr group) {
   rcl_client_options_t options = rcl_client_get_default_options();
   auto client = std::make_shared<GenericServiceClient>(
       node->get_node_base_interface().get(), node->get_node_graph_interface(), service_name, service_type, options);
 
-  // Register the client with the node's default callback group so the executor
-  // polls it for incoming responses.  Without this, handle_response() is never
+  // Register the client with the given callback group so the executor polls
+  // it for incoming responses. Without this, handle_response() is never
   // called and every future hangs until timeout.
-  node->get_node_services_interface()->add_client(std::dynamic_pointer_cast<rclcpp::ClientBase>(client), nullptr);
+  node->get_node_services_interface()->add_client(std::dynamic_pointer_cast<rclcpp::ClientBase>(client),
+                                                  std::move(group));
 
   return client;
 }

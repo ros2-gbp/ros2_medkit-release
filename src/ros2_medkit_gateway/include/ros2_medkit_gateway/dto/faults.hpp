@@ -42,7 +42,8 @@ namespace dto {
 //
 // Wire keys (exact, from fault_msg_conversions.cpp):
 //   fault_code, severity, description, first_occurred, last_occurred,
-//   occurrence_count, status, reporting_sources, severity_label
+//   last_passed (absent = never passed), occurrence_count, status,
+//   reporting_sources, severity_label
 // =============================================================================
 struct FaultListItem {
   std::string fault_code;
@@ -50,6 +51,7 @@ struct FaultListItem {
   std::optional<std::string> description;
   std::optional<double> first_occurred;
   std::optional<double> last_occurred;
+  std::optional<double> last_passed;
   std::optional<int64_t> occurrence_count;
   std::string status;
   std::optional<std::vector<std::string>> reporting_sources;
@@ -60,8 +62,9 @@ template <>
 inline constexpr auto dto_fields<FaultListItem> = std::make_tuple(
     field("fault_code", &FaultListItem::fault_code), field("severity", &FaultListItem::severity),
     field("description", &FaultListItem::description), field("first_occurred", &FaultListItem::first_occurred),
-    field("last_occurred", &FaultListItem::last_occurred), field("occurrence_count", &FaultListItem::occurrence_count),
-    field("status", &FaultListItem::status), field("reporting_sources", &FaultListItem::reporting_sources),
+    field("last_occurred", &FaultListItem::last_occurred), field("last_passed", &FaultListItem::last_passed),
+    field("occurrence_count", &FaultListItem::occurrence_count), field("status", &FaultListItem::status),
+    field("reporting_sources", &FaultListItem::reporting_sources),
     field_enum("severity_label", &FaultListItem::severity_label, kFaultSeverityLabelValues));
 
 template <>
@@ -148,6 +151,7 @@ inline constexpr std::string_view dto_name<FaultEnvironmentData> = "FaultEnviron
 //   clusters        - detailed cluster list (optional; only if requested)
 //   partial            - true when a fan-out peer request failed (optional)
 //   failed_peers       - list of peer addresses that returned errors (optional)
+//   peer_failures      - why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items - per-peer items dropped due to malformed JSON
 //                        (observability for invisible drift; optional)
 // =============================================================================
@@ -161,18 +165,21 @@ struct FaultListXMedkit {
   std::optional<nlohmann::json> clusters;      // free-form: FaultManager output
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
 template <>
-inline constexpr auto dto_fields<FaultListXMedkit> =
-    std::make_tuple(field("count", &FaultListXMedkit::count), field("muted_count", &FaultListXMedkit::muted_count),
-                    field("cluster_count", &FaultListXMedkit::cluster_count),
-                    field("entity_id", &FaultListXMedkit::entity_id), field("source_id", &FaultListXMedkit::source_id),
-                    field("muted_faults", &FaultListXMedkit::muted_faults),
-                    field("clusters", &FaultListXMedkit::clusters), field("partial", &FaultListXMedkit::partial),
-                    field("failed_peers", &FaultListXMedkit::failed_peers),
-                    field("peer_dropped_items", &FaultListXMedkit::peer_dropped_items));
+inline constexpr auto dto_fields<FaultListXMedkit> = std::make_tuple(
+    field("count", &FaultListXMedkit::count), field("muted_count", &FaultListXMedkit::muted_count),
+    field("cluster_count", &FaultListXMedkit::cluster_count), field("entity_id", &FaultListXMedkit::entity_id),
+    field("source_id", &FaultListXMedkit::source_id), field("muted_faults", &FaultListXMedkit::muted_faults),
+    field("clusters", &FaultListXMedkit::clusters), field("partial", &FaultListXMedkit::partial),
+    field("failed_peers", &FaultListXMedkit::failed_peers), field("peer_failures", &FaultListXMedkit::peer_failures),
+    field("peer_dropped_items", &FaultListXMedkit::peer_dropped_items));
 
 template <>
 inline constexpr std::string_view dto_name<FaultListXMedkit> = "FaultListXMedkit";
@@ -192,6 +199,7 @@ inline constexpr std::string_view dto_name<FaultListXMedkit> = "FaultListXMedkit
 //   count               - total items after fan-out merge
 //   partial             - true when a fan-out peer request failed (optional)
 //   failed_peers        - list of peer addresses that returned errors (optional)
+//   peer_failures       - why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items  - per-peer items dropped due to malformed JSON
 //                         (observability for invisible drift; optional)
 // =============================================================================
@@ -206,6 +214,10 @@ struct FaultListAggXMedkit {
   int64_t count{0};
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
@@ -220,6 +232,7 @@ inline constexpr auto dto_fields<FaultListAggXMedkit> =
                     field("aggregation_sources", &FaultListAggXMedkit::aggregation_sources),
                     field("count", &FaultListAggXMedkit::count), field("partial", &FaultListAggXMedkit::partial),
                     field("failed_peers", &FaultListAggXMedkit::failed_peers),
+                    field("peer_failures", &FaultListAggXMedkit::peer_failures),
                     field("peer_dropped_items", &FaultListAggXMedkit::peer_dropped_items));
 
 template <>
@@ -270,10 +283,27 @@ template <>
 inline constexpr std::string_view dto_name<FaultDetail> = "FaultDetail";
 
 // =============================================================================
-// Collection<FaultListItem> - named "FaultList"
+// Collection<FaultListItem, FaultListXMedkit> - named "FaultList"
+//
+// The x-medkit member is FaultListXMedkit, not the generic XMedkitCollection:
+// every fault-list emitter writes a FaultListXMedkit (count / muted_count /
+// cluster_count / ...) and none of them writes XMedkitCollection's
+// total_count + contributors. Naming the generic one here published a
+// vendor-extension object the gateway has never sent.
 // =============================================================================
 template <>
-inline constexpr std::string_view dto_name<Collection<FaultListItem>> = "FaultList";
+inline constexpr std::string_view dto_name<Collection<FaultListItem, FaultListXMedkit>> = "FaultList";
+
+// =============================================================================
+// Collection<FaultListItem, FaultListAggXMedkit> - named "FaultListAggregated"
+//
+// The per-entity list emits this instead of FaultList when the entity spans
+// several reporting sources (Function / Component / Area branches of
+// handle_list_faults): same items, a different vendor extension carrying the
+// aggregation level and the source FQNs.
+// =============================================================================
+template <>
+inline constexpr std::string_view dto_name<Collection<FaultListItem, FaultListAggXMedkit>> = "FaultListAggregated";
 
 // =============================================================================
 // FaultListResult - typed envelope around the plugin-defined fault list
@@ -324,7 +354,25 @@ struct JsonReader<FaultListResult> {
 template <>
 struct SchemaWriter<FaultListResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"description",
+         "Fault list whose shape depends on who owns the entity. An entity backed by the ROS 2 graph "
+         "answers with `FaultList`, or with `FaultListAggregated` when the entity spans several reporting "
+         "sources. A plugin-owned entity answers with whatever its FaultProvider returns and the gateway "
+         "emits that verbatim. Which branch applies is discoverable ahead of the call: `x-medkit.source` on "
+         "the entity's own document (`GET /{entity_type}/{entity_id}`) reads `plugin` for a plugin-owned "
+         "entity."},
+        {"anyOf",
+         nlohmann::json::array({nlohmann::json{{"$ref", "#/components/schemas/FaultList"}},
+                                nlohmann::json{{"$ref", "#/components/schemas/FaultListAggregated"}},
+                                nlohmann::json{{"title", "PluginFaultList"},
+                                               {"type", "object"},
+                                               {"additionalProperties", true},
+                                               {"x-medkit-opaque", true},
+                                               {"description",
+                                                "Plugin-defined list. A UDS backend adds DTC status bytes and "
+                                                "snapshot record references; an OPC-UA backend adds node references "
+                                                "and severity metadata. Read the plugin's own documentation."}}})}};
   }
 };
 
@@ -384,7 +432,23 @@ struct JsonReader<FaultDetailResult> {
 template <>
 struct SchemaWriter<FaultDetailResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"description",
+         "One fault whose shape depends on who owns the entity. An entity backed by the ROS 2 graph answers "
+         "with `FaultDetail` (SOVD `item` + `environment_data` + `x-medkit`). A plugin-owned entity answers "
+         "with whatever its FaultProvider returns and the gateway emits that verbatim. Which branch applies "
+         "is discoverable ahead of the call: `x-medkit.source` on the entity's own document "
+         "(`GET /{entity_type}/{entity_id}`) reads `plugin` for a plugin-owned entity."},
+        {"anyOf",
+         nlohmann::json::array({nlohmann::json{{"$ref", "#/components/schemas/FaultDetail"}},
+                                nlohmann::json{{"title", "PluginFaultDetail"},
+                                               {"type", "object"},
+                                               {"additionalProperties", true},
+                                               {"x-medkit-opaque", true},
+                                               {"description",
+                                                "Plugin-defined fault. Backends carry DTC environment records, "
+                                                "snapshot blobs or vendor extended status here. Read the plugin's "
+                                                "own documentation."}}})}};
   }
 };
 
@@ -444,7 +508,16 @@ struct JsonReader<FaultClearResult> {
 template <>
 struct SchemaWriter<FaultClearResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"type", "object"},
+        {"additionalProperties", true},
+        {"x-medkit-opaque", true},
+        {"description",
+         "Acknowledgement of a clear, shaped by whoever owns the entity. The ROS 2 path answers "
+         "`{\"code\": <fault_code>, \"cleared\": true}`; a plugin answers with its backend's own "
+         "acknowledgement - UDS clear response codes, vendor warnings, residual fault state - and the "
+         "gateway emits it verbatim. Treat the 2xx status, not a body field, as the signal that the clear "
+         "succeeded."}};
   }
 };
 
