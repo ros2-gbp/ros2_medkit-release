@@ -27,6 +27,7 @@
 #include <fstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -58,6 +59,24 @@ class ScopedYamlFile {
   std::string path_;
 };
 
+/// RAII guard that guarantees rclcpp::shutdown() runs when it leaves scope,
+/// including during stack unwinding after an ASSERT_* abort. Without it an
+/// aborted test would return early, leave rclcpp initialized, and corrupt
+/// later tests in the same process.
+class ScopedRclcpp {
+ public:
+  explicit ScopedRclcpp(int argc = 0, char ** argv = nullptr) {
+    rclcpp::init(argc, argv);
+  }
+  ~ScopedRclcpp() {
+    rclcpp::shutdown();
+  }
+  ScopedRclcpp(const ScopedRclcpp &) = delete;
+  ScopedRclcpp & operator=(const ScopedRclcpp &) = delete;
+  ScopedRclcpp(ScopedRclcpp &&) = delete;
+  ScopedRclcpp & operator=(ScopedRclcpp &&) = delete;
+};
+
 }  // namespace
 
 /// Proves the bug and validates the fix using a lightweight rclcpp::Node.
@@ -81,7 +100,7 @@ TEST(PluginConfig, YamlPluginParamsReachGateway) {
 
   // Init rclcpp with --params-file (simulates: ros2 run ... --ros-args --params-file ...)
   const char * args[] = {"test", "--ros-args", "--params-file", yaml.path().c_str()};
-  rclcpp::init(4, const_cast<char **>(args));
+  ScopedRclcpp rclcpp_ctx(4, const_cast<char **>(args));
 
   // Create a lightweight node (no HTTP server, no DDS subscriptions)
   auto node = std::make_shared<rclcpp::Node>("test_plugin_config_node");
@@ -119,9 +138,6 @@ TEST(PluginConfig, YamlPluginParamsReachGateway) {
   auto result_with_dot = node->list_parameters({"plugins.my_plugin."}, 10);
   EXPECT_EQ(result_with_dot.names.size(), 0u) << "list_parameters with trailing dot returns nothing - "
                                               << "extract_plugin_config must use prefix without trailing dot";
-
-  node.reset();
-  rclcpp::shutdown();
 }
 
 /// Verifies that YAML array params (string, bool, int, double) survive the
@@ -139,7 +155,7 @@ TEST(PluginConfig, YamlPluginArrayParamsReachGateway) {
                       "    plugins.arr_plugin.thresholds: [0.5, 1.5, 2.5]\n");
 
   const char * args[] = {"test", "--ros-args", "--params-file", yaml.path().c_str()};
-  rclcpp::init(4, const_cast<char **>(args));
+  ScopedRclcpp rclcpp_ctx(4, const_cast<char **>(args));
 
   auto node = std::make_shared<rclcpp::Node>("test_plugin_config_arrays_node");
   ros2_medkit_gateway::declare_plugin_params_from_yaml(node.get(), "plugins.arr_plugin.");
@@ -181,9 +197,6 @@ TEST(PluginConfig, YamlPluginArrayParamsReachGateway) {
   EXPECT_DOUBLE_EQ(thresholds[0], 0.5);
   EXPECT_DOUBLE_EQ(thresholds[1], 1.5);
   EXPECT_DOUBLE_EQ(thresholds[2], 2.5);
-
-  node.reset();
-  rclcpp::shutdown();
 }
 
 /// Prefix scoping + dotted-key flattening.
@@ -210,7 +223,7 @@ TEST(PluginConfig, YamlPluginPrefixScopingAndDottedKeys) {
                       "    plugins.bar_plugin.outside_prefix: \"nope\"\n");
 
   const char * args[] = {"test", "--ros-args", "--params-file", yaml.path().c_str()};
-  rclcpp::init(4, const_cast<char **>(args));
+  ScopedRclcpp rclcpp_ctx(4, const_cast<char **>(args));
 
   auto node = std::make_shared<rclcpp::Node>("test_plugin_config_scoping_node");
   ros2_medkit_gateway::declare_plugin_params_from_yaml(node.get(), "plugins.foo_plugin.");
@@ -224,9 +237,189 @@ TEST(PluginConfig, YamlPluginPrefixScopingAndDottedKeys) {
 
   // Out-of-prefix params must be skipped by the prefix filter.
   EXPECT_FALSE(node->has_parameter("plugins.bar_plugin.outside_prefix"));
+}
 
-  node.reset();
-  rclcpp::shutdown();
+/// Locks the nested-reconstruction contract of extract_plugin_config().
+///
+/// Plugins read their config as NESTED JSON objects
+/// (config.contains("native_alarms"), config["native_alarms"]["enabled"], ...).
+/// The old code built a FLAT object keyed by the dotted string
+/// (config["native_alarms.enabled"]), which no plugin ever matched, silently
+/// breaking the whole plugins.<name>.* ROS-param surface for nested config.
+///
+/// This test drives the NodeOptions::parameter_overrides() source (source 1)
+/// directly and asserts the reconstructed shape. It FAILS on the old flat code:
+/// the flat code never creates the nested objects and instead leaves the dotted
+/// keys as top-level strings.
+TEST(PluginConfig, ExtractPluginConfigReconstructsNested) {
+  ScopedRclcpp rclcpp_ctx;
+
+  rclcpp::NodeOptions opts;
+  opts.parameter_overrides({
+      // 2-level nested
+      rclcpp::Parameter("plugins.beckhoff_ads.native_alarms.enabled", true),
+      // 3-level nested (severity_bands)
+      rclcpp::Parameter("plugins.beckhoff_ads.native_alarms.severity_bands.warning", 200),
+      rclcpp::Parameter("plugins.beckhoff_ads.native_alarms.severity_bands.error", 800),
+      // sibling nested group
+      rclcpp::Parameter("plugins.beckhoff_ads.discovery.enabled", true),
+      // single-level scalar stays flat
+      rclcpp::Parameter("plugins.beckhoff_ads.ams_net_id", std::string("192.168.56.1.1.1")),
+      // array-valued leaf must survive as a JSON array
+      rclcpp::Parameter("plugins.beckhoff_ads.trust_list_paths", std::vector<std::string>{"/a.der", "/b.der"}),
+      // read-only .path must be excluded from the config object
+      rclcpp::Parameter("plugins.beckhoff_ads.path", std::string("/opt/plugin.so")),
+  });
+
+  auto node = std::make_shared<rclcpp::Node>("test_extract_nested_node", opts);
+  auto config = ros2_medkit_gateway::extract_plugin_config(node.get(), "beckhoff_ads");
+
+  // 2-level nesting: {"native_alarms": {"enabled": true}}
+  ASSERT_TRUE(config.contains("native_alarms")) << "native_alarms group missing (old flat code fails here)";
+  ASSERT_TRUE(config["native_alarms"].is_object()) << "native_alarms must be a nested object, not a scalar";
+  EXPECT_EQ(config["native_alarms"]["enabled"].get<bool>(), true);
+
+  // 3-level nesting: {"native_alarms": {"severity_bands": {"warning": 200, "error": 800}}}
+  ASSERT_TRUE(config["native_alarms"].contains("severity_bands"));
+  ASSERT_TRUE(config["native_alarms"]["severity_bands"].is_object());
+  EXPECT_EQ(config["native_alarms"]["severity_bands"]["warning"].get<int>(), 200);
+  EXPECT_EQ(config["native_alarms"]["severity_bands"]["error"].get<int>(), 800);
+
+  // Sibling nested group is independent.
+  ASSERT_TRUE(config.contains("discovery"));
+  ASSERT_TRUE(config["discovery"].is_object());
+  EXPECT_TRUE(config["discovery"]["enabled"].get<bool>());
+
+  // Single-level scalar remains flat (no regression for existing flat keys).
+  ASSERT_TRUE(config.contains("ams_net_id"));
+  EXPECT_EQ(config["ams_net_id"].get<std::string>(), "192.168.56.1.1.1");
+
+  // Array leaf is preserved verbatim as a JSON array.
+  ASSERT_TRUE(config.contains("trust_list_paths"));
+  ASSERT_TRUE(config["trust_list_paths"].is_array());
+  ASSERT_EQ(config["trust_list_paths"].size(), 2u);
+  EXPECT_EQ(config["trust_list_paths"][0].get<std::string>(), "/a.der");
+  EXPECT_EQ(config["trust_list_paths"][1].get<std::string>(), "/b.der");
+
+  // .path is excluded, and is NOT smuggled in under a dotted key either.
+  EXPECT_FALSE(config.contains("path"));
+
+  // Regression guards: the OLD flat implementation produced these dotted
+  // top-level keys. Their absence proves the reconstruction happened.
+  EXPECT_FALSE(config.contains("native_alarms.enabled"));
+  EXPECT_FALSE(config.contains("native_alarms.severity_bands.warning"));
+  EXPECT_FALSE(config.contains("discovery.enabled"));
+}
+
+/// Locks the nested-reconstruction contract for the PRODUCTION source: params
+/// arriving via --params-file (source 2 of extract_plugin_config). The sibling
+/// ExtractPluginConfigReconstructsNested test uses parameter_overrides (source
+/// 1), which returns before the YAML path runs, so a regression in
+/// declare_plugin_params_from_yaml -> list_parameters -> the second
+/// insert_nested_param loop would slip through unnoticed.
+TEST(PluginConfig, ExtractPluginConfigReconstructsNestedFromYaml) {
+  ScopedYamlFile yaml("/tmp/test_plugin_config_nested_yaml_" + std::to_string(getpid()) + ".yaml",
+                      "test_extract_nested_yaml_node:\n"
+                      "  ros__parameters:\n"
+                      "    plugins.opcua.native_alarms.enabled: true\n"
+                      "    plugins.opcua.native_alarms.severity_bands.warning: 200\n"
+                      "    plugins.opcua.native_alarms.severity_bands.error: 800\n"
+                      "    plugins.opcua.discovery.enabled: true\n"
+                      "    plugins.opcua.endpoint: \"opc.tcp://host:4840\"\n"
+                      "    plugins.opcua.trust_list_paths: [\"/a.der\", \"/b.der\"]\n"
+                      "    plugins.opcua.path: \"/opt/plugin.so\"\n");
+
+  const char * args[] = {"test", "--ros-args", "--params-file", yaml.path().c_str()};
+  ScopedRclcpp rclcpp_ctx(4, const_cast<char **>(args));
+
+  // No parameter_overrides: forces extract_plugin_config past source 1 into the
+  // --params-file path (the production one).
+  auto node = std::make_shared<rclcpp::Node>("test_extract_nested_yaml_node");
+  ASSERT_EQ(node->get_node_options().parameter_overrides().size(), 0u)
+      << "must have no overrides so extract_plugin_config exercises the YAML source";
+
+  auto config = ros2_medkit_gateway::extract_plugin_config(node.get(), "opcua");
+
+  // 2-level nesting: {"native_alarms": {"enabled": true}}
+  ASSERT_TRUE(config.contains("native_alarms")) << "native_alarms group missing from the YAML path";
+  ASSERT_TRUE(config["native_alarms"].is_object()) << "native_alarms must be a nested object, not a scalar";
+  EXPECT_EQ(config["native_alarms"]["enabled"].get<bool>(), true);
+
+  // 3-level nesting: {"native_alarms": {"severity_bands": {"warning": 200, "error": 800}}}
+  ASSERT_TRUE(config["native_alarms"].contains("severity_bands"));
+  ASSERT_TRUE(config["native_alarms"]["severity_bands"].is_object());
+  EXPECT_EQ(config["native_alarms"]["severity_bands"]["warning"].get<int>(), 200);
+  EXPECT_EQ(config["native_alarms"]["severity_bands"]["error"].get<int>(), 800);
+
+  // Sibling nested group is independent.
+  ASSERT_TRUE(config.contains("discovery"));
+  ASSERT_TRUE(config["discovery"].is_object());
+  EXPECT_TRUE(config["discovery"]["enabled"].get<bool>());
+
+  // Single-level scalar stays flat.
+  ASSERT_TRUE(config.contains("endpoint"));
+  EXPECT_EQ(config["endpoint"].get<std::string>(), "opc.tcp://host:4840");
+
+  // Array leaf survives as a JSON array through the YAML path.
+  ASSERT_TRUE(config.contains("trust_list_paths"));
+  ASSERT_TRUE(config["trust_list_paths"].is_array());
+  ASSERT_EQ(config["trust_list_paths"].size(), 2u);
+  EXPECT_EQ(config["trust_list_paths"][0].get<std::string>(), "/a.der");
+  EXPECT_EQ(config["trust_list_paths"][1].get<std::string>(), "/b.der");
+
+  // .path is excluded from the config object.
+  EXPECT_FALSE(config.contains("path"));
+
+  // No dotted top-level keys leaked (the old flat behaviour).
+  EXPECT_FALSE(config.contains("native_alarms.enabled"));
+  EXPECT_FALSE(config.contains("native_alarms.severity_bands.warning"));
+  EXPECT_FALSE(config.contains("discovery.enabled"));
+}
+
+/// A key used as both a leaf and an intermediate must not crash and must
+/// resolve to the nested object deterministically, regardless of the order the
+/// two overrides are seen in.
+TEST(PluginConfig, ExtractPluginConfigLeafIntermediateCollision) {
+  ScopedRclcpp rclcpp_ctx;
+
+  rclcpp::NodeOptions opts;
+  opts.parameter_overrides({
+      // Scalar leaf seen first, then a deeper key needing the same name as a group.
+      rclcpp::Parameter("plugins.collide.discovery", true),
+      rclcpp::Parameter("plugins.collide.discovery.enabled", true),
+  });
+
+  auto node = std::make_shared<rclcpp::Node>("test_extract_collision_node", opts);
+  auto config = ros2_medkit_gateway::extract_plugin_config(node.get(), "collide");
+
+  // The nested object wins; the scalar is discarded (with a warning).
+  ASSERT_TRUE(config.contains("discovery"));
+  ASSERT_TRUE(config["discovery"].is_object()) << "nested group must win the leaf/intermediate collision";
+  EXPECT_TRUE(config["discovery"]["enabled"].get<bool>());
+}
+
+/// Reverse of the collision test above: the nested key is seen BEFORE the
+/// scalar. Scalar-first goes through the intermediate branch in
+/// insert_nested_param; nested-first instead reaches the leaf guard (a scalar
+/// arriving where a nested object already exists is dropped), which no other
+/// test exercises. The result must be identical either way.
+TEST(PluginConfig, ExtractPluginConfigLeafIntermediateCollisionReversed) {
+  ScopedRclcpp rclcpp_ctx;
+
+  rclcpp::NodeOptions opts;
+  opts.parameter_overrides({
+      // Nested key first: builds discovery as an object.
+      rclcpp::Parameter("plugins.collide_rev.discovery.enabled", true),
+      // Scalar second: must not clobber the existing nested object.
+      rclcpp::Parameter("plugins.collide_rev.discovery", true),
+  });
+
+  auto node = std::make_shared<rclcpp::Node>("test_extract_collision_rev_node", opts);
+  auto config = ros2_medkit_gateway::extract_plugin_config(node.get(), "collide_rev");
+
+  ASSERT_TRUE(config.contains("discovery"));
+  ASSERT_TRUE(config["discovery"].is_object()) << "nested group must survive the reversed collision";
+  EXPECT_TRUE(config["discovery"]["enabled"].get<bool>());
 }
 
 int main(int argc, char ** argv) {
