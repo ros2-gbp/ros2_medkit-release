@@ -1,0 +1,459 @@
+// Copyright 2026 bburda
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "ros2_medkit_gateway/ros2/transports/ros2_fault_service_transport.hpp"
+
+#include <algorithm>
+#include <builtin_interfaces/msg/time.hpp>
+#include <chrono>
+#include <string>
+
+#include "ros2_medkit_gateway/fault_manager_paths.hpp"
+#include "ros2_medkit_gateway/ros2/conversions/fault_msg_conversions.hpp"
+#include "ros2_medkit_msgs/msg/environment_data.hpp"
+#include "ros2_medkit_msgs/msg/fault.hpp"
+
+namespace ros2_medkit_gateway::ros2 {
+
+namespace {
+
+// Synchronous fault-manager RPC under the transport's private executor.
+//
+// Mirrors the pattern in ros2_service_transport.cpp / ros2_action_transport.cpp
+// (clamp negative timeouts, drop abandoned pending requests on timeout) and
+// adapts it to the private-node / private-executor design from issue #399.
+//
+// wait_for_service runs outside `executor_mutex` because the graph listener
+// that backs it is a per-context thread independent of any user executor; the
+// local shared_ptr copies of `client` and `executor` keep the rclcpp state
+// alive even if the transport destructor races the caller.
+template <typename Service>
+typename Service::Response::SharedPtr invoke_fault_service(
+    // SharedPtrs are taken by value on purpose: they keep the rclcpp client
+    // and executor alive for the duration of the call even if the transport
+    // destructor concurrently resets the corresponding member shared_ptrs.
+    typename rclcpp::Client<Service>::SharedPtr client,                   // NOLINT(performance-unnecessary-value-param)
+    typename Service::Request::SharedPtr request,                         // NOLINT(performance-unnecessary-value-param)
+    std::shared_ptr<rclcpp::executors::SingleThreadedExecutor> executor,  // NOLINT(performance-unnecessary-value-param)
+    std::mutex & executor_mutex, std::chrono::duration<double> timeout, const char * op_name, std::string & error_out) {
+  const auto clamped = std::chrono::duration<double>(std::max(timeout.count(), 0.0));
+
+  if (!client || !executor) {
+    error_out = std::string(op_name) + " transport not initialised";
+    return nullptr;
+  }
+
+  if (!client->wait_for_service(clamped)) {
+    error_out = std::string(op_name) + " service not available";
+    return nullptr;
+  }
+
+  std::lock_guard<std::mutex> lock(executor_mutex);
+  auto future = client->async_send_request(request);
+  if (executor->spin_until_future_complete(future, clamped) != rclcpp::FutureReturnCode::SUCCESS) {
+    // Drop the abandoned slot from the client's pending-request map; without
+    // this, repeated timeouts leak entries until the client is destroyed.
+    client->remove_pending_request(future.request_id);
+    error_out = std::string(op_name) + " service call timed out";
+    return nullptr;
+  }
+  return future.get();
+}
+
+}  // namespace
+
+Ros2FaultServiceTransport::Ros2FaultServiceTransport(rclcpp::Node * node) : node_(node) {
+  // Pick up configurable timeout. GatewayNode declares this parameter up front,
+  // but unit tests may construct the transport with a plain rclcpp::Node.
+  if (!node_->get_parameter("fault_manager.service_timeout_sec", service_timeout_sec_)) {
+    service_timeout_sec_ = 5.0;
+  }
+  fault_manager_base_path_ = build_fault_manager_base_path(node_);
+
+  // The fault service clients live on a private node driven by a private
+  // executor. The host gateway node's MultiThreadedExecutor therefore never
+  // processes these clients, so the client's pending-request cleanup cannot
+  // race against the calling thread destroying the response shared_ptr - both
+  // happen inline on the caller's thread inside spin_until_future_complete().
+  client_node_ = std::make_shared<rclcpp::Node>(std::string(node_->get_name()) + "_fault_clients");
+  executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+  executor_->add_node(client_node_);
+
+  report_fault_client_ =
+      client_node_->create_client<ros2_medkit_msgs::srv::ReportFault>(fault_manager_base_path_ + "/report_fault");
+  get_fault_client_ =
+      client_node_->create_client<ros2_medkit_msgs::srv::GetFault>(fault_manager_base_path_ + "/get_fault");
+  list_faults_client_ =
+      client_node_->create_client<ros2_medkit_msgs::srv::ListFaults>(fault_manager_base_path_ + "/list_faults");
+  clear_fault_client_ =
+      client_node_->create_client<ros2_medkit_msgs::srv::ClearFault>(fault_manager_base_path_ + "/clear_fault");
+  get_snapshots_client_ =
+      client_node_->create_client<ros2_medkit_msgs::srv::GetSnapshots>(fault_manager_base_path_ + "/get_snapshots");
+  get_rosbag_client_ =
+      client_node_->create_client<ros2_medkit_msgs::srv::GetRosbag>(fault_manager_base_path_ + "/get_rosbag");
+  list_rosbags_client_ =
+      client_node_->create_client<ros2_medkit_msgs::srv::ListRosbags>(fault_manager_base_path_ + "/list_rosbags");
+
+  RCLCPP_INFO(node_->get_logger(), "Ros2FaultServiceTransport initialized (base_path=%s, timeout=%.1fs)",
+              fault_manager_base_path_.c_str(), service_timeout_sec_);
+}
+
+Ros2FaultServiceTransport::~Ros2FaultServiceTransport() {
+  // Tear down under the executor mutex so any in-flight RPC has finished. Drop
+  // the clients first, then the executor, then the node, so the executor never
+  // references a freed node.
+  std::lock_guard<std::mutex> lock(executor_mutex_);
+
+  report_fault_client_.reset();
+  get_fault_client_.reset();
+  list_faults_client_.reset();
+  clear_fault_client_.reset();
+  get_snapshots_client_.reset();
+  get_rosbag_client_.reset();
+  list_rosbags_client_.reset();
+
+  executor_.reset();
+  client_node_.reset();
+}
+
+bool Ros2FaultServiceTransport::wait_for_services(std::chrono::duration<double> timeout) {
+  return report_fault_client_->wait_for_service(timeout) && get_fault_client_->wait_for_service(timeout) &&
+         list_faults_client_->wait_for_service(timeout) && clear_fault_client_->wait_for_service(timeout);
+}
+
+bool Ros2FaultServiceTransport::is_available() const {
+  return report_fault_client_->service_is_ready() && get_fault_client_->service_is_ready() &&
+         list_faults_client_->service_is_ready() && clear_fault_client_->service_is_ready();
+}
+
+FaultResult Ros2FaultServiceTransport::report_fault(const std::string & fault_code, uint8_t severity,
+                                                    const std::string & description, const std::string & source_id) {
+  FaultResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::ReportFault::Request>();
+  request->fault_code = fault_code;
+  request->event_type = ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED;
+  request->severity = severity;
+  request->description = description;
+  request->source_id = source_id;
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::ReportFault>(
+      report_fault_client_, request, executor_, executor_mutex_, std::chrono::duration<double>(service_timeout_sec_),
+      "ReportFault", result.error_message);
+  if (!response) {
+    result.success = false;
+    return result;
+  }
+
+  result.success = response->accepted;
+  result.data = {{"accepted", response->accepted}};
+  if (!response->accepted) {
+    result.error_message = "Fault report rejected";
+  }
+
+  return result;
+}
+
+FaultResult Ros2FaultServiceTransport::list_faults(const std::string & source_id, bool include_prefailed,
+                                                   bool include_confirmed, bool include_cleared, bool include_healed,
+                                                   bool include_muted, bool include_clusters) {
+  FaultResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::ListFaults::Request>();
+  request->filter_by_severity = false;
+  request->severity = 0;
+
+  if (include_prefailed) {
+    request->statuses.push_back(ros2_medkit_msgs::msg::Fault::STATUS_PREFAILED);
+  }
+  if (include_confirmed) {
+    request->statuses.push_back(ros2_medkit_msgs::msg::Fault::STATUS_CONFIRMED);
+  }
+  if (include_cleared) {
+    request->statuses.push_back(ros2_medkit_msgs::msg::Fault::STATUS_CLEARED);
+  }
+  if (include_healed) {
+    request->statuses.push_back(ros2_medkit_msgs::msg::Fault::STATUS_HEALED);
+    request->statuses.push_back(ros2_medkit_msgs::msg::Fault::STATUS_PREPASSED);
+  }
+
+  request->include_muted = include_muted;
+  request->include_clusters = include_clusters;
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::ListFaults>(
+      list_faults_client_, request, executor_, executor_mutex_, std::chrono::duration<double>(service_timeout_sec_),
+      "ListFaults", result.error_message);
+  if (!response) {
+    result.success = false;
+    return result;
+  }
+
+  // Filter by source_id if provided (uses prefix matching)
+  json faults_array = json::array();
+  for (const auto & fault : response->faults) {
+    if (!source_id.empty()) {
+      const auto & sources = fault.reporting_sources;
+      bool matches = false;
+      for (const auto & src : sources) {
+        if (src.rfind(source_id, 0) == 0) {
+          matches = true;
+          break;
+        }
+      }
+      if (!matches) {
+        continue;
+      }
+    }
+    faults_array.push_back(conversions::fault_to_json(fault));
+  }
+
+  result.success = true;
+  result.data = {{"faults", faults_array}, {"count", faults_array.size()}};
+  result.data["muted_count"] = response->muted_count;
+  result.data["cluster_count"] = response->cluster_count;
+
+  if (include_muted && !response->muted_faults.empty()) {
+    json muted_array = json::array();
+    for (const auto & muted : response->muted_faults) {
+      muted_array.push_back({{"fault_code", muted.fault_code},
+                             {"root_cause_code", muted.root_cause_code},
+                             {"rule_id", muted.rule_id},
+                             {"delay_ms", muted.delay_ms}});
+    }
+    result.data["muted_faults"] = muted_array;
+  }
+
+  if (include_clusters && !response->clusters.empty()) {
+    auto to_seconds = [](const builtin_interfaces::msg::Time & t) {
+      return t.sec + static_cast<double>(t.nanosec) / 1e9;
+    };
+
+    json clusters_array = json::array();
+    for (const auto & cluster : response->clusters) {
+      clusters_array.push_back({{"cluster_id", cluster.cluster_id},
+                                {"rule_id", cluster.rule_id},
+                                {"rule_name", cluster.rule_name},
+                                {"label", cluster.label},
+                                {"representative_code", cluster.representative_code},
+                                {"representative_severity", cluster.representative_severity},
+                                {"fault_codes", cluster.fault_codes},
+                                {"count", cluster.count},
+                                {"first_at", to_seconds(cluster.first_at)},
+                                {"last_at", to_seconds(cluster.last_at)}});
+    }
+    result.data["clusters"] = clusters_array;
+  }
+
+  return result;
+}
+
+FaultWithEnvJsonResult Ros2FaultServiceTransport::get_fault_with_env(const std::string & fault_code,
+                                                                     const std::string & source_id) {
+  FaultWithEnvJsonResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::GetFault::Request>();
+  request->fault_code = fault_code;
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::GetFault>(
+      get_fault_client_, request, executor_, executor_mutex_, std::chrono::duration<double>(service_timeout_sec_),
+      "GetFault", result.error_message);
+  if (!response) {
+    result.success = false;
+    return result;
+  }
+
+  if (!response->success) {
+    result.success = false;
+    result.error_message = response->error_message;
+    return result;
+  }
+
+  // Verify source_id if provided (prefix match against any reporting source).
+  if (!source_id.empty()) {
+    bool matches = false;
+    for (const auto & src : response->fault.reporting_sources) {
+      if (src.rfind(source_id, 0) == 0) {
+        matches = true;
+        break;
+      }
+    }
+    if (!matches) {
+      result.success = false;
+      result.error_message = "Fault not found for source: " + source_id;
+      return result;
+    }
+  }
+
+  result.success = true;
+  result.data = {{"fault", conversions::fault_to_json(response->fault)},
+                 {"environment_data", conversions::environment_data_to_json(response->environment_data)}};
+  return result;
+}
+
+FaultResult Ros2FaultServiceTransport::get_fault(const std::string & fault_code, const std::string & source_id) {
+  // Use get_fault_with_env and pull only the fault portion of the body.
+  auto env_result = get_fault_with_env(fault_code, source_id);
+
+  FaultResult result;
+  result.success = env_result.success;
+  result.error_message = env_result.error_message;
+
+  if (env_result.success) {
+    result.data = env_result.data["fault"];
+  }
+
+  return result;
+}
+
+FaultResult Ros2FaultServiceTransport::clear_fault(const std::string & fault_code, bool skip_correlation_auto_clear) {
+  FaultResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::ClearFault::Request>();
+  request->fault_code = fault_code;
+  request->skip_correlation_auto_clear = skip_correlation_auto_clear;
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::ClearFault>(
+      clear_fault_client_, request, executor_, executor_mutex_, std::chrono::duration<double>(service_timeout_sec_),
+      "ClearFault", result.error_message);
+  if (!response) {
+    result.success = false;
+    return result;
+  }
+
+  result.success = response->success;
+  result.data = {{"success", response->success}, {"message", response->message}};
+  if (!response->success) {
+    result.error_message = response->message;
+  }
+
+  if (!response->auto_cleared_codes.empty()) {
+    result.data["auto_cleared_codes"] = response->auto_cleared_codes;
+  }
+
+  return result;
+}
+
+FaultResult Ros2FaultServiceTransport::get_snapshots(const std::string & fault_code, const std::string & topic) {
+  FaultResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::GetSnapshots::Request>();
+  request->fault_code = fault_code;
+  request->topic = topic;
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::GetSnapshots>(
+      get_snapshots_client_, request, executor_, executor_mutex_, std::chrono::duration<double>(service_timeout_sec_),
+      "GetSnapshots", result.error_message);
+  if (!response) {
+    result.success = false;
+    return result;
+  }
+
+  result.success = response->success;
+
+  if (response->success) {
+    try {
+      result.data = json::parse(response->data);
+    } catch (const json::exception & e) {
+      RCLCPP_WARN(node_->get_logger(),
+                  "Ros2FaultServiceTransport::get_snapshots: failed to parse JSON response for fault_code='%s' "
+                  "topic='%s': %s; falling back to raw_data wrapper",
+                  fault_code.c_str(), topic.c_str(), e.what());
+      result.data = {{"raw_data", response->data}};
+    }
+  } else {
+    result.error_message = response->error_message;
+  }
+
+  return result;
+}
+
+FaultResult Ros2FaultServiceTransport::get_rosbag(const std::string & fault_code) {
+  FaultResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::GetRosbag::Request>();
+  request->fault_code = fault_code;
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::GetRosbag>(
+      get_rosbag_client_, request, executor_, executor_mutex_, std::chrono::duration<double>(service_timeout_sec_),
+      "GetRosbag", result.error_message);
+  if (!response) {
+    result.success = false;
+    return result;
+  }
+
+  result.success = response->success;
+
+  if (response->success) {
+    result.data = {{"file_path", response->file_path},
+                   {"format", response->format},
+                   {"duration_sec", response->duration_sec},
+                   {"size_bytes", response->size_bytes}};
+  } else {
+    result.error_message = response->error_message;
+  }
+
+  return result;
+}
+
+FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_fqn) {
+  FaultResult result;
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::ListRosbags::Request>();
+  request->entity_fqn = entity_fqn;
+
+  auto response = invoke_fault_service<ros2_medkit_msgs::srv::ListRosbags>(
+      list_rosbags_client_, request, executor_, executor_mutex_, std::chrono::duration<double>(service_timeout_sec_),
+      "ListRosbags", result.error_message);
+  if (!response) {
+    result.success = false;
+    return result;
+  }
+
+  result.success = response->success;
+
+  if (response->success) {
+    // The response uses parallel arrays. Trust nothing about the remote
+    // service: a server bug or schema drift could ship arrays of different
+    // lengths, and indexing past end-of-vector is UB. Take the shortest
+    // length and surface the mismatch rather than silently truncate.
+    const size_t n = response->fault_codes.size();
+    const size_t shortest = std::min({n, response->file_paths.size(), response->formats.size(),
+                                      response->durations_sec.size(), response->sizes_bytes.size()});
+    if (shortest != n || response->file_paths.size() != n || response->formats.size() != n ||
+        response->durations_sec.size() != n || response->sizes_bytes.size() != n) {
+      result.success = false;
+      result.error_message = "ListRosbags response has mismatched array sizes (fault_codes=" + std::to_string(n) +
+                             ", file_paths=" + std::to_string(response->file_paths.size()) +
+                             ", formats=" + std::to_string(response->formats.size()) +
+                             ", durations_sec=" + std::to_string(response->durations_sec.size()) +
+                             ", sizes_bytes=" + std::to_string(response->sizes_bytes.size()) + ")";
+      return result;
+    }
+    json rosbags = json::array();
+    for (size_t i = 0; i < n; ++i) {
+      rosbags.push_back({{"fault_code", response->fault_codes[i]},
+                         {"file_path", response->file_paths[i]},
+                         {"format", response->formats[i]},
+                         {"duration_sec", response->durations_sec[i]},
+                         {"size_bytes", response->sizes_bytes[i]}});
+    }
+    result.data = {{"rosbags", rosbags}};
+  } else {
+    result.error_message = response->error_message;
+  }
+
+  return result;
+}
+
+}  // namespace ros2_medkit_gateway::ros2
