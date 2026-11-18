@@ -58,10 +58,13 @@ COPY src/ros2_medkit_cmake/ ${COLCON_WS}/src/ros2_medkit_cmake/
 # Copy core packages
 COPY src/ros2_medkit_msgs/ ${COLCON_WS}/src/ros2_medkit_msgs/
 COPY src/ros2_medkit_serialization/ ${COLCON_WS}/src/ros2_medkit_serialization/
+COPY src/ros2_medkit_fault_detection/ ${COLCON_WS}/src/ros2_medkit_fault_detection/
 COPY src/ros2_medkit_gateway/ ${COLCON_WS}/src/ros2_medkit_gateway/
 COPY src/ros2_medkit_fault_manager/ ${COLCON_WS}/src/ros2_medkit_fault_manager/
 COPY src/ros2_medkit_fault_reporter/ ${COLCON_WS}/src/ros2_medkit_fault_reporter/
 COPY src/ros2_medkit_diagnostic_bridge/ ${COLCON_WS}/src/ros2_medkit_diagnostic_bridge/
+COPY src/ros2_medkit_log_bridge/ ${COLCON_WS}/src/ros2_medkit_log_bridge/
+COPY src/ros2_medkit_action_status_bridge/ ${COLCON_WS}/src/ros2_medkit_action_status_bridge/
 
 # Copy open-core plugins
 COPY src/ros2_medkit_discovery_plugins/ ${COLCON_WS}/src/ros2_medkit_discovery_plugins/
@@ -77,13 +80,47 @@ COPY src/ros2_medkit_plugins/ ${COLCON_WS}/src/ros2_medkit_plugins/
 # test_depend and which rosdep tries to install even with BUILD_TESTING=OFF).
 # This was previously masked by Docker layer cache hits on CI; cold builds
 # always failed.
+#
+# The OPC-UA plugin in this image carries no controller write path:
+# MEDKIT_OPCUA_READ_ONLY=ON is stated on the colcon line, because this image is
+# what a diagnostic box runs on a plant network and the CMake option's default
+# is not a property anything can check. The flag gets a colcon pass of its own
+# because only one package declares it: passed to the whole workspace, every
+# other package reports it as a manually-specified variable nobody used, and
+# that stderr would bury a real one. The build type is stated on the same line:
+# a fresh configure of this package otherwise takes whatever default its
+# FetchContent dependencies put in the cache, and Release is what the plugin's
+# other build sites compile with.
+#
+# The test at the end guards the split. colcon accepts an unknown name in
+# --packages-skip and in --packages-select with a warning and exit 0, so a
+# renamed or moved package would leave the first pass building the plugin at the
+# option's default and the second pass building nothing, with this RUN still
+# succeeding. The object has to exist where the second pass installs it.
+#
+# rosbag2_storage_mcap stays skip-keyed here even though fault_manager now
+# exec_depends on it: this stage compiles with -DBUILD_TESTING=OFF against
+# rosbag2_cpp/rosbag2_storage (the plugin interface, already resolvable
+# without it) and never runs a bag, so it never needs the plugin itself, only
+# its interface. The key exists because the plugin package was not available
+# via rosdep on every distro this Dockerfile targets when it was added
+# (ce702f61); that constraint is about apt package availability per distro,
+# not about whether fault_manager declares the dependency, so becoming an
+# exec_depend does not remove the reason to skip it here. It is installed for
+# real in the runtime stage below, which is where it is actually loaded.
 RUN bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && \
     apt-get update && \
     rosdep update && \
     rosdep install --from-paths src --ignore-src -r -y \
-      --skip-keys='ament_cmake_clang_format ament_cmake_clang_tidy test_msgs sqlite3 libcpp-httplib-dev rosbag2_storage_mcap' && \
+      --skip-keys='ament_cmake_clang_format ament_cmake_clang_tidy ament_cmake_flake8 test_msgs sqlite3 libcpp-httplib-dev rosbag2_storage_mcap' && \
     rm -rf /var/lib/apt/lists/* && \
-    colcon build --cmake-args -DBUILD_TESTING=OFF"
+    colcon build --cmake-args -DBUILD_TESTING=OFF \
+      --packages-skip ros2_medkit_opcua && \
+    source install/setup.bash && \
+    colcon build --packages-select ros2_medkit_opcua \
+      --cmake-args -DBUILD_TESTING=OFF -DMEDKIT_OPCUA_READ_ONLY=ON \
+        -DCMAKE_BUILD_TYPE=Release && \
+    test -f install/ros2_medkit_opcua/lib/ros2_medkit_opcua/libros2_medkit_opcua_plugin.so"
 
 # ============================================================================
 # Stage 2: Runtime
@@ -101,10 +138,23 @@ ENV COLCON_WS=/home/medkit/ws
 # CycloneDDS RMW is bundled so the gateway can attach to a stack running
 # CycloneDDS (e.g. Autoware) without rebuilding. FastDDS stays the default;
 # switch with RMW_IMPLEMENTATION=rmw_cyclonedds_cpp at runtime.
+# rosbag2-storage-mcap and rosbag2-storage-default-plugins are the actual
+# rosbag2 storage plugins fault_manager loads at runtime through
+# rosbag2_storage's plugin interface: the former is always the mcap plugin,
+# the latter is the sqlite3 plugin itself on humble but, on jazzy (this
+# stage's default) and lyrical, a metapackage that pulls in both sqlite3 and
+# mcap - so it is not a clean sqlite3-only counterpart to the first package on
+# every distro this image targets, just the name that guarantees sqlite3 is
+# present. libsqlite3-0 alone is the C library, not a rosbag2 plugin, and this
+# stage never gets /opt/ros from the builder - only the colcon workspace
+# install/ - so without these two the image would advertise mcap-by-default
+# and silently have no working black-box storage backend at all.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-${ROS_DISTRO}-yaml-cpp-vendor \
     ros-${ROS_DISTRO}-example-interfaces \
     ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
+    ros-${ROS_DISTRO}-rosbag2-storage-mcap \
+    ros-${ROS_DISTRO}-rosbag2-storage-default-plugins \
     libsqlite3-0 \
     libsystemd0 \
     libssl3 \
@@ -123,10 +173,12 @@ COPY docker/gateway_docker_params.yaml /etc/ros2_medkit/params.yaml
 # their full paths in your custom params file.
 RUN mkdir -p /opt/ros2_medkit/plugins
 
-# Non-root user for production safety
+# Non-root user for production safety. /var/lib/ros2_medkit is the default
+# fault_manager database_path parent; create and chown it so the fault manager
+# can persist faults.db without running as root.
 RUN groupadd -r medkit && useradd -r -g medkit -d /home/medkit -s /bin/bash medkit && \
-    mkdir -p /home/medkit && chown medkit:medkit /home/medkit && \
-    chown -R medkit:medkit ${COLCON_WS}/install /etc/ros2_medkit /opt/ros2_medkit
+    mkdir -p /home/medkit /var/lib/ros2_medkit && chown medkit:medkit /home/medkit && \
+    chown -R medkit:medkit ${COLCON_WS}/install /etc/ros2_medkit /opt/ros2_medkit /var/lib/ros2_medkit
 
 # Entrypoint that sources ROS and starts the gateway
 COPY docker/entrypoint.sh /entrypoint.sh

@@ -23,6 +23,8 @@ find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
+include(ROS2MedkitCoverage)
+include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
@@ -73,22 +75,18 @@ if(BUILD_TESTING)
     file(GLOB_RECURSE _format_files
       "include/*.hpp" "src/*.cpp" "test/*.cpp"
     )
+    medkit_lint_config(.clang-format _clang_format_config)
     ament_clang_format(${_format_files}
-      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+      CONFIG_FILE "${_clang_format_config}")
   endif()
 
   find_package(ament_cmake_gmock REQUIRED)
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 100 END 109)
 
   # Include plugin source in test (plugin is MODULE/dlopen, test instantiates directly)
-  # TIMEOUT 180: the 12 test cases each spin a node for ~200-400 ms. Under
-  # plain gcc that's ~4 s total, well under the 30 s ctest default, but TSan
-  # instrumentation inflates that 5-10x and occasionally trips the 30 s cap
-  # (CI saw timeouts at test 4/12 around 27 s). 180 s covers the worst-case
-  # sanitizer slowdown without masking real hangs.
-  ament_add_gmock(test_param_beacon_plugin
+  # TIMEOUT 180: the cases spin real nodes, and TSan slows them 5-10x past the 30 s default.
+  medkit_add_gmock(test_param_beacon_plugin
     test/test_param_beacon_plugin.cpp
     src/param_beacon_plugin.cpp
     TIMEOUT 180)
@@ -99,7 +97,17 @@ if(BUILD_TESTING)
   target_link_libraries(test_param_beacon_plugin
     nlohmann_json::nlohmann_json
     ros2_medkit_beacon_common::beacon_common_lib)
-  medkit_set_test_domain(test_param_beacon_plugin)
+  # The plugin on a gateway whose context is private, with the default context never initialised
+  medkit_add_gmock(test_param_beacon_private_context
+    test/test_param_beacon_private_context.cpp
+    src/param_beacon_plugin.cpp)
+  target_include_directories(test_param_beacon_private_context PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  medkit_target_dependencies(test_param_beacon_private_context
+    ros2_medkit_gateway ros2_medkit_beacon_common rclcpp)
+  target_link_libraries(test_param_beacon_private_context
+    nlohmann_json::nlohmann_json
+    ros2_medkit_beacon_common::beacon_common_lib)
   ros2_medkit_relax_vendor_warnings()
 endif()
 

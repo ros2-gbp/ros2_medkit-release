@@ -48,19 +48,36 @@ namespace dto {
 //                 services; goal/result/feedback for actions); kept as
 //                 nlohmann::json because the structure is runtime-determined
 //                 by type introspection and cannot be statically typed
+//   member_ids  - the members of an aggregating entity that provide this
+//                 operation; absent on an entity that exposes its own
+//   available   - present only as false, marking an item whose provider is not
+//                 answering; absent means it can be served
 // =============================================================================
 struct XMedkitOperationItem {
   std::optional<XMedkitRos2> ros2;
   std::optional<std::string> entity_id;
   std::optional<std::string> source;
   std::optional<nlohmann::json> type_info;  // free-form: dynamic ROS IDL schemas
+  /// Members of the grouping that contribute this item.
+  ///
+  /// Absent on a leaf entity, where the entity is the only contributor.
+  /// A list rather than one id because an item can genuinely have several:
+  /// a topic published by one member and subscribed by another is merged
+  /// into a single item, and two members can expose the same operation
+  /// short name. More than one entry is what makes the bare item id
+  /// ambiguous for addressing.
+  std::optional<std::vector<std::string>> member_ids;
+  /// Absent while the item can be served. False marks an item listed from a
+  /// retained declaration because the member that owns it is not answering -
+  /// the item is still part of the tree, and still counts towards ambiguity.
+  std::optional<bool> available;
 };
 
 template <>
-inline constexpr auto dto_fields<XMedkitOperationItem> =
-    std::make_tuple(field("ros2", &XMedkitOperationItem::ros2), field("entity_id", &XMedkitOperationItem::entity_id),
-                    field("source", &XMedkitOperationItem::source),
-                    field("type_info", &XMedkitOperationItem::type_info));
+inline constexpr auto dto_fields<XMedkitOperationItem> = std::make_tuple(
+    field("ros2", &XMedkitOperationItem::ros2), field("entity_id", &XMedkitOperationItem::entity_id),
+    field("source", &XMedkitOperationItem::source), field("type_info", &XMedkitOperationItem::type_info),
+    field("member_ids", &XMedkitOperationItem::member_ids), field("available", &XMedkitOperationItem::available));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitOperationItem> = "XMedkitOperationItem";
@@ -99,7 +116,9 @@ inline constexpr std::string_view dto_name<XMedkitOperationExecution> = "XMedkit
 //   proximity_proof_required - bool (required, always false for ROS 2)
 //   asynchronous_execution - bool (required; false for services, true for actions)
 //   x-medkit               - typed vendor extension; carries ros2.{service|action,
-//                            type,kind}, entity_id, source, and optional type_info
+//                            type,kind}, entity_id, source, optional type_info,
+//                            and, on an aggregating entity, member_ids plus
+//                            available
 // =============================================================================
 struct OperationItem {
   std::string id;
@@ -184,8 +203,14 @@ struct ExecutionUpdateRequest {
 };
 
 template <>
-inline constexpr auto dto_fields<ExecutionUpdateRequest> =
-    std::make_tuple(field("capability", &ExecutionUpdateRequest::capability));
+inline constexpr auto dto_fields<ExecutionUpdateRequest> = std::make_tuple(
+    field("capability", &ExecutionUpdateRequest::capability,
+          "SOVD control capability to apply to the running execution: `stop`, `execute`, `freeze` or `reset`. A ROS 2 "
+          "action implements only `stop`, which cancels the goal and answers 202; `execute` answers 409 (cancel first, "
+          "then start a new execution) and `freeze` and `reset` answer 400. Described rather than declared as an "
+          "`enum` on purpose - the handler answers an unknown value with a 400 that names `supported_capabilities` for "
+          "the backend in front of the caller, and a schema-level enum would replace that with a generic "
+          "body-validation error. Same reason `LogConfiguration.severity_filter` carries no enum."));
 
 template <>
 inline constexpr std::string_view dto_name<ExecutionUpdateRequest> = "ExecutionUpdateRequest";
@@ -248,7 +273,16 @@ struct JsonReader<OperationExecutionResult> {
 template <>
 struct SchemaWriter<OperationExecutionResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"type", "object"},
+        {"additionalProperties", true},
+        {"x-medkit-opaque", true},
+        {"description",
+         "Result of a synchronous operation. The shape belongs to the operation, not to this endpoint: on "
+         "the ROS 2 path it is the service response or action result converted field-for-field from its IDL "
+         "type, and on a plugin-owned entity it is whatever the OperationProvider returns (an OPC-UA method "
+         "result, a UDS service response). Discover the concrete shape from the operation's own document, "
+         "`GET /{entity_type}/{entity_id}/operations/{operation_id}`."}};
   }
 };
 
