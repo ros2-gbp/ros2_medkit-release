@@ -14,11 +14,14 @@
 
 #pragma once
 
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "rclcpp/rclcpp.hpp"
 #include "diagnostic_msgs/msg/diagnostic_array.hpp"
@@ -50,9 +53,13 @@ class DiagnosticBridgeNode : public rclcpp::Node {
  public:
   explicit DiagnosticBridgeNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
 
-  /// Map diagnostic name to fault code
-  /// Uses custom mapping if available, otherwise auto-generates from name
-  std::string map_to_fault_code(const std::string & diagnostic_name) const;
+  /// Map diagnostic status to fault code
+  /// Mapping order:
+  /// 1. Custom name_to_code mapping (parameter overrides)
+  /// 2. Check if diagnostic contains any key-value pairs with keys in keyvalue_codes
+  /// 3. Auto-generate from diagnostic name (if auto_generate_codes is true)
+  /// 4. Return empty string if no mapping found
+  std::string map_to_fault_code(const diagnostic_msgs::msg::DiagnosticStatus & status) const;
 
   /// Map DiagnosticStatus level to Fault severity
   /// Returns std::nullopt if level is OK (should send PASSED instead)
@@ -60,6 +67,16 @@ class DiagnosticBridgeNode : public rclcpp::Node {
 
   /// Check if diagnostic level indicates OK status
   static bool is_ok_level(uint8_t diagnostic_level);
+
+  /// Get (creating on first use) the FaultReporter for a given source_id.
+  ros2_medkit_fault_reporter::FaultReporter * reporter_for(const std::string & source_id);
+
+  /// Resolve fault source_id for a diagnostic status.
+  /// Uses a slash-containing hardware_id when enabled, else falls back to bridge FQN.
+  std::string source_id_for(const diagnostic_msgs::msg::DiagnosticStatus & status) const;
+
+  /// Number of currently tracked source reporters.
+  size_t tracked_reporter_count();
 
  private:
   /// Callback for /diagnostics messages
@@ -77,13 +94,22 @@ class DiagnosticBridgeNode : public rclcpp::Node {
 
   // ROS2 components
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr diagnostics_sub_;
-  std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter> reporter_;
-  std::once_flag reporter_init_flag_;
+  // One FaultReporter per source_id, bounded with LRU eviction.
+  struct ReporterEntry {
+    std::string source_id;
+    std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter> reporter;
+  };
+  std::list<ReporterEntry> reporters_lru_;
+  std::unordered_map<std::string, std::list<ReporterEntry>::iterator> reporters_;
+  std::mutex reporters_mutex_;
 
   // Configuration
   std::string diagnostics_topic_;
   bool auto_generate_codes_;
+  bool use_hardware_id_as_source_id_{false};
+  int max_tracked_sources_{512};
   std::map<std::string, std::string> name_to_code_;
+  std::vector<std::string> keyvalue_codes_;
 };
 
 }  // namespace ros2_medkit_diagnostic_bridge

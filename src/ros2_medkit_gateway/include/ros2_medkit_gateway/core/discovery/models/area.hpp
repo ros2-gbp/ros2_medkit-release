@@ -41,6 +41,13 @@ struct Area {
   std::string parent_area_id;             ///< Parent area ID for sub-areas
   std::string source;                     ///< Origin of this area (e.g., "manifest", "heuristic")
   std::vector<std::string> contributors;  ///< Aggregation provenance: "local" and/or "peer:<name>"
+  /// What the contributing gateway itself called this entity: "manifest",
+  /// "runtime", "node" or "topic". `source` is overwritten with `peer:<name>`
+  /// on arrival, because the identity-merge precedence keys on it, so the
+  /// origin would otherwise be lost - and the origin is what decides whether
+  /// the entity is retained when its peer stops answering. Empty for entities
+  /// this gateway discovered itself.
+  std::string declared_source;
 
   /**
    * @brief Convert to JSON representation
@@ -118,9 +125,11 @@ struct Area {
       j["translationId"] = translation_id;
     }
 
-    // Capabilities as URI references (SOVD compliant)
+    // Capabilities as URI references (SOVD compliant). Both name a route
+    // `rest_server.cpp` registers for areas - `/related-components` did not,
+    // and was the last spelling of a segment no entity type serves.
     j["subareas"] = area_url + "/subareas";
-    j["related-components"] = area_url + "/related-components";
+    j["components"] = area_url + "/components";
 
     // x-medkit extension for ROS 2 specific info
     j["x-medkit"] = {{"entityType", type}, {"namespace", namespace_path}};
@@ -132,7 +141,8 @@ struct Area {
 inline bool operator==(const Area & a, const Area & b) {
   return a.id == b.id && a.name == b.name && a.namespace_path == b.namespace_path && a.type == b.type &&
          a.translation_id == b.translation_id && a.description == b.description && a.tags == b.tags &&
-         a.parent_area_id == b.parent_area_id && a.source == b.source && a.contributors == b.contributors;
+         a.parent_area_id == b.parent_area_id && a.source == b.source && a.contributors == b.contributors &&
+         a.declared_source == b.declared_source;
 }
 inline bool operator!=(const Area & a, const Area & b) {
   return !(a == b);
