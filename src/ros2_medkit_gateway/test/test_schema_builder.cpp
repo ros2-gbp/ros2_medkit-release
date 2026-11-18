@@ -25,6 +25,7 @@
 #include "ros2_medkit_gateway/dto/registry.hpp"
 #include "ros2_medkit_gateway/dto/schema_writer.hpp"
 #include "ros2_medkit_gateway/dto/triggers.hpp"
+#include "ros2_medkit_gateway/ros2/ros2_type_schema_provider.hpp"
 
 using ros2_medkit_gateway::openapi::SchemaBuilder;
 
@@ -504,7 +505,8 @@ TEST(SchemaBuilderStaticTest, VersionInfoSchemaComesFromDto) {
 
 TEST(SchemaBuilderRuntimeTest, FromRosMsgKnownType) {
   // @verifies REQ_INTEROP_002
-  SchemaBuilder builder;
+  ros2_medkit_gateway::ros2::Ros2TypeSchemaProvider schemas;
+  SchemaBuilder builder(schemas);
   auto schema = builder.from_ros_msg("std_msgs/msg/String");
 
   // Should return valid JSON Schema with type: object and properties.data
@@ -515,7 +517,8 @@ TEST(SchemaBuilderRuntimeTest, FromRosMsgKnownType) {
 
 TEST(SchemaBuilderRuntimeTest, FromRosMsgUnknownType) {
   // @verifies REQ_INTEROP_002
-  SchemaBuilder builder;
+  ros2_medkit_gateway::ros2::Ros2TypeSchemaProvider schemas;
+  SchemaBuilder builder(schemas);
   auto schema = builder.from_ros_msg("nonexistent/msg/Type");
 
   // Should gracefully degrade to generic object
@@ -525,7 +528,8 @@ TEST(SchemaBuilderRuntimeTest, FromRosMsgUnknownType) {
 }
 
 TEST(SchemaBuilderRuntimeTest, FromRosSrvRequest) {
-  SchemaBuilder builder;
+  ros2_medkit_gateway::ros2::Ros2TypeSchemaProvider schemas;
+  SchemaBuilder builder(schemas);
   auto schema = builder.from_ros_srv_request("std_srvs/srv/SetBool");
 
   // SetBool_Request has a "data" field (bool)
@@ -535,7 +539,8 @@ TEST(SchemaBuilderRuntimeTest, FromRosSrvRequest) {
 }
 
 TEST(SchemaBuilderRuntimeTest, FromRosSrvResponse) {
-  SchemaBuilder builder;
+  ros2_medkit_gateway::ros2::Ros2TypeSchemaProvider schemas;
+  SchemaBuilder builder(schemas);
   auto schema = builder.from_ros_srv_response("std_srvs/srv/SetBool");
 
   // SetBool_Response has "success" and "message" fields
@@ -546,7 +551,8 @@ TEST(SchemaBuilderRuntimeTest, FromRosSrvResponse) {
 }
 
 TEST(SchemaBuilderRuntimeTest, FromRosSrvRequestUnknown) {
-  SchemaBuilder builder;
+  ros2_medkit_gateway::ros2::Ros2TypeSchemaProvider schemas;
+  SchemaBuilder builder(schemas);
   auto schema = builder.from_ros_srv_request("nonexistent/srv/Foo");
 
   // Should gracefully degrade
@@ -556,7 +562,8 @@ TEST(SchemaBuilderRuntimeTest, FromRosSrvRequestUnknown) {
 }
 
 TEST(SchemaBuilderRuntimeTest, FromRosSrvResponseUnknown) {
-  SchemaBuilder builder;
+  ros2_medkit_gateway::ros2::Ros2TypeSchemaProvider schemas;
+  SchemaBuilder builder(schemas);
   auto schema = builder.from_ros_srv_response("nonexistent/srv/Foo");
 
   // Should gracefully degrade
@@ -653,9 +660,18 @@ TEST(SchemaBuilderStaticTest, DataWriteRequestSchemaComesFromDto) {
 // @verifies REQ_INTEROP_002
 TEST(SchemaBuilderStaticTest, ExecutionUpdateRequestSchemaComesFromDto) {
   // ExecutionUpdateRequest is now generated from the DTO; verify via component_schemas().
-  // capability is a plain string field (no enum constraint) so that custom
-  // x-vendor-* capabilities pass parse_body and reach the handler's own
-  // validation logic.
+  //
+  // capability is a plain string field, and the absence of the enum is the
+  // assertion. `OperationHandlers::update_execution` answers an unrecognised
+  // value with a 400 carrying `supported_capabilities` for the backend the
+  // caller is talking to; a schema-level enum would make `JsonReader` reject
+  // the request first and replace that with a generic body-validation error.
+  // The vocabulary is published as prose on the field instead.
+  //
+  // The previous note here justified this by custom `x-vendor-*` capabilities
+  // "reaching the handler's own validation logic". There is no such branch:
+  // update_execution has no plugin delegation, and every value outside
+  // stop/execute/freeze/reset lands in the same 400.
   const auto & schemas = SchemaBuilder::component_schemas();
   ASSERT_TRUE(schemas.count("ExecutionUpdateRequest") > 0);
   const auto & schema = schemas.at("ExecutionUpdateRequest");

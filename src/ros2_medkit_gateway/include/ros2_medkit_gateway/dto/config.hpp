@@ -25,6 +25,7 @@
 #include "ros2_medkit_gateway/dto/contract.hpp"
 #include "ros2_medkit_gateway/dto/entities.hpp"
 #include "ros2_medkit_gateway/dto/sample.hpp"
+#include "ros2_medkit_gateway/dto/schema_writer.hpp"
 #include "ros2_medkit_gateway/dto/x_medkit.hpp"
 #include "ros2_medkit_gateway/http/alternate_status.hpp"
 
@@ -87,9 +88,13 @@ inline constexpr std::string_view dto_name<ConfigurationMetaData> = "Configurati
 //   parameters        - full parameter details including value/type/read_only
 //                       (free-form: raw ConfigurationManager output + x-medkit)
 //   source_ids        - namespace/FQN strings used for node lookup
-//   queried_nodes     - list of node FQNs successfully queried
-//   partial            - true when a fan-out peer request failed
+//   queried_nodes      - list of node FQNs successfully queried
+//   unavailable_nodes  - backing node FQNs that were down/unresponsive (503-class)
+//   failed_nodes       - backing node FQNs that failed for a non-availability reason
+//   partial            - true when a fan-out peer request failed OR a local backing
+//                        node did not answer (see unavailable_nodes/failed_nodes)
 //   failed_peers       - list of peer addresses that returned errors
+//   peer_failures      - why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items - per-peer items dropped due to malformed JSON
 //                        (observability for invisible drift)
 // =============================================================================
@@ -101,8 +106,14 @@ struct ConfigListXMedkit {
   std::optional<nlohmann::json> parameters;  // free-form: array of raw param JSON
   std::optional<std::vector<std::string>> source_ids;
   std::optional<std::vector<std::string>> queried_nodes;
+  std::optional<std::vector<std::string>> unavailable_nodes;
+  std::optional<std::vector<std::string>> failed_nodes;
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
@@ -112,7 +123,9 @@ inline constexpr auto dto_fields<ConfigListXMedkit> = std::make_tuple(
     field("aggregation_level", &ConfigListXMedkit::aggregation_level),
     field("is_aggregated", &ConfigListXMedkit::is_aggregated), field("parameters", &ConfigListXMedkit::parameters),
     field("source_ids", &ConfigListXMedkit::source_ids), field("queried_nodes", &ConfigListXMedkit::queried_nodes),
-    field("partial", &ConfigListXMedkit::partial), field("failed_peers", &ConfigListXMedkit::failed_peers),
+    field("unavailable_nodes", &ConfigListXMedkit::unavailable_nodes),
+    field("failed_nodes", &ConfigListXMedkit::failed_nodes), field("partial", &ConfigListXMedkit::partial),
+    field("failed_peers", &ConfigListXMedkit::failed_peers), field("peer_failures", &ConfigListXMedkit::peer_failures),
     field("peer_dropped_items", &ConfigListXMedkit::peer_dropped_items));
 
 template <>
@@ -192,6 +205,30 @@ inline constexpr auto dto_fields<ConfigurationWriteRequest> =
 template <>
 inline constexpr std::string_view dto_name<ConfigurationWriteRequest> = "ConfigurationWriteRequest";
 
+// The "at least one of data or value" rule is a relation BETWEEN two members,
+// and `dto_fields` describes members one at a time, so the derived schema
+// cannot carry it: both are optional there and an empty object validates
+// against a request `handle_write_configuration` answers 400. A generated
+// client would compile that call. The properties still come from the
+// descriptor - only the cross-field rule is added here, so a member renamed in
+// `dto_fields` cannot leave this stale without also changing the key below.
+template <>
+struct SchemaWriter<ConfigurationWriteRequest> {
+  static nlohmann::json schema() {
+    auto derived = derived_object_schema<ConfigurationWriteRequest>();
+    // Each branch carries `type: object` as well as its `required`: a DTO
+    // schema describes an object body, and a branch that states only a
+    // constraint leaves that unsaid.
+    derived["anyOf"] =
+        nlohmann::json::array({nlohmann::json{{"type", "object"}, {"required", nlohmann::json::array({"data"})}},
+                               nlohmann::json{{"type", "object"}, {"required", nlohmann::json::array({"value"})}}});
+    derived["description"] =
+        "Configuration value to write. At least one of `data` or `value` must be present; `data` is preferred and "
+        "wins when both are supplied. `value` is a legacy alias kept for older clients.";
+    return derived;
+  }
+};
+
 // =============================================================================
 // ConfigurationDeleteResultItem - single entry in the 207 multi-status results
 // array from handle_delete_all_configurations.
@@ -248,7 +285,8 @@ inline constexpr std::string_view dto_name<ConfigurationDeleteMultiStatus> = "Co
 // Same wire shape as the legacy `Collection<ConfigurationMetaData>` named
 // `ConfigurationList`, but the `x-medkit` payload carries the rich
 // `ConfigListXMedkit` fields (entity_id, source, parameters, aggregation_level,
-// is_aggregated, source_ids, queried_nodes, partial, failed_peers,
+// is_aggregated, source_ids, queried_nodes, unavailable_nodes, failed_nodes,
+// partial, failed_peers,
 // peer_dropped_items) instead of the generic `XMedkitCollection`. The schema
 // name is kept identical to the legacy `ConfigurationList` $ref so existing
 // OpenAPI clients are not affected; the difference is purely server-side
