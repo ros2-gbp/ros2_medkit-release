@@ -56,6 +56,9 @@ def generate_test_description():
             # fault heals on that single event only with healing_threshold 0.
             'healing_threshold': 0,
         }],
+        # Give the node room to flush coverage data at shutdown before SIGKILL.
+        sigterm_timeout='30',
+        sigkill_timeout='15',
     )
 
     # Load the packaged config first so assertExitCodes guards against the
@@ -72,17 +75,39 @@ def generate_test_description():
         parameters=[config_file, {
             'rescan_period_sec': 1.0,  # fast discovery for the test
         }],
+        # Give the node room to flush coverage data at shutdown before SIGKILL.
+        sigterm_timeout='30',
+        sigkill_timeout='15',
+    )
+
+    # A second bridge carrying two values above INT_MAX. Both parameters used to
+    # be declared as int, so the value was narrowed before its range check and
+    # wrapped back into the accepted band: 4294967298 arrived as 2 and passed
+    # silently as ERROR severity. Only this node's startup log is read.
+    bad_params_bridge_node = launch_ros.actions.Node(
+        package='ros2_medkit_action_status_bridge',
+        executable='action_status_bridge_node',
+        name='action_status_bridge_bad_params',
+        output='screen',
+        parameters=[{
+            'aborted_severity': 4294967298,
+            'dedup_capacity': 4294967296,
+        }],
+        sigterm_timeout='30',
+        sigkill_timeout='15',
     )
 
     return (
         LaunchDescription([
             fault_manager_node,
             action_status_bridge_node,
+            bad_params_bridge_node,
             launch_testing.actions.ReadyToTest(),
         ]),
         {
             'fault_manager_node': fault_manager_node,
             'action_status_bridge_node': action_status_bridge_node,
+            'bad_params_bridge_node': bad_params_bridge_node,
         },
     )
 
@@ -128,7 +153,8 @@ class TestActionStatusBridgeIntegration(unittest.TestCase):
         request.statuses = statuses or []
         future = self.list_faults_client.call_async(request)
         rclpy.spin_until_future_complete(self.node, future, timeout_sec=5.0)
-        return future.result().faults
+        result = future.result()
+        return result.faults if result is not None else []
 
     def find(self, faults, code):
         return next((f for f in faults if f.fault_code == code), None)
@@ -144,8 +170,34 @@ class TestActionStatusBridgeIntegration(unittest.TestCase):
             time.sleep(0.5)
         return fault
 
+    def wait_for_bridge_watching(self, timeout=15.0):
+        """
+        Wait until the bridge subscribes to the status topic with a resolved name.
+
+        The bridge fixes a fault's source at first report: the status publisher's
+        node FQN if DDS discovery has resolved it, else the action-name fallback
+        (reporter_for). If the ABORTED status is published before the bridge has
+        resolved this node's name, the source freezes to the fallback and is never
+        re-attributed. Seeing the bridge's subscription here with a resolved node
+        name means discovery between the two participants has settled both ways, so
+        the first report resolves the server FQN instead of racing node-name
+        propagation.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            infos = self.node.get_subscriptions_info_by_topic(STATUS_TOPIC)
+            if any(info.node_name == 'action_status_bridge' for info in infos):
+                return True
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+        return False
+
     def test_01_aborted_goal_raises_fault(self):
         """An ABORTED goal on a discovered status topic raises a fault."""
+        # Synchronize on the bridge's subscription before publishing so the server
+        # FQN is resolved at first report rather than racing DDS node-name
+        # propagation (which freezes the source to the action-name fallback).
+        self.assertTrue(self.wait_for_bridge_watching(),
+                        'bridge did not subscribe to the status topic in time')
         self.status_pub.publish(_status_array(GoalStatus.STATUS_ABORTED, 1))
         # Poll through runtime discovery (rescan) + subscription + processing.
         fault = self.wait_for_fault(ABORTED_CODE)
@@ -164,6 +216,28 @@ class TestActionStatusBridgeIntegration(unittest.TestCase):
         )
         self.assertIsNotNone(fault, f'{ABORTED_CODE} fault not HEALED in time')
         self.assertEqual(fault.status, Fault.STATUS_HEALED)
+
+
+class TestActionStatusBridgeParameterRefusal(unittest.TestCase):
+    """A value that wrapped into the accepted band is refused and named."""
+
+    def test_out_of_range_parameters_are_reported(self, proc_output, bad_params_bridge_node):
+        """
+        Both parameters name the value that was actually supplied.
+
+        Reading them as int narrowed first, so 4294967298 became 2 and was
+        taken as a valid ERROR severity with nothing logged. The warning has to
+        carry the requested value, not the wrapped one, or the operator cannot
+        tell which setting was refused.
+        """
+        for fragment in (
+            'aborted_severity 4294967298 out of range [0,3]',
+            'dedup_capacity 4294967296 out of range',
+        ):
+            with self.subTest(fragment=fragment):
+                proc_output.assertWaitFor(
+                    fragment, process=bad_params_bridge_node, timeout=30,
+                )
 
 
 @launch_testing.post_shutdown_test()
