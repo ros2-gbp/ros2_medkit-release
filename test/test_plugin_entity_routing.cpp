@@ -84,6 +84,51 @@ class MockBarePlugin : public GatewayPlugin {
   }
 };
 
+// --- Mock plugin that owns a mix of servable and unservable entities ---
+//
+// Mirrors the real OPC-UA plugin shape: one DataProvider/OperationProvider
+// implementation shared across every entity the plugin owns, but only
+// "data_entity" actually has data/operations - "group_entity" (like the
+// auto-browsed Component) has neither. Exercises the has_data/has_operations
+// gate PluginManager applies on top of plain ownership.
+class MockMixedFitnessPlugin : public GatewayPlugin, public DataProvider, public OperationProvider {
+ public:
+  std::string name() const override {
+    return "mixed_plugin";
+  }
+  void configure(const json & /*config*/) override {
+  }
+  void shutdown() override {
+  }
+
+  tl::expected<dto::DataListResult, DataProviderErrorInfo> list_data(const std::string & entity_id) override {
+    return dto::DataListResult{json{{"items", json::array({{{"entity", entity_id}}})}}};
+  }
+  tl::expected<dto::DataValue, DataProviderErrorInfo> read_data(const std::string & /*entity_id*/,
+                                                                const std::string & resource) override {
+    return dto::DataValue{json{{"value", resource}}};
+  }
+  tl::expected<dto::DataWriteResult, DataProviderErrorInfo>
+  write_data(const std::string & /*entity_id*/, const std::string & /*resource*/, const json & /*payload*/) override {
+    return dto::DataWriteResult{json{{"status", "ok"}}};
+  }
+  bool has_data(const std::string & entity_id) const override {
+    return entity_id == "data_entity";
+  }
+
+  tl::expected<dto::Collection<dto::OperationItem>, OperationProviderErrorInfo>
+  list_operations(const std::string & /*entity_id*/) override {
+    return dto::Collection<dto::OperationItem>{};
+  }
+  tl::expected<dto::OperationExecutionResult, OperationProviderErrorInfo>
+  execute_operation(const std::string & /*entity_id*/, const std::string & op, const json & /*params*/) override {
+    return dto::OperationExecutionResult{json{{"executed", op}}};
+  }
+  bool has_operations(const std::string & entity_id) const override {
+    return entity_id == "data_entity";
+  }
+};
+
 // =============================================================================
 // Entity Ownership Tests
 // =============================================================================
@@ -191,6 +236,67 @@ TEST(PluginEntityRouting, UnownedEntityReturnsNullProviders) {
 }
 
 // =============================================================================
+// Per-entity fitness gating (has_data / has_operations)
+// =============================================================================
+//
+// Ownership alone used to be enough for PluginManager to hand back a
+// plugin's DataProvider/OperationProvider, which over-advertised `data` and
+// `operations` capabilities for entities the plugin owns but does not
+// actually serve (e.g. a grouping Component built by auto-browse discovery -
+// see the OPC-UA plugin's has_data/has_operations overrides). These pin the
+// gate at the PluginManager level with a generic mock, independent of the
+// OPC-UA specifics covered in ros2_medkit_opcua's own tests.
+
+TEST(PluginEntityRouting, DataProviderWithheldForEntityWithoutData) {
+  PluginManager mgr;
+  auto plugin = std::make_unique<MockMixedFitnessPlugin>();
+  auto * raw = plugin.get();
+  mgr.add_plugin(std::move(plugin));
+  mgr.register_entity_ownership("mixed_plugin", {"data_entity", "group_entity"});
+
+  // Owned and data-bearing: provider resolves.
+  auto * dp = mgr.get_data_provider_for_entity("data_entity");
+  ASSERT_NE(dp, nullptr);
+  EXPECT_EQ(dp, static_cast<DataProvider *>(raw));
+
+  // Owned but not data-bearing: PluginManager withholds the provider even
+  // though the plugin owns the entity, so the /data route (and capability
+  // advertisement built on this same lookup) both see "no provider" instead
+  // of delegating into a plugin call that would 404 anyway.
+  EXPECT_EQ(mgr.get_data_provider_for_entity("group_entity"), nullptr);
+}
+
+TEST(PluginEntityRouting, OperationProviderWithheldForEntityWithoutOperations) {
+  PluginManager mgr;
+  auto plugin = std::make_unique<MockMixedFitnessPlugin>();
+  auto * raw = plugin.get();
+  mgr.add_plugin(std::move(plugin));
+  mgr.register_entity_ownership("mixed_plugin", {"data_entity", "group_entity"});
+
+  auto * op = mgr.get_operation_provider_for_entity("data_entity");
+  ASSERT_NE(op, nullptr);
+  EXPECT_EQ(op, static_cast<OperationProvider *>(raw));
+
+  EXPECT_EQ(mgr.get_operation_provider_for_entity("group_entity"), nullptr);
+}
+
+TEST(PluginEntityRouting, EntityOwnershipUnaffectedByFitnessGating) {
+  // get_entity_owner reports ownership regardless of has_data/has_operations -
+  // only the provider getters are gated. Callers that need "does this plugin
+  // own the entity at all" (e.g. HandlerContext::apply_routing) must keep
+  // working for group_entity even though it serves neither data nor
+  // operations.
+  PluginManager mgr;
+  auto plugin = std::make_unique<MockMixedFitnessPlugin>();
+  mgr.add_plugin(std::move(plugin));
+  mgr.register_entity_ownership("mixed_plugin", {"group_entity"});
+
+  auto owner = mgr.get_entity_owner("group_entity");
+  ASSERT_TRUE(owner.has_value());
+  EXPECT_EQ(*owner, "mixed_plugin");
+}
+
+// =============================================================================
 // FaultProvider Routing Tests
 // =============================================================================
 
@@ -233,6 +339,26 @@ TEST(PluginEntityRouting, FaultProviderResolvedForOwnedEntity) {
   auto result = fp->list_faults("my_ecu");
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->content["items"][0]["code"], "DTC_001");
+}
+
+// The gateway get_fault handler prefers the fault_manager's environment-enriched
+// record when a plugin entity owns the fault, and falls back to the plugin's own
+// FaultProvider for faults the fault_manager does not hold (e.g. on-demand UDS
+// DTCs). This pins the plugin-served payload the handler forwards verbatim on
+// that fallback path.
+TEST(PluginEntityRouting, FaultProviderFallbackServesPluginOwnedPayload) {
+  PluginManager mgr;
+  auto plugin = std::make_unique<MockFaultPlugin>();
+  mgr.add_plugin(std::move(plugin));
+  mgr.register_entity_ownership("fault_plugin", {"my_ecu"});
+
+  auto * fp = mgr.get_fault_provider_for_entity("my_ecu");
+  ASSERT_NE(fp, nullptr);
+
+  auto result = fp->get_fault("my_ecu", "DTC_042");
+  ASSERT_TRUE(result.has_value());
+  EXPECT_EQ(result->content["code"], "DTC_042");
+  EXPECT_EQ(result->content["status"], "pending");
 }
 
 TEST(PluginEntityRouting, BarePluginReturnsNullFaultProvider) {
