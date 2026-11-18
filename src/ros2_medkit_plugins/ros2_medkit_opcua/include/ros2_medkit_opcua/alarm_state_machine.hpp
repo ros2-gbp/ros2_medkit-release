@@ -63,6 +63,12 @@ enum class AlarmAction { NoOp, ReportConfirmed, ReportHealed, ClearFault };
 struct AlarmEventInput {
   bool enabled_state{true};
   bool active_state{false};
+  /// False when the notification did not carry a readable ActiveState/Id
+  /// (Siemens sends secondary notifications - e.g. the unacked-transition of
+  /// the same condition - without it). An absent field must never read as
+  /// "inactive": the caller substitutes the tracked instance's previous
+  /// activity before compute().
+  bool active_state_present{true};
   bool acked_state{false};
   bool confirmed_state{false};
   /// True iff ShelvingState != Unshelved.
@@ -86,6 +92,15 @@ struct AlarmEventInput {
 ///   5. ActiveState == false          -> Healed or Cleared based on
 ///                                       Acked + Confirmed
 ///
+/// ``require_confirm_for_clear`` (default true) controls rule 5: a fully
+/// cleared alarm needs both Acked AND Confirmed. Some servers do NOT implement
+/// the optional Confirm transition (Siemens S7-1500 supports Acknowledge /
+/// ConditionRefresh / AddComment but not Confirm), so ConfirmedState never
+/// becomes true and the alarm would latch in Healed forever. Setting the flag
+/// false lets such a deployment clear on Acknowledge alone. Default true keeps
+/// the spec-strict behaviour for conformant servers (no regression). Needs
+/// real-S7-1500 validation.
+///
 /// Retain is intentionally not modeled by this state machine and does not
 /// affect ``compute()``. Per Part 9 §5.5.2.10 it controls visibility during
 /// ConditionRefresh bursts rather than the lifecycle mapping implemented
@@ -100,7 +115,8 @@ class AlarmStateMachine {
     AlarmAction action;
   };
 
-  static Outcome compute(SovdAlarmStatus prev_status, const AlarmEventInput & in) {
+  static Outcome compute(SovdAlarmStatus prev_status, const AlarmEventInput & in,
+                         bool require_confirm_for_clear = true) {
     // Rule 1: branch events are recorded in the fault_manager event log
     // (caller's responsibility) but never advance the primary lifecycle.
     if (in.branch_id_present) {
@@ -141,8 +157,11 @@ class AlarmStateMachine {
 
     // Rule 5: ActiveState=false. Cleared only when both Acked AND Confirmed
     // have been completed by the operator; until then the alarm is latched
-    // (HEALED) so the operator sees the unfinished workflow item.
-    if (in.acked_state && in.confirmed_state) {
+    // (HEALED) so the operator sees the unfinished workflow item. When
+    // ``require_confirm_for_clear`` is false (Confirm-less server, e.g. S7-1500)
+    // the Confirmed gate is dropped so Acknowledge alone clears the alarm.
+    const bool clear_ready = in.acked_state && (in.confirmed_state || !require_confirm_for_clear);
+    if (clear_ready) {
       if (prev_status == SovdAlarmStatus::Cleared || prev_status == SovdAlarmStatus::Suppressed) {
         return {SovdAlarmStatus::Cleared, AlarmAction::NoOp};
       }

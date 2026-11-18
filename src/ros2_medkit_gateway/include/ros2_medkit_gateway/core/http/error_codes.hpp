@@ -108,6 +108,11 @@ constexpr const char * ERR_X_MEDKIT_SUBSCRIBE_FAILED = "x-medkit-subscribe-faile
 /// Concurrent cold-wait pool saturation; retry with backoff
 constexpr const char * ERR_X_MEDKIT_COLD_WAIT_CAP_EXCEEDED = "x-medkit-cold-wait-cap-exceeded";
 
+/// A cyclic subscription's resource sampler could not produce a value this
+/// tick. Delivered inside an SSE frame's `error` object, never as an HTTP
+/// status: the stream stays open and the next tick is retried.
+constexpr const char * ERR_X_MEDKIT_RESOURCE_SAMPLE_FAILED = "x-medkit-resource-sample-failed";
+
 /// Software update package not found
 constexpr const char * ERR_X_MEDKIT_UPDATE_NOT_FOUND = "x-medkit-update-not-found";
 
@@ -138,6 +143,11 @@ constexpr const char * ERR_X_MEDKIT_ENTITY_MISMATCH = "x-medkit-entity-mismatch"
 /// Vendor-specific: unsupported subscription protocol
 constexpr const char * ERR_X_MEDKIT_UNSUPPORTED_PROTOCOL = "x-medkit-unsupported-protocol";
 
+/// The fault manager answered and holds no recording with the requested id (404).
+/// Sent by the recording manifest and file routes only, and only in that case: any
+/// other 404 from them proves nothing about the recording.
+constexpr const char * ERR_X_MEDKIT_RECORDING_NOT_FOUND = "x-medkit-recording-not-found";
+
 /// SOVD standard: client's lock was broken by another client (409)
 constexpr const char * ERR_LOCK_BROKEN = "lock-broken";
 
@@ -146,6 +156,12 @@ constexpr const char * ERR_INSUFFICIENT_ACCESS_RIGHTS = "insufficient-access-rig
 
 /// SOVD standard: a required precondition was not fulfilled (409)
 constexpr const char * ERR_PRECONDITION_NOT_FULFILLED = "precondition-not-fulfilled";
+
+/// SOVD standard: entity queried but did not respond (504). SOVD reserves
+/// 504 Gateway Timeout for "no response from the underlying entity in time"
+/// - used when a ROS 2 round-trip times out and the outcome is therefore
+/// UNKNOWN, as opposed to a definitive failure reported by the entity.
+constexpr const char * ERR_NOT_RESPONDING = "not-responding";
 
 // Script error codes (vendor-specific only; generic cases use ERR_RESOURCE_NOT_FOUND / ERR_INVALID_PARAMETER)
 constexpr const char * ERR_SCRIPT_ALREADY_EXISTS = "x-medkit-script-already-exists";
