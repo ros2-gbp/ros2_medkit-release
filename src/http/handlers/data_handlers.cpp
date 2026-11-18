@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "ros2_medkit_gateway/core/http/handlers/data_handlers.hpp"
+#include "ros2_medkit_gateway/core/logging.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -20,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -27,18 +29,21 @@
 #include <nlohmann/json.hpp>
 #include <tl/expected.hpp>
 
+#include "ros2_medkit_gateway/core/data/data_item_reader.hpp"
 #include "ros2_medkit_gateway/core/data/topic_data_provider.hpp"
 #include "ros2_medkit_gateway/core/exceptions.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/fan_out_helpers.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/http/member_qualified_id.hpp"
+#include "ros2_medkit_gateway/core/managers/data_access_manager.hpp"
+#include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/core/providers/data_provider.hpp"
+#include "ros2_medkit_gateway/core/types/type_schema_provider.hpp"
 #include "ros2_medkit_gateway/dto/json_reader.hpp"
 #include "ros2_medkit_gateway/dto/json_writer.hpp"
-#include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_support.hpp"
-#include "ros2_medkit_serialization/type_introspection.hpp"
 
 namespace ros2_medkit_gateway {
 namespace handlers {
@@ -50,21 +55,6 @@ using json = nlohmann::json;
 // =============================================================================
 // Helper free functions
 // =============================================================================
-
-/// Sanitize a plugin-supplied error into the standard `x-medkit-plugin-error`
-/// shape: clamp HTTP status to [400, 599] and truncate message at 512 chars.
-ErrorInfo make_plugin_error(int http_status, const std::string & message, json extra_params = {}) {
-  static constexpr size_t kMaxMessageLength = 512;
-  int status = http_status < 400 ? 400 : (http_status > 599 ? 599 : http_status);
-  std::string msg = message.size() > kMaxMessageLength ? message.substr(0, kMaxMessageLength) + "..." : message;
-  return make_error(status, ERR_PLUGIN_ERROR, std::move(msg), std::move(extra_params));
-}
-
-/// Map a `DataProviderErrorInfo` (from the typed plugin ABI) into the SOVD
-/// `x-medkit-plugin-error` wire shape via `make_plugin_error`.
-ErrorInfo make_provider_error(const DataProviderErrorInfo & info, const std::string & entity_id) {
-  return make_plugin_error(info.http_status, info.message, json{{"entity_id", entity_id}});
-}
 
 /// Read the first positional capture group (entity_id) with the same "missing
 /// capture is treated as 400 invalid-request" semantics as the other migrated
@@ -87,25 +77,191 @@ tl::expected<std::string, ErrorInfo> read_topic_id(const http::TypedRequest & re
   return tl::make_unexpected(make_error(400, ERR_INVALID_REQUEST, "Invalid request"));
 }
 
+/// What one addressed data item resolves to: the ROS topic to act on, the id to
+/// echo back to the caller, the member the id named, whether this gateway's own
+/// walk records that member as a provider of the topic, and the member the tree
+/// dispatches the request through when the id named none.
+struct AddressedDataItem {
+  std::string full_topic_path;
+  std::string item_id;
+  std::string member_id;                 ///< Empty when the id carried no member half.
+  bool provided_by_named_member{false};  ///< Meaningful only when member_id is set.
+  std::string owner_member_id;           ///< The member a bare id is dispatched through; empty means serve here.
+};
+
+/// The member a BARE id is dispatched through, or empty when this gateway is the
+/// one that serves it.
+///
+/// A topic with a single provider keeps its bare id in the collection -
+/// qualification follows ambiguity, not aggregation - so the bare form is the id
+/// a client is handed back, and it has to reach the gateway that has the topic.
+/// That is what the owners record makes possible, exactly as
+/// `AggregatedOperations::owner_by_path` makes a bare operation id routable.
+///
+/// What is settled here is WHERE, and the owner COUNT does not settle it: a
+/// topic is one topic on one ROS graph, and its owners are the members that
+/// touch it, not several copies of it. Two members of one gateway publishing and
+/// subscribing to a topic name one place between them, and either of them
+/// addresses it there. So the declarations decide:
+///
+///   * an owner this gateway runs - the topic is on this graph, serve it here;
+///   * every owner on one peer - the topic is on that peer, and any of its
+///     members reaches it;
+///   * owners spread across gateways - the bare id names no single place, and
+///     the local walk answers, which is what it has always done.
+///
+/// A leaf has no members at all: it is its own sole contributor, and there is
+/// nothing to hand the request to.
+std::string serving_member_for_topic(const ThreadSafeEntityCache & cache, const AggregatedData & aggregated,
+                                     const std::string & full_topic_path) {
+  if (!aggregated.is_aggregated) {
+    return {};
+  }
+  auto owners = aggregated.owners_by_topic.find(full_topic_path);
+  if (owners == aggregated.owners_by_topic.end() || owners->second.empty()) {
+    return {};
+  }
+  std::string peer;
+  for (const auto & owner : owners->second) {
+    const std::string owner_peer = peer_source_of_member(cache, owner);
+    if (owner_peer.empty() || (!peer.empty() && owner_peer != peer)) {
+      return {};
+    }
+    peer = owner_peer;
+  }
+  return owners->second.front();
+}
+
+/// Resolve the id in the route against the entity, for reads and writes alike.
+///
+/// A qualified id is answered exactly, because the member set is known here: an
+/// id naming a member the entity does not have is a miss. Without that check the
+/// gateway samples the local graph, finds nothing, and returns 200 with an empty
+/// body and status `metadata_only` - a typo reported as success.
+///
+/// Whether the named member provides the item is REPORTED, not decided: this
+/// gateway's walk holds a member another gateway runs only as that gateway last
+/// reported it, so a member whose report has not arrived yet would have every
+/// one of its items read as a miss. The caller settles ownership first - a
+/// member another gateway runs is answered by that gateway - and only reads the
+/// flag for a member it serves itself.
+///
+/// A ROS topic name cannot contain a colon, so one in the id can only be the
+/// member separator. A bare id addresses a topic path, which names one topic on
+/// its own; it still has an owner, and `resolve_owner` says whether finding it
+/// can change where the request is served. Walking the entity is not free, so a
+/// gateway with no peers - where every member is served here anyway - skips it.
+tl::expected<AddressedDataItem, ErrorInfo> address_data_item(const ThreadSafeEntityCache & cache,
+                                                             const std::string & entity_id,
+                                                             const std::string & topic_name, bool resolve_owner) {
+  AddressedDataItem addressed;
+  addressed.full_topic_path = to_full_topic_path(topic_name);
+  addressed.item_id = addressed.full_topic_path;
+
+  if (topic_name.find(':') == std::string::npos) {
+    if (resolve_owner) {
+      addressed.owner_member_id =
+          serving_member_for_topic(cache, cache.get_entity_data(entity_id), addressed.full_topic_path);
+    }
+    return addressed;
+  }
+
+  auto aggregated = cache.get_entity_data(entity_id);
+  auto parsed = http::parse_member_qualified_id(topic_name, aggregated.is_aggregated);
+  if (!parsed.has_member) {
+    if (resolve_owner) {
+      addressed.owner_member_id = serving_member_for_topic(cache, aggregated, addressed.full_topic_path);
+    }
+    return addressed;
+  }
+
+  if (std::find(aggregated.source_ids.begin(), aggregated.source_ids.end(), parsed.member_id) ==
+      aggregated.source_ids.end()) {
+    return tl::make_unexpected(
+        make_error(404, ERR_RESOURCE_NOT_FOUND, "Member not found in entity",
+                   json{{"entity_id", entity_id}, {"id", topic_name}, {"member_id", parsed.member_id}}));
+  }
+
+  // An id whose member half is followed by nothing names no item. Carried
+  // further it would address the member's data COLLECTION - the route that
+  // answers a request with one trailing slash fewer - and hand back a list to a
+  // caller that asked for a single value.
+  if (parsed.item_id.empty()) {
+    return tl::make_unexpected(make_error(
+        404, ERR_RESOURCE_NOT_FOUND, "Data item not provided by member",
+        json{{"entity_id", entity_id}, {"id", topic_name}, {"member_id", parsed.member_id}, {"topic_name", ""}}));
+  }
+
+  addressed.member_id = parsed.member_id;
+  addressed.full_topic_path = to_full_topic_path(parsed.item_id);
+  auto owners = aggregated.owners_by_topic.find(addressed.full_topic_path);
+  addressed.provided_by_named_member =
+      owners != aggregated.owners_by_topic.end() &&
+      std::find(owners->second.begin(), owners->second.end(), parsed.member_id) != owners->second.end();
+
+  addressed.item_id = http::make_member_qualified_id(parsed.member_id, addressed.full_topic_path);
+  return addressed;
+}
+
+/// The member's own data route for the topic an id addressed. A qualified id
+/// with an empty item half is refused before this point, so `full_topic_path`
+/// always opens with the slash `to_full_topic_path` guarantees and the
+/// concatenation carries exactly one separator.
+std::string member_data_resource_path(const std::string & full_topic_path) {
+  return "data" + full_topic_path;
+}
+
+/// Settle where an addressed data item is served, and hand the request over when
+/// that is another gateway. Reads and writes share it because they address the
+/// item identically and the owner of the topic is the same either way.
+///
+/// Returns the answer the handler must return - including the sentinel that says
+/// the owning peer has already committed the wire - or nullopt when this gateway
+/// serves the item itself. The "member does not provide it" refusal is decided
+/// here rather than while addressing, because it rests on the local walk, and
+/// the walk only describes a member another gateway runs as well as that
+/// gateway's last report did.
+///
+/// An id that named a member is served by that member. An id that named none is
+/// served by the member the tree says owns the topic, so the bare form a
+/// single-provider item is listed under reaches the same gateway the qualified
+/// form does. Where neither applies the entity serves it itself.
+std::optional<ErrorInfo> dispatch_data_item(const HandlerContext & ctx, const http::TypedRequest & req,
+                                            const std::string & entity_id, const std::string & topic_name,
+                                            const AddressedDataItem & addressed) {
+  const std::string & serving_member = addressed.member_id.empty() ? addressed.owner_member_id : addressed.member_id;
+  auto dispatch = ctx.dispatch_to_member(req, serving_member, member_data_resource_path(addressed.full_topic_path),
+                                         json{{"entity_id", entity_id}, {"id", topic_name}});
+  if (!dispatch) {
+    return dispatch.error();
+  }
+  if (*dispatch == MemberDispatch::kForwarded) {
+    return HandlerContext::forwarded_sentinel_error();
+  }
+  if (!addressed.member_id.empty() && !addressed.provided_by_named_member) {
+    return make_error(404, ERR_RESOURCE_NOT_FOUND, "Data item not provided by member",
+                      json{{"entity_id", entity_id},
+                           {"id", topic_name},
+                           {"member_id", addressed.member_id},
+                           {"topic_name", addressed.full_topic_path}});
+  }
+  return std::nullopt;
+}
+
 /// Build the typed x-medkit per-item payload for the list endpoint.
 dto::XMedkitDataItem build_list_item_xmedkit(const std::string & topic_name, const std::string & direction,
-                                             const std::string & topic_type,
-                                             ros2_medkit_serialization::TypeIntrospection * type_introspection) {
+                                             const std::string & topic_type, TypeSchemaProvider & type_schemas) {
   dto::XMedkitDataItem item_xm;
   dto::XMedkitRos2 ros2_meta;
   ros2_meta.topic = topic_name;
   ros2_meta.direction = direction;
   if (!topic_type.empty()) {
     ros2_meta.type = topic_type;
-    try {
-      auto type_info = type_introspection->get_type_info(topic_type);
-      json type_info_obj;
-      type_info_obj["schema"] = type_info.schema;
-      type_info_obj["default_value"] = type_info.default_value;
-      item_xm.type_info = type_info_obj;
-    } catch (const std::exception & e) {
-      RCLCPP_DEBUG(HandlerContext::logger(), "Could not get type info for topic '%s': %s", topic_name.c_str(),
-                   e.what());
+    if (auto type_info = type_schemas.type_info(topic_type)) {
+      item_xm.type_info = std::move(*type_info);
+    } else {
+      MEDKIT_LOG_DEBUG(HandlerContext::logger(), "Could not get type info for topic '%s' (type '%s')",
+                       topic_name.c_str(), topic_type.c_str());
     }
   }
   item_xm.ros2 = ros2_meta;
@@ -119,6 +275,7 @@ void apply_fan_out_observability(dto::DataListXMedkit & xm, const FanOutResult<d
   if (fan_out.partial) {
     xm.partial = true;
     xm.failed_peers = fan_out.failed_peers;
+    xm.peer_failures = fan_out.peer_failures;
   }
   if (!fan_out.dropped_items.empty()) {
     xm.peer_dropped_items = fan_out.dropped_items;
@@ -127,11 +284,15 @@ void apply_fan_out_observability(dto::DataListXMedkit & xm, const FanOutResult<d
 
 /// Build a `DataValue` whose `content` matches the wire shape produced by the
 /// legacy `handle_get_data_item` (top-level `id`, `data`, `x-medkit`).
-dto::DataValue build_read_response(const std::string & full_topic_path, const TopicSampleResult & sample,
-                                   const std::string & entity_id,
-                                   ros2_medkit_serialization::TypeIntrospection * type_introspection) {
+/// `item_id` is the id the caller addressed - a qualified id when it named a
+/// member, the topic path otherwise - and is echoed so a caller can keep using
+/// the id it read out of the collection. `full_topic_path` is the ROS topic
+/// that was actually sampled.
+dto::DataValue build_read_response(const std::string & item_id, const std::string & full_topic_path,
+                                   const TopicSampleResult & sample, const std::string & entity_id,
+                                   TypeSchemaProvider & type_schemas) {
   json response;
-  response["id"] = full_topic_path;
+  response["id"] = item_id;
   if (sample.has_data && sample.data) {
     response["data"] = *sample.data;
   } else {
@@ -144,15 +305,11 @@ dto::DataValue build_read_response(const std::string & full_topic_path, const To
   xm.entity_id = entity_id;
   if (!sample.message_type.empty()) {
     ros2_meta.type = sample.message_type;
-    try {
-      auto type_info = type_introspection->get_type_info(sample.message_type);
-      json type_info_obj;
-      type_info_obj["schema"] = type_info.schema;
-      type_info_obj["default_value"] = type_info.default_value;
-      xm.type_info = type_info_obj;
-    } catch (const std::exception & e) {
-      RCLCPP_DEBUG(HandlerContext::logger(), "Could not get type info for topic '%s': %s", full_topic_path.c_str(),
-                   e.what());
+    if (auto type_info = type_schemas.type_info(sample.message_type)) {
+      xm.type_info = std::move(*type_info);
+    } else {
+      MEDKIT_LOG_DEBUG(HandlerContext::logger(), "Could not get type info for topic '%s' (type '%s')",
+                       full_topic_path.c_str(), sample.message_type.c_str());
     }
   }
   xm.ros2 = ros2_meta;
@@ -170,10 +327,11 @@ dto::DataValue build_read_response(const std::string & full_topic_path, const To
 /// Build a `DataValue` whose `content` matches the wire shape produced by the
 /// legacy `handle_put_data_item` write echo (top-level `id`, `data`,
 /// `x-medkit`).
-dto::DataValue build_write_response(const std::string & full_topic_path, const std::string & msg_type,
-                                    const std::string & entity_id, const json & data, const json & publish_result) {
+dto::DataValue build_write_response(const std::string & item_id, const std::string & full_topic_path,
+                                    const std::string & msg_type, const std::string & entity_id, const json & data,
+                                    const json & publish_result) {
   json response;
-  response["id"] = full_topic_path;
+  response["id"] = item_id;
   response["data"] = data;  // Echo back the written data
 
   dto::XMedkitDataItem xm;
@@ -216,9 +374,32 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
 
   // Delegate to plugin DataProvider for plugin-owned entities.
   if (entity_info.is_plugin) {
-    auto * pmgr = ctx_.node()->get_plugin_manager();
+    auto * pmgr = ctx_.services().plugin_manager();
     auto * data_prov = pmgr ? pmgr->get_data_provider_for_entity(entity_id) : nullptr;
     if (data_prov == nullptr) {
+      // PLC bridges serve live values through their own x-plc-data route
+      // instead of a DataProvider - dispatch it in-process (same path the
+      // freeze-frame capture uses) so /data works for them too. The vendor
+      // shape differs from the DataProvider one (name = data name, no id, no
+      // category), and SOVD requires id on every item - normalize here so
+      // /data items always carry id/name/category regardless of which plugin
+      // path produced them; vendor extras pass through untouched.
+      if (auto via_route = pmgr ? pmgr->fetch_entity_data_via_route(entity_id) : std::nullopt) {
+        if (via_route->contains("items") && (*via_route)["items"].is_array()) {
+          for (auto & item : (*via_route)["items"]) {
+            if (!item.is_object()) {
+              continue;
+            }
+            if (!item.contains("id") && item.contains("name")) {
+              item["id"] = item["name"];
+            }
+            if (!item.contains("category")) {
+              item["category"] = "currentData";
+            }
+          }
+        }
+        return dto::DataListResult{std::move(*via_route)};
+      }
       return tl::make_unexpected(
           make_error(404, ERR_RESOURCE_NOT_FOUND, "No data provider for plugin entity '" + entity_id + "'"));
     }
@@ -235,12 +416,12 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
       // contract for exactly this case.
       return std::move(*result);
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(HandlerContext::logger(), "Plugin DataProvider threw for entity '%s': %s", entity_id.c_str(),
-                   e.what());
+      MEDKIT_LOG_ERROR(HandlerContext::logger(), "Plugin DataProvider threw for entity '%s': %s", entity_id.c_str(),
+                       e.what());
       return tl::make_unexpected(make_plugin_error(500, "Plugin threw exception", json{{"entity_id", entity_id}}));
     } catch (...) {
-      RCLCPP_ERROR(HandlerContext::logger(), "Plugin DataProvider threw unknown exception for entity '%s'",
-                   entity_id.c_str());
+      MEDKIT_LOG_ERROR(HandlerContext::logger(), "Plugin DataProvider threw unknown exception for entity '%s'",
+                       entity_id.c_str());
       return tl::make_unexpected(
           make_plugin_error(500, "Plugin threw unknown exception", json{{"entity_id", entity_id}}));
     }
@@ -248,22 +429,48 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
 
   try {
     // Use unified cache method to get aggregated data.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto aggregated = cache.get_entity_data(entity_id);
 
-    // Get data access manager for type introspection.
-    auto data_access_mgr = ctx_.node()->get_data_access_manager();
-    auto type_introspection = data_access_mgr->get_type_introspection();
+    auto & type_schemas = *ctx_.services().type_schemas();
+
+    // True for a topic every one of whose providers is a member another gateway
+    // runs. The owners are a list because a topic can be published by one member
+    // and subscribed by another, and a single local provider is enough to make
+    // this gateway's walk the account of the item - so it is "all", not "any".
+    const auto served_only_by_peers = [&aggregated, &cache](const std::string & topic_name) {
+      auto owners = aggregated.owners_by_topic.find(topic_name);
+      if (owners == aggregated.owners_by_topic.end() || owners->second.empty()) {
+        return false;
+      }
+      return std::all_of(owners->second.begin(), owners->second.end(), [&cache](const std::string & member_id) {
+        return member_is_peer_contributed(cache, member_id);
+      });
+    };
 
     dto::Collection<dto::DataItem, dto::DataListXMedkit> response;
+    // A peer's topics are held here so ownership can be settled without asking
+    // anyone. They are not reported from this walk while the peer is reachable -
+    // the gateway that owns an item is the one that reports it, and its copy
+    // carries the message type and the sample metadata this one cannot - so they
+    // are set aside and only fall back into the list below, when the fan-out
+    // that should have carried them did not.
+    std::vector<dto::DataItem> retained_from_peers;
     for (const auto & topic : aggregated.topics) {
       dto::DataItem di;
       di.id = topic.name;
       di.name = topic.name;
       di.category = "currentData";
       const std::string topic_type = cache.get_topic_type(topic.name);
-      di.x_medkit = build_list_item_xmedkit(topic.name, topic.direction, topic_type, type_introspection);
-      response.items.push_back(std::move(di));
+      di.x_medkit = build_list_item_xmedkit(topic.name, topic.direction, topic_type, type_schemas);
+      // Attribute the item to the members that contribute it. Only a grouping
+      // has members to name; on a leaf the entity is the sole contributor and
+      // the field stays absent rather than repeating the entity id.
+      if (auto owners = aggregated.owners_by_topic.find(topic.name);
+          owners != aggregated.owners_by_topic.end() && aggregated.is_aggregated) {
+        di.x_medkit->member_ids = owners->second;
+      }
+      (served_only_by_peers(topic.name) ? retained_from_peers : response.items).push_back(std::move(di));
     }
 
     // Typed fan-out for the data list. Replaces the legacy raw-JSON
@@ -279,10 +486,86 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     const auto & raw_req = req.raw_for_framework();
 #pragma GCC diagnostic pop
-    auto fan_out = fan_out_collection<dto::DataItem>(ctx_.aggregation_manager(), raw_req);
-    for (auto & item : fan_out.items) {
+    // Two different reasons a peer's copy can be missing, and they are not the
+    // same answer. The caller asking for no fan-out means the peers were never
+    // consulted, and reporting their items anyway is what turns a
+    // bidirectionally peered pair into a bounce. A fan-out that ran and came
+    // back without them means the peer is not answering, and the tree still
+    // knows what it declared.
+    const bool fan_out_suppressed = raw_req.has_header("X-Medkit-No-Fan-Out");
+    auto * agg = ctx_.aggregation_manager();
+    auto fan_out = fan_out_collection<dto::DataItem>(agg, raw_req);
+
+    // The ROS topic an item names. Empty when the item names none, which is
+    // what a peer's malformed item - or a plugin's data point - looks like.
+    const auto topic_of = [](const dto::DataItem & item) -> std::string {
+      if (!item.x_medkit.has_value() || !item.x_medkit->ros2.has_value()) {
+        return {};
+      }
+      return item.x_medkit->ros2->topic.value_or(std::string{});
+    };
+
+    // A peer names its members as its own tree names them, and an App whose id
+    // collided with a local one was merged under `<peer>__<id>` - so the name
+    // the peer sends names the LOCAL leaf here. Re-emitted verbatim it
+    // attributes the peer's topic to a member that does not publish it, and
+    // every id built from that attribution - by this gateway or by a client
+    // reading the list - is resolved against the wrong member.
+    std::unordered_set<std::string> topics_from_peers;
+    for (size_t index = 0; index < fan_out.items.size(); ++index) {
+      auto & item = fan_out.items[index];
+      const std::string peer_name = index < fan_out.item_peers.size() ? fan_out.item_peers[index] : std::string{};
+      if (agg != nullptr && !peer_name.empty() && item.x_medkit.has_value() && item.x_medkit->member_ids.has_value()) {
+        for (auto & member_id : *item.x_medkit->member_ids) {
+          member_id = agg->local_member_id(peer_name, member_id);
+        }
+      }
+      if (auto topic = topic_of(item); !topic.empty()) {
+        topics_from_peers.insert(std::move(topic));
+      }
       response.items.push_back(std::move(item));
     }
+
+    // The full ROS topic path is the key, because that is what makes two copies
+    // one item: the wire id is that same path, and a topic is held once per ROS
+    // graph, so a path arriving from the owner and a path held here from its
+    // declaration describe the same topic. Without it both are listed, and the
+    // duplicate ids are then qualified into two items that address one topic.
+    if (!fan_out_suppressed) {
+      for (auto & item : retained_from_peers) {
+        const std::string topic = topic_of(item);
+        if (!topic.empty() && topics_from_peers.count(topic) > 0u) {
+          continue;  // the owner answered for itself, which is the better copy
+        }
+        // `available` is a statement about the MEMBER, not about the fan-out:
+        // false means the gateway that owns the item is not answering, so a
+        // request for it cannot be served. A fan-out reaching this gateway with
+        // nothing for this topic says nothing on its own - it also never ran
+        // when no peer contributes this entity. The member's own reachability
+        // is what a request for the item will meet, and it is the same reading
+        // `dispatch_to_member` acts on, so the listing and the read cannot
+        // disagree.
+        if (auto owners = aggregated.owners_by_topic.find(topic); owners != aggregated.owners_by_topic.end()) {
+          const bool any_unreachable =
+              std::any_of(owners->second.begin(), owners->second.end(), [this](const std::string & member_id) {
+                return !ctx_.is_entity_available(member_id);
+              });
+          if (any_unreachable) {
+            item.x_medkit->available = false;
+          }
+        }
+        response.items.push_back(std::move(item));
+      }
+    }
+
+    // A topic path names one topic however many members publish and subscribe
+    // to it - those merge into a single item, whose contributors are already
+    // named in member_ids - so nothing here is qualified in the ordinary case.
+    // Two gateways each contributing an item under one path is the case that
+    // is genuinely ambiguous, and it is the case this catches.
+    http::qualify_ambiguous_ids(response.items, [](const dto::DataItem & item) {
+      return item.x_medkit.has_value() && item.x_medkit->member_ids.has_value() ? &*item.x_medkit->member_ids : nullptr;
+    });
 
     dto::DataListXMedkit xm;
     xm.entity_id = entity_id;
@@ -300,7 +583,7 @@ http::Result<dto::DataListResult> DataHandlers::list_data(const http::TypedReque
     // opaque DataListResult (consistent with the fault list route).
     return dto::DataListResult{dto::JsonWriter<dto::Collection<dto::DataItem, dto::DataListXMedkit>>::write(response)};
   } catch (const std::exception & e) {
-    RCLCPP_ERROR(HandlerContext::logger(), "Error in list_data for entity '%s': %s", entity_id.c_str(), e.what());
+    MEDKIT_LOG_ERROR(HandlerContext::logger(), "Error in list_data for entity '%s': %s", entity_id.c_str(), e.what());
     return tl::make_unexpected(make_error(500, ERR_INTERNAL_ERROR, "Failed to retrieve entity data",
                                           json{{"details", e.what()}, {"entity_id", entity_id}}));
   }
@@ -331,49 +614,22 @@ http::Result<dto::DataValue> DataHandlers::get_data_item(const http::TypedReques
 
   // Delegate to plugin DataProvider for plugin-owned entities.
   if (entity_info.is_plugin) {
-    auto * pmgr = ctx_.node()->get_plugin_manager();
-    auto * data_prov = pmgr ? pmgr->get_data_provider_for_entity(entity_id) : nullptr;
-    if (data_prov == nullptr) {
-      return tl::make_unexpected(
-          make_error(404, ERR_RESOURCE_NOT_FOUND, "No data provider for plugin entity '" + entity_id + "'"));
-    }
-    try {
-      auto result = data_prov->read_data(entity_id, topic_name);
-      if (!result) {
-        return tl::make_unexpected(make_provider_error(result.error(), entity_id));
-      }
-      return std::move(*result);
-    } catch (const std::exception & e) {
-      RCLCPP_ERROR(HandlerContext::logger(), "Plugin DataProvider threw for entity '%s': %s", entity_id.c_str(),
-                   e.what());
-      return tl::make_unexpected(make_plugin_error(500, "Plugin threw exception", json{{"entity_id", entity_id}}));
-    } catch (...) {
-      RCLCPP_ERROR(HandlerContext::logger(), "Plugin DataProvider threw unknown exception for entity '%s'",
-                   entity_id.c_str());
-      return tl::make_unexpected(
-          make_plugin_error(500, "Plugin threw unknown exception", json{{"entity_id", entity_id}}));
-    }
+    return read_plugin_data_item(ctx_.services().plugin_manager(), entity_id, topic_name);
   }
 
   try {
-    // Determine the full ROS topic path.
-    std::string full_topic_path;
-    if (topic_name.empty() || topic_name[0] == '/') {
-      full_topic_path = topic_name;
-    } else {
-      full_topic_path = "/" + topic_name;
+    auto addressed =
+        address_data_item(ctx_.services().entity_cache(), entity_id, topic_name, ctx_.aggregation_manager() != nullptr);
+    if (!addressed) {
+      return tl::make_unexpected(addressed.error());
     }
 
-    // Sampling goes through the pool-backed TopicDataProvider (issue #375 race
-    // fix). The provider is configured in main() before serving traffic.
-    auto data_access_mgr = ctx_.node()->get_data_access_manager();
-    const auto timeout_sec = data_access_mgr->get_topic_sample_timeout();
-    auto * provider = data_access_mgr->get_topic_data_provider();
-    if (provider == nullptr) {
-      return tl::make_unexpected(make_error(503, ERR_SERVICE_UNAVAILABLE, "Topic sampling is not configured"));
+    if (auto answered = dispatch_data_item(ctx_, req, entity_id, topic_name, *addressed)) {
+      return tl::make_unexpected(*answered);
     }
-    const auto timeout_ms = std::chrono::milliseconds{static_cast<std::int64_t>(std::max(timeout_sec, 0.0) * 1000.0)};
-    auto r = provider->sample(full_topic_path, timeout_ms);
+    const std::string & full_topic_path = addressed->full_topic_path;
+
+    auto r = sample_data_topic(*ctx_.services().data_access_manager(), full_topic_path);
     if (!r) {
       // Propagate the provider's ErrorInfo verbatim: http_status, code (SOVD
       // constant or x-medkit-*), message, and structured params. Collapsing
@@ -389,11 +645,10 @@ http::Result<dto::DataValue> DataHandlers::get_data_item(const http::TypedReques
       return tl::make_unexpected(make_error(status, code, err.message, std::move(params)));
     }
 
-    auto type_introspection = data_access_mgr->get_type_introspection();
-    return build_read_response(full_topic_path, *r, entity_id, type_introspection);
+    return build_read_response(addressed->item_id, full_topic_path, *r, entity_id, *ctx_.services().type_schemas());
   } catch (const TopicNotAvailableException & e) {
-    RCLCPP_DEBUG(HandlerContext::logger(), "Topic not available for entity '%s', topic '%s': %s", entity_id.c_str(),
-                 topic_name.c_str(), e.what());
+    MEDKIT_LOG_DEBUG(HandlerContext::logger(), "Topic not available for entity '%s', topic '%s': %s", entity_id.c_str(),
+                     topic_name.c_str(), e.what());
     return tl::make_unexpected(make_error(404, ERR_X_MEDKIT_ROS2_TOPIC_UNAVAILABLE, "Topic not found",
                                           json{{"entity_id", entity_id}, {"topic_name", topic_name}}));
   } catch (const ProviderErrorException & e) {
@@ -406,12 +661,12 @@ http::Result<dto::DataValue> DataHandlers::get_data_item(const http::TypedReques
     params["topic_name"] = topic_name;
     const std::string code = info.code.empty() ? std::string{ERR_INTERNAL_ERROR} : info.code;
     const int status = (info.http_status >= 400 && info.http_status < 600) ? info.http_status : 500;
-    RCLCPP_WARN(HandlerContext::logger(), "Provider error for entity '%s', topic '%s': %s [%d]", entity_id.c_str(),
-                topic_name.c_str(), info.message.c_str(), info.http_status);
+    MEDKIT_LOG_WARN(HandlerContext::logger(), "Provider error for entity '%s', topic '%s': %s [%d]", entity_id.c_str(),
+                    topic_name.c_str(), info.message.c_str(), info.http_status);
     return tl::make_unexpected(make_error(status, code, info.message, std::move(params)));
   } catch (const std::exception & e) {
-    RCLCPP_ERROR(HandlerContext::logger(), "Error in get_data_item for entity '%s', topic '%s': %s", entity_id.c_str(),
-                 topic_name.c_str(), e.what());
+    MEDKIT_LOG_ERROR(HandlerContext::logger(), "Error in get_data_item for entity '%s', topic '%s': %s",
+                     entity_id.c_str(), topic_name.c_str(), e.what());
     return tl::make_unexpected(
         make_error(500, ERR_INTERNAL_ERROR, "Failed to retrieve topic data",
                    json{{"details", e.what()}, {"entity_id", entity_id}, {"topic_name", topic_name}}));
@@ -459,7 +714,7 @@ http::Result<dto::DataValue> DataHandlers::put_data_item(const http::TypedReques
 
   // Delegate to plugin DataProvider for plugin-owned entities.
   if (entity_info.is_plugin) {
-    auto * pmgr = ctx_.node()->get_plugin_manager();
+    auto * pmgr = ctx_.services().plugin_manager();
     auto * data_prov = pmgr ? pmgr->get_data_provider_for_entity(entity_id) : nullptr;
     if (data_prov == nullptr) {
       return tl::make_unexpected(
@@ -481,12 +736,12 @@ http::Result<dto::DataValue> DataHandlers::put_data_item(const http::TypedReques
       data_value.content = std::move(result->content);
       return data_value;
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(HandlerContext::logger(), "Plugin DataProvider threw for entity '%s': %s", entity_id.c_str(),
-                   e.what());
+      MEDKIT_LOG_ERROR(HandlerContext::logger(), "Plugin DataProvider threw for entity '%s': %s", entity_id.c_str(),
+                       e.what());
       return tl::make_unexpected(make_plugin_error(500, "Plugin threw exception", json{{"entity_id", entity_id}}));
     } catch (...) {
-      RCLCPP_ERROR(HandlerContext::logger(), "Plugin DataProvider threw unknown exception for entity '%s'",
-                   entity_id.c_str());
+      MEDKIT_LOG_ERROR(HandlerContext::logger(), "Plugin DataProvider threw unknown exception for entity '%s'",
+                       entity_id.c_str());
       return tl::make_unexpected(
           make_plugin_error(500, "Plugin threw unknown exception", json{{"entity_id", entity_id}}));
     }
@@ -533,19 +788,27 @@ http::Result<dto::DataValue> DataHandlers::put_data_item(const http::TypedReques
                      json{{"details", "Message type should be in format: package/msg/Type"}, {"type", msg_type}}));
     }
 
-    // Build full topic path (mirror GET logic: only prefix '/' when needed).
-    std::string full_topic_path = topic_name;
-    if (!full_topic_path.empty() && full_topic_path.front() != '/') {
-      full_topic_path = "/" + full_topic_path;
+    // A write addresses the same item a read does, so it resolves the same way -
+    // including which gateway publishes it. Publishing here for a member another
+    // gateway runs would create a publisher on a graph that member is not on.
+    auto addressed =
+        address_data_item(ctx_.services().entity_cache(), entity_id, topic_name, ctx_.aggregation_manager() != nullptr);
+    if (!addressed) {
+      return tl::make_unexpected(addressed.error());
     }
 
+    if (auto answered = dispatch_data_item(ctx_, req, entity_id, topic_name, *addressed)) {
+      return tl::make_unexpected(*answered);
+    }
+    const std::string & full_topic_path = addressed->full_topic_path;
+
     // Publish data using DataAccessManager.
-    auto data_access_mgr = ctx_.node()->get_data_access_manager();
+    auto data_access_mgr = ctx_.services().data_access_manager();
     json publish_result = data_access_mgr->publish_to_topic(full_topic_path, msg_type, data);
-    return build_write_response(full_topic_path, msg_type, entity_id, data, publish_result);
+    return build_write_response(addressed->item_id, full_topic_path, msg_type, entity_id, data, publish_result);
   } catch (const std::exception & e) {
-    RCLCPP_ERROR(HandlerContext::logger(), "Error in put_data_item for entity '%s', topic '%s': %s", entity_id.c_str(),
-                 topic_name.c_str(), e.what());
+    MEDKIT_LOG_ERROR(HandlerContext::logger(), "Error in put_data_item for entity '%s', topic '%s': %s",
+                     entity_id.c_str(), topic_name.c_str(), e.what());
     return tl::make_unexpected(
         make_error(500, ERR_INTERNAL_ERROR, "Failed to publish to topic",
                    json{{"details", e.what()}, {"entity_id", entity_id}, {"topic_name", topic_name}}));

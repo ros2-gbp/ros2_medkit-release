@@ -14,6 +14,7 @@
 
 #include "ros2_medkit_gateway/core/http/handlers/config_handlers.hpp"
 
+#include <algorithm>
 #include <future>
 #include <optional>
 #include <string>
@@ -27,9 +28,11 @@
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/fan_out_helpers.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/http/parameter_error_classification.hpp"
+#include "ros2_medkit_gateway/core/managers/configuration_manager.hpp"
+#include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
 #include "ros2_medkit_gateway/dto/json_reader.hpp"
 #include "ros2_medkit_gateway/dto/json_writer.hpp"
-#include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_support.hpp"
 
 namespace ros2_medkit_gateway {
@@ -86,21 +89,52 @@ struct ParsedParamId {
   bool has_prefix{false};  ///< Whether the ID had an app prefix
 };
 
-/// Parse param_id which may carry an `app_id:param_name` prefix for
-/// aggregated configurations. For aggregated entities the prefix
-/// disambiguates which app's parameter is targeted; for non-aggregated
-/// entities the colon (if any) is treated as part of the parameter name.
-ParsedParamId parse_aggregated_param_id(const std::string & param_id, bool is_aggregated) {
+/// Split `param_id` into member and parameter halves at its first colon, when
+/// the half before that colon names a member of this entity.
+///
+/// An entity id is restricted to alphanumerics, underscore and hyphen, so it
+/// can never contain a colon and the first one is the only candidate separator.
+/// Whether it IS a separator is decided by the entity's member set, because
+/// that is the set the member half draws its meaning from. A count of the nodes
+/// this gateway resolves for the entity cannot decide it: a member another
+/// gateway runs reports no ROS binding here and so contributes no node, which
+/// makes the count a measure of how much of the entity is local and not of how
+/// its ids are formed. An entity whose members all belong to peers resolves no
+/// node at all, and one that resolves a single node can still have peer-owned
+/// members alongside it.
+///
+/// A prefix that names no member is part of the parameter name. That is what
+/// keeps a parameter whose own name contains a colon addressable, and it is why
+/// the entity's own id is not read as a member half: it separates nothing, and
+/// accepting it would give a parameter a second id nothing offers.
+///
+/// A member half followed by an empty parameter name addresses no parameter.
+/// Carried further it would name the member's configurations COLLECTION - the
+/// route one path segment shorter - and hand a list back to a caller that asked
+/// for one value, so it is left unsplit and misses as an ordinary name.
+ParsedParamId address_parameter(const ThreadSafeEntityCache & cache, const EntityInfo & entity,
+                                const std::string & param_id) {
   ParsedParamId result;
   result.param_name = param_id;
 
-  auto colon_pos = param_id.find(':');
-  if (colon_pos != std::string::npos && is_aggregated) {
-    result.app_id = param_id.substr(0, colon_pos);
-    result.param_name = param_id.substr(colon_pos + 1);
-    result.has_prefix = true;
+  const auto colon_pos = param_id.find(':');
+  if (colon_pos == std::string::npos || colon_pos == 0 || colon_pos + 1 == param_id.size()) {
+    return result;
   }
 
+  std::string candidate = param_id.substr(0, colon_pos);
+  if (candidate == entity.id) {
+    return result;
+  }
+
+  const auto members = cache.get_members(entity.sovd_type(), entity.id);
+  if (std::find(members.begin(), members.end(), candidate) == members.end()) {
+    return result;
+  }
+
+  result.app_id = std::move(candidate);
+  result.param_name = param_id.substr(colon_pos + 1);
+  result.has_prefix = true;
   return result;
 }
 
@@ -114,88 +148,34 @@ const NodeConfigInfo * find_node_for_app(const std::vector<NodeConfigInfo> & nod
   return nullptr;
 }
 
-/// Error classification result for parameter operations.
-struct ErrorClassification {
-  int status_code;
-  std::string error_code;
-};
-
-/// Map a structured `ParameterErrorCode` to an HTTP status + SOVD error code.
-/// Identical mapping to the legacy `classify_error_code` helper.
-ErrorClassification classify_error_code(ParameterErrorCode error_code) {
-  ErrorClassification result;
-
-  switch (error_code) {
-    case ParameterErrorCode::NOT_FOUND:
-    case ParameterErrorCode::NO_DEFAULTS_CACHED:
-      result.status_code = 404;
-      result.error_code = ERR_RESOURCE_NOT_FOUND;
-      break;
-    case ParameterErrorCode::READ_ONLY:
-      result.status_code = 403;
-      result.error_code = ERR_X_MEDKIT_ROS2_PARAMETER_READ_ONLY;
-      break;
-    case ParameterErrorCode::SERVICE_UNAVAILABLE:
-    case ParameterErrorCode::TIMEOUT:
-      result.status_code = 503;
-      result.error_code = ERR_X_MEDKIT_ROS2_NODE_UNAVAILABLE;
-      break;
-    case ParameterErrorCode::TYPE_MISMATCH:
-    case ParameterErrorCode::INVALID_VALUE:
-      result.status_code = 400;
-      result.error_code = ERR_INVALID_PARAMETER;
-      break;
-    case ParameterErrorCode::NONE:
-      // NONE means "no error" - caller (classify_parameter_error) pre-filters
-      // this case, so reaching here indicates a programming error.
-      result.status_code = 500;
-      result.error_code = ERR_INTERNAL_ERROR;
-      break;
-    case ParameterErrorCode::SHUT_DOWN:
-    case ParameterErrorCode::INTERNAL_ERROR:
-    default:
-      result.status_code = 500;
-      result.error_code = ERR_INTERNAL_ERROR;
-      break;
+/// Settle where a member-qualified configuration id is served, and hand the
+/// request over when that is another gateway. Reads, writes and resets share it
+/// because a parameter has exactly one owning node whatever the method is.
+///
+/// A parameter is owned by a ROS node, and the node behind a member another
+/// gateway runs is on a graph this one cannot see: the local walk records no
+/// FQN for it, so every method resolved here refuses an id that names it. The
+/// member, however, is an entity with an owner, and on that owner the parameter
+/// is addressed by its bare name under the member's own App or Component route -
+/// nothing over there is aggregating, so nothing over there qualifies the id.
+///
+/// Returns the answer the handler must return - including the sentinel that says
+/// the owning peer has already committed the wire - or nullopt when this gateway
+/// serves the parameter itself, which is every unprefixed id and every member
+/// this gateway owns. An unprefixed id carries no member half, and an empty
+/// member id is the case `dispatch_to_member` answers with kServeLocally.
+std::optional<ErrorInfo> dispatch_configuration(const HandlerContext & ctx, const http::TypedRequest & req,
+                                                const std::string & entity_id, const std::string & param_id,
+                                                const ParsedParamId & parsed) {
+  auto dispatch = ctx.dispatch_to_member(req, parsed.app_id, "configurations/" + parsed.param_name,
+                                         json{{"entity_id", entity_id}, {"id", param_id}});
+  if (!dispatch) {
+    return dispatch.error();
   }
-
-  return result;
-}
-
-/// Classify a ParameterResult into HTTP status + error code. Prefers the
-/// structured `error_code` field and falls back to string-matching the legacy
-/// error messages for backward compatibility with older transports.
-ErrorClassification classify_parameter_error(const ParameterResult & result) {
-  // Prefer structured error code
-  if (result.error_code != ParameterErrorCode::NONE) {
-    return classify_error_code(result.error_code);
+  if (*dispatch == MemberDispatch::kForwarded) {
+    return HandlerContext::forwarded_sentinel_error();
   }
-
-  // Fallback to string parsing for backward compatibility
-  ErrorClassification classification;
-  const auto & error_message = result.error_message;
-
-  if (error_message.find("not found") != std::string::npos ||
-      error_message.find("Parameter not found") != std::string::npos) {
-    classification.status_code = 404;
-    classification.error_code = ERR_RESOURCE_NOT_FOUND;
-  } else if (error_message.find("read-only") != std::string::npos ||
-             error_message.find("read only") != std::string::npos ||
-             error_message.find("is read_only") != std::string::npos) {
-    classification.status_code = 403;
-    classification.error_code = ERR_X_MEDKIT_ROS2_PARAMETER_READ_ONLY;
-  } else if (error_message.find("not available") != std::string::npos ||
-             error_message.find("service not available") != std::string::npos ||
-             error_message.find("timed out") != std::string::npos ||
-             error_message.find("timeout") != std::string::npos) {
-    classification.status_code = 503;
-    classification.error_code = ERR_X_MEDKIT_ROS2_NODE_UNAVAILABLE;
-  } else {
-    classification.status_code = 400;
-    classification.error_code = ERR_INVALID_REQUEST;
-  }
-
-  return classification;
+  return std::nullopt;
 }
 
 /// Build a typed `ErrorInfo` for a failed parameter operation. Mirrors the
@@ -306,11 +286,72 @@ void apply_fan_out_observability(dto::ConfigListXMedkit & xm,
   if (fan_out.partial) {
     xm.partial = true;
     xm.failed_peers = fan_out.failed_peers;
+    xm.peer_failures = fan_out.peer_failures;
   }
   if (!fan_out.dropped_items.empty()) {
     xm.peer_dropped_items = fan_out.dropped_items;
   }
 }
+
+/// Severity rank for order-independent folding: node-unavailable (503) is the
+/// most actionable verdict (retry), then other server errors, then non-404
+/// client errors; NOT_FOUND ranks lowest so it can never mask a real failure.
+int severity_rank(int status_code) {
+  if (status_code == 404) {
+    return 0;
+  }
+  if (status_code == 503) {
+    return 3;
+  }
+  if (status_code >= 500) {
+    return 2;
+  }
+  return 1;  // non-404 4xx
+}
+
+/// Folds per-node parameter lookup failures so the error surfaced when no
+/// node succeeds does not depend on node iteration order. Failures are
+/// ranked by `severity_rank`; the highest rank folded so far is kept, and
+/// within a rank the first failure folded wins.
+class ParameterErrorAccumulator {
+ public:
+  /// Fold one failed ParameterResult.
+  void add(const ParameterResult & result) {
+    auto err = classify_parameter_error(result);
+    const int rank = severity_rank(err.status_code);
+    if (rank > 0) {
+      all_not_found_ = false;
+    }
+    // Strictly-greater keeps the first failure folded at the winning rank, so
+    // the surfaced status never depends on node iteration order.
+    if (rank > worst_rank_) {
+      worst_ = result;
+      classification_ = std::move(err);
+      worst_rank_ = rank;
+    }
+  }
+
+  /// True when every folded failure classified as 404.
+  bool all_not_found() const {
+    return all_not_found_;
+  }
+
+  /// The failure to surface: the highest-severity failure folded so far.
+  const ParameterResult & worst() const {
+    return worst_;
+  }
+
+  /// Classification of worst().
+  const ParameterErrorClassification & classification() const {
+    return classification_;
+  }
+
+ private:
+  ParameterResult worst_;
+  ParameterErrorClassification classification_;
+  int worst_rank_ = -1;
+  bool all_not_found_ = true;
+};
 
 }  // namespace
 
@@ -331,7 +372,7 @@ ConfigHandlers::list_configurations(const http::TypedRequest & req) {
     return tl::unexpected(flatten_validator_error(entity_result.error()));
   }
 
-  const auto & cache = ctx_.node()->get_thread_safe_cache();
+  const auto & cache = ctx_.services().entity_cache();
   auto agg_configs = cache.get_entity_configurations(entity_id);
 
   dto::Collection<dto::ConfigurationMetaData, dto::ConfigListXMedkit> response;
@@ -345,12 +386,13 @@ ConfigHandlers::list_configurations(const http::TypedRequest & req) {
   std::vector<std::string> queried_nodes;
 
   if (!agg_configs.nodes.empty()) {
-    auto * config_mgr = ctx_.node()->get_configuration_manager();
+    auto * config_mgr = ctx_.services().configuration_manager();
     const auto node_results = query_nodes_in_parallel(config_mgr, agg_configs);
 
     bool any_success = false;
-    std::string first_error;
-    std::string first_error_node;  // Track which node failed for better diagnostics
+    ParameterErrorAccumulator errors;            // worst failure to surface if no node answers
+    std::vector<std::string> unavailable_nodes;  // 503-class: node down/unresponsive
+    std::vector<std::string> failed_nodes;       // other per-node failures
 
     for (const auto & qr : node_results) {
       const auto & node_info = qr.node_info;
@@ -375,16 +417,35 @@ ConfigHandlers::list_configurations(const http::TypedRequest & req) {
             all_parameters.push_back(std::move(param_with_source));
           }
         }
-      } else if (first_error.empty()) {
-        first_error = result.error_message;
-        first_error_node = node_info.node_fqn;
+      } else {
+        errors.add(result);
+        // A per-node failure never discards the nodes that answered. A 503-class
+        // failure (node down/unresponsive) is an availability gap named in
+        // `unavailable_nodes`; any other failure is named in `failed_nodes`.
+        // Both keep the answering nodes' parameters and flag the list partial.
+        if (classify_parameter_error(result).status_code == 503) {
+          unavailable_nodes.push_back(node_info.node_fqn);
+        } else {
+          failed_nodes.push_back(node_info.node_fqn);
+        }
       }
     }
 
     if (!any_success) {
+      // No backing node answered. Surface the worst failure order-independently
+      // (`severity_rank`: 503 outranks other 5xx), so a mixed down + internal
+      // outage returns 503 to match GET /{entity}/configurations/{param}; name
+      // every failed node so the outage is diagnosable.
+      const auto & cls = errors.classification();
+      json details{{"details", errors.worst().error_message}, {"entity_id", entity_id}};
+      if (!unavailable_nodes.empty()) {
+        details["unavailable_nodes"] = unavailable_nodes;
+      }
+      if (!failed_nodes.empty()) {
+        details["failed_nodes"] = failed_nodes;
+      }
       return tl::unexpected(
-          make_error(503, ERR_X_MEDKIT_ROS2_NODE_UNAVAILABLE, "Failed to list parameters from any node",
-                     json{{"details", first_error}, {"entity_id", entity_id}, {"failed_node", first_error_node}}));
+          make_error(cls.status_code, cls.error_code, "Failed to list parameters from any node", std::move(details)));
     }
 
     xm.parameters = all_parameters;
@@ -393,6 +454,22 @@ ConfigHandlers::list_configurations(const http::TypedRequest & req) {
     }
     if (!queried_nodes.empty()) {
       xm.queried_nodes = queried_nodes;
+    }
+    // Some (but not all) backing nodes failed. Mirror the peer fan-out honesty
+    // convention (partial + failed_peers) for local nodes: keep the answering
+    // nodes' parameters, flag the response partial, and name what failed -
+    // 503-class nodes in `unavailable_nodes`, other failures in `failed_nodes` -
+    // instead of silently returning a shrunken 200. Keeps the list surface
+    // consistent with GET /{entity}/configurations/{param}, which returns the
+    // same 503 for a backing-node outage.
+    if (!unavailable_nodes.empty() || !failed_nodes.empty()) {
+      xm.partial = true;
+    }
+    if (!unavailable_nodes.empty()) {
+      xm.unavailable_nodes = std::move(unavailable_nodes);
+    }
+    if (!failed_nodes.empty()) {
+      xm.failed_nodes = std::move(failed_nodes);
     }
   }
 
@@ -439,26 +516,36 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::get_configuration(cons
   if (!entity_result) {
     return tl::unexpected(flatten_validator_error(entity_result.error()));
   }
+  const auto & entity = *entity_result;
 
-  // Parameter ID may be prefixed with app_id: for aggregated configs.
+  // Bounded before anything is parsed: the id may carry a member half, so the
+  // cap covers an entity id, the separator and a parameter name.
   if (param_id.empty() || param_id.length() > kMaxAggregatedParamIdLength) {
     return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER, "Invalid parameter ID",
                                      json{{"details", "Parameter ID is empty or too long"}}));
   }
 
-  const auto & cache = ctx_.node()->get_thread_safe_cache();
+  const auto & cache = ctx_.services().entity_cache();
   auto agg_configs = cache.get_entity_configurations(entity_id);
+  auto parsed = address_parameter(cache, entity, param_id);
+
+  // Ownership is settled before the local node set is consulted, because the
+  // node set describes this gateway's own graph: an entity all of whose members
+  // belong to peers resolves none, and refusing on that count would refuse the
+  // one id the entity can actually answer.
+  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
+    return tl::unexpected(*answered);
+  }
 
   if (agg_configs.nodes.empty()) {
     return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "No nodes available",
                                      json{{"entity_id", entity_id}, {"id", param_id}}));
   }
 
-  auto * config_mgr = ctx_.node()->get_configuration_manager();
-  auto parsed = parse_aggregated_param_id(param_id, agg_configs.is_aggregated);
+  auto * config_mgr = ctx_.services().configuration_manager();
 
-  // If targeting a specific app in an aggregated entity, dispatch to that
-  // app's node directly.
+  // The id named a member this gateway owns; read the parameter from that
+  // member's own node rather than probing every node the entity has.
   if (parsed.has_prefix) {
     const auto * node_info = find_node_for_app(agg_configs.nodes, parsed.app_id);
     if (node_info == nullptr) {
@@ -476,10 +563,10 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::get_configuration(cons
 
   // For non-aggregated entities (or aggregated entities without a prefix) we
   // probe every backing node for the parameter and return the first success.
-  // Track errors so a non-404 from any node (e.g. unavailable) wins over a
-  // pure "not found" verdict in the no-success branch.
-  ParameterResult last_result;
-  bool all_not_found = true;
+  // Failures fold through ParameterErrorAccumulator, which ranks them by
+  // severity (503 > other 5xx > non-404 4xx > 404), so the surfaced error is
+  // the same regardless of node iteration order.
+  ParameterErrorAccumulator errors;
 
   for (const auto & node_info : agg_configs.nodes) {
     auto result = config_mgr->get_parameter(node_info.node_fqn, parsed.param_name);
@@ -491,23 +578,19 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::get_configuration(cons
       return make_read_value(entity_id, node_info.node_fqn, parsed.param_name, source_app, result.data);
     }
 
-    last_result = result;
-    auto err = classify_parameter_error(result);
-    if (err.status_code != 404) {
-      all_not_found = false;
-    }
+    errors.add(result);
   }
 
-  if (all_not_found) {
+  if (errors.all_not_found()) {
     return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "Parameter not found",
                                      json{{"entity_id", entity_id}, {"id", param_id}}));
   }
 
   // Some node reported a non-404 (e.g. unavailable); surface that.
-  auto err = classify_parameter_error(last_result);
+  const auto & err = errors.classification();
   return tl::unexpected(
       make_error(err.status_code, err.error_code, "Failed to get parameter from any node",
-                 json{{"details", last_result.error_message}, {"entity_id", entity_id}, {"id", param_id}}));
+                 json{{"details", errors.worst().error_message}, {"entity_id", entity_id}, {"id", param_id}}));
 }
 
 // ===========================================================================
@@ -563,16 +646,9 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::set_configuration(cons
     return tl::unexpected(lock_err.error());
   }
 
-  const auto & cache = ctx_.node()->get_thread_safe_cache();
+  const auto & cache = ctx_.services().entity_cache();
   auto agg_configs = cache.get_entity_configurations(entity_id);
-
-  if (agg_configs.nodes.empty()) {
-    return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "No nodes available",
-                                     json{{"entity_id", entity_id}, {"id", param_id}}));
-  }
-
-  auto * config_mgr = ctx_.node()->get_configuration_manager();
-  auto parsed = parse_aggregated_param_id(param_id, agg_configs.is_aggregated);
+  auto parsed = address_parameter(cache, entity, param_id);
 
   // Helper: turn a successful set into the typed response. The wire shape
   // matches the legacy handler exactly - the response id is the original
@@ -582,6 +658,20 @@ http::Result<dto::ConfigurationReadValue> ConfigHandlers::set_configuration(cons
                         const json & param_data) -> dto::ConfigurationReadValue {
     return make_read_value(entity_id, node_fqn, param_id, source_app, param_data);
   };
+
+  // Ownership is settled before the local node set is consulted, for the same
+  // reason as on the read: the node set counts this gateway's own nodes, and a
+  // member another gateway runs contributes none of them.
+  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
+    return tl::unexpected(*answered);
+  }
+
+  if (agg_configs.nodes.empty()) {
+    return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "No nodes available",
+                                     json{{"entity_id", entity_id}, {"id", param_id}}));
+  }
+
+  auto * config_mgr = ctx_.services().configuration_manager();
 
   if (parsed.has_prefix) {
     const auto * node_info = find_node_for_app(agg_configs.nodes, parsed.app_id);
@@ -634,6 +724,18 @@ http::Result<http::NoContent> ConfigHandlers::delete_configuration(const http::T
   }
   const std::string param_id = *param_id_result;
 
+  // Same bound, and in the same position, as `set_configuration`: validate the
+  // caller's own inputs before consulting the lock, because a malformed id is
+  // the client's bug rather than a contended resource. `read_param_id` checks
+  // only that the capture is present, so without this DELETE was the one verb
+  // in the family accepting an unbounded parameter id - and the OpenAPI
+  // document publishes `maxLength: 512` on every route carrying `{config_id}`,
+  // this one included.
+  if (param_id.empty() || param_id.length() > kMaxAggregatedParamIdLength) {
+    return tl::unexpected(make_error(400, ERR_INVALID_PARAMETER, "Invalid parameter ID",
+                                     json{{"details", "Parameter ID is empty or too long"}}));
+  }
+
   auto entity_result = ctx_.validate_entity_for_route(req, entity_id);
   if (!entity_result) {
     return tl::unexpected(flatten_validator_error(entity_result.error()));
@@ -644,16 +746,23 @@ http::Result<http::NoContent> ConfigHandlers::delete_configuration(const http::T
     return tl::unexpected(lock_err.error());
   }
 
-  const auto & cache = ctx_.node()->get_thread_safe_cache();
+  const auto & cache = ctx_.services().entity_cache();
   auto agg_configs = cache.get_entity_configurations(entity_id);
+  auto parsed = address_parameter(cache, entity, param_id);
+
+  // Ownership is settled before the local node set is consulted, for the same
+  // reason as on the read: the node set counts this gateway's own nodes, and a
+  // member another gateway runs contributes none of them.
+  if (auto answered = dispatch_configuration(ctx_, req, entity_id, param_id, parsed)) {
+    return tl::unexpected(*answered);
+  }
 
   if (agg_configs.nodes.empty()) {
     return tl::unexpected(make_error(404, ERR_RESOURCE_NOT_FOUND, "No nodes available",
                                      json{{"entity_id", entity_id}, {"id", param_id}}));
   }
 
-  auto * config_mgr = ctx_.node()->get_configuration_manager();
-  auto parsed = parse_aggregated_param_id(param_id, agg_configs.is_aggregated);
+  auto * config_mgr = ctx_.services().configuration_manager();
 
   if (parsed.has_prefix) {
     const auto * node_info = find_node_for_app(agg_configs.nodes, parsed.app_id);
@@ -710,17 +819,11 @@ ConfigHandlers::delete_all_configurations(const http::TypedRequest & req) {
     return tl::unexpected(lock_err.error());
   }
 
-  const auto & cache = ctx_.node()->get_thread_safe_cache();
+  const auto & cache = ctx_.services().entity_cache();
   auto agg_configs = cache.get_entity_configurations(entity_id);
 
-  if (agg_configs.nodes.empty()) {
-    // No backing nodes means nothing to reset; SOVD treats this as a success
-    // with no content (204) - matches legacy behaviour.
-    return ResultVariant{http::NoContent{}};
-  }
-
-  auto * config_mgr = ctx_.node()->get_configuration_manager();
-  bool all_success = true;
+  auto * config_mgr = ctx_.services().configuration_manager();
+  bool all_reset = true;
   dto::ConfigurationDeleteMultiStatus multi_status;
   multi_status.entity_id = entity_id;
 
@@ -730,20 +833,65 @@ ConfigHandlers::delete_all_configurations(const http::TypedRequest & req) {
     dto::ConfigurationDeleteResultItem entry;
     entry.node = node_info.node_fqn;
     entry.app_id = node_info.app_id;
-    if (result.success) {
-      entry.success = true;
-      if (result.data.is_object() || result.data.is_array()) {
-        entry.details = result.data;
-      }
-    } else {
-      all_success = false;
-      entry.success = false;
+    entry.success = result.success;
+    if (!result.success) {
+      all_reset = false;
       entry.error = result.error_message;
+    }
+    // Carried on the failing entry as well as the succeeding one: a partial
+    // reset names the parameters it could not restore, and dropping that leaves
+    // the caller a verdict with nothing to act on.
+    if (result.data.is_object() || result.data.is_array()) {
+      entry.details = result.data;
     }
     multi_status.results.push_back(std::move(entry));
   }
 
-  if (all_success) {
+  // Members whose node another gateway runs. This route resets by calling the
+  // parameter services on this gateway's own ROS graph, and there is no such
+  // service for them here - so they are not reset, however the local half went.
+  // They are named rather than omitted because the entity's configurations
+  // collection LISTS their parameters: a caller who resets the entity and is
+  // answered 204 has been told the parameters it can see were restored, and for
+  // these they were not. A member with no parameters at all is a different case
+  // and is not reported - nothing was left undone for it.
+  //
+  // A member routed to a peer never contributes a local node: an id a peer
+  // announces that this gateway also declares is renamed `<peer>__<id>` by the
+  // merge, so the loop above and this one cannot name the same member.
+  if (auto * agg = ctx_.aggregation_manager(); agg != nullptr) {
+    for (const auto & member : cache.get_members(entity.sovd_type(), entity_id)) {
+      // Apps only: a parameter belongs to a ROS node, an App is what carries
+      // one, and a peer-owned Component's Apps are members in their own right.
+      // Naming the Component too would report the same gap twice.
+      if (!cache.get_app(member)) {
+        continue;
+      }
+      auto peer = agg->find_peer_for_entity(member);
+      if (!peer) {
+        continue;
+      }
+
+      std::string reason = "Not reset here: '";
+      reason += member;
+      reason += "' is owned by gateway '";
+      reason += *peer;
+      reason += "'. Reset it on that gateway, through its own /apps/";
+      reason += member;
+      reason += "/configurations route.";
+
+      dto::ConfigurationDeleteResultItem entry;
+      entry.app_id = member;
+      entry.success = false;
+      entry.error = std::move(reason);
+      all_reset = false;
+      multi_status.results.push_back(std::move(entry));
+    }
+  }
+
+  if (all_reset) {
+    // Every member this entity has was reset - including the case where it has
+    // none at all, which SOVD answers as a success with no content.
     return ResultVariant{http::NoContent{}};
   }
   return ResultVariant{std::move(multi_status)};

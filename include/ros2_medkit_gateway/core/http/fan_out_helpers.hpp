@@ -14,7 +14,9 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -111,6 +113,69 @@ inline std::string build_fan_out_path(const httplib::Request & req) {
   return path;
 }
 
+/// How a gateway answers the global `GET /faults`.
+///
+/// That list has no routing table behind it: the only way to list the faults
+/// of a gateway two hops away is for the hop in between to fan out again. So
+/// the route does not stop at `X-Medkit-No-Fan-Out` the way the per-entity
+/// collections do. Each gateway adds its instance id to
+/// `X-Medkit-Fan-Out-Visited` instead. A peer whose id is on the path is not
+/// asked, and one asked anyway (its id not yet learned from its health check)
+/// answers an empty list. A chain A -> B -> C still reaches C, and two gateways
+/// that aggregate each other do not ask each other twice.
+struct GlobalFaultFanOut {
+  enum class Mode {
+    kFanOut,          ///< Answer locally and ask the peers, sending `visited`.
+    kLocalOnly,       ///< Answer from this gateway's fault manager only.
+    kAlreadyCounted,  ///< This gateway is on the path: answer an empty list.
+    kTooDeep,         ///< The path cannot be extended: answer locally, report the peers not asked.
+  };
+  Mode mode{Mode::kLocalOnly};
+  std::string visited;
+};
+
+/// Longest `X-Medkit-Fan-Out-Visited` path that is still extended.
+inline constexpr size_t kMaxFanOutVisited = 16;
+/// Longest instance id accepted on that path. Ours are 32 hex digits.
+inline constexpr size_t kMaxFanOutVisitedIdLength = 64;
+
+/// `self_id` is `AggregationManager::instance_id()`, empty when aggregation is off.
+///
+/// `X-Medkit-No-Fan-Out` alone keeps its meaning: answer from this gateway
+/// alone. That is what a client opting out sends, and what a gateway that
+/// predates the visited path sends. Next to the visited path it is ignored,
+/// because `fan_out_get` puts it on every peer request.
+inline GlobalFaultFanOut plan_global_fault_fan_out(const httplib::Request & req, const std::string & self_id) {
+  using Mode = GlobalFaultFanOut::Mode;
+  if (self_id.empty()) {
+    return {Mode::kLocalOnly, {}};
+  }
+  if (!req.has_header(kFanOutVisitedHeader)) {
+    if (req.has_header("X-Medkit-No-Fan-Out")) {
+      return {Mode::kLocalOnly, {}};
+    }
+    return {Mode::kFanOut, self_id};
+  }
+  const auto ids = split_fan_out_visited(req.get_header_value(kFanOutVisitedHeader));
+  if (std::find(ids.begin(), ids.end(), self_id) != ids.end()) {
+    return {Mode::kAlreadyCounted, {}};
+  }
+  // A path this gateway cannot extend still gets its own faults: answering
+  // for itself is right, asking further is not.
+  bool readable = ids.size() < kMaxFanOutVisited;
+  std::string visited;
+  for (const auto & id : ids) {
+    readable = readable && id.size() <= kMaxFanOutVisitedIdLength;
+    visited += id;
+    visited += ',';
+  }
+  if (!readable) {
+    return {Mode::kTooDeep, {}};
+  }
+  visited += self_id;
+  return {Mode::kFanOut, std::move(visited)};
+}
+
 /// Fan-out GET to peer gateways and merge their items into `result["items"]`.
 /// Aggregation metadata (partial, failed_peers) is written into `ext_json`
 /// (a plain JSON object that callers fold into the response x-medkit block).
@@ -149,6 +214,11 @@ inline void merge_peer_items(AggregationManager * agg, const httplib::Request & 
   if (fan_result.is_partial) {
     ext_json["partial"] = true;
     ext_json["failed_peers"] = fan_result.failed_peers;
+    nlohmann::json failures = nlohmann::json::array();
+    for (const auto & failure : fan_result.peer_failures) {
+      failures.push_back({{"peer", failure.peer}, {"reason", failure.reason}});
+    }
+    ext_json["peer_failures"] = std::move(failures);
   }
 }
 
@@ -160,10 +230,20 @@ template <class T>
 struct FanOutResult {
   /// Typed peer items that successfully parsed as `T`.
   std::vector<T> items;
+  /// Name of the peer that sent `items[i]`, same order and length as `items`.
+  ///
+  /// A peer names its own members, and a member this gateway renamed on
+  /// collision (`<peer>__<id>`) is called something else here, so an item can
+  /// only be re-addressed to the leaf that owns it once the sending peer is
+  /// known. Kept parallel rather than folded into `T` because `T` is the wire
+  /// DTO and provenance is not part of the wire shape.
+  std::vector<std::string> item_peers;
   /// True if at least one targeted peer failed.
   bool partial{false};
   /// Names of peers that failed (matches AggregationManager::FanOutResult.failed_peers).
   std::vector<std::string> failed_peers;
+  /// Why each of those peers failed, one entry per name in `failed_peers`.
+  std::vector<dto::PeerFailure> peer_failures;
   /// Per-item drop records for peer items that failed JsonReader<T> validation.
   /// Surfaces "invisible drift" - malformed peer items used to disappear silently;
   /// now callers can fold these into x-medkit.peer_dropped_items for observability.
@@ -178,17 +258,15 @@ struct FanOutResult {
 ///     short-circuit to an empty result (no fan-out attempted).
 ///   - per-entity paths consult the routing/contributor tables to target only
 ///     the peers that host the entity; global paths fan out to all healthy peers.
-///   - peer failures are surfaced via `partial` + `failed_peers`.
+///   - peer failures are surfaced via `partial` + `failed_peers`, and the
+///     reason for each via `peer_failures`.
 ///
 /// New behavior:
 ///   - peer items are parsed via `dto::JsonReader<T>` rather than copied as
 ///     raw JSON. Items that fail validation are dropped from `items` and
 ///     recorded in `dropped_items` with the JsonReader error message plus a
 ///     best-effort `source_id`. A WARN is logged for each drop.
-///   - the `peer` field on each DroppedItem is left empty in this commit
-///     because AggregationManager::fan_out_get coalesces all peer responses
-///     into one `merged_items` array without per-item provenance. Future work
-///     can thread per-peer attribution through if needed.
+///   - every item that parsed carries the peer it came from, in `item_peers`.
 template <class T>
 inline FanOutResult<T> fan_out_collection(AggregationManager * agg, const httplib::Request & req) {
   FanOutResult<T> result;
@@ -216,21 +294,25 @@ inline FanOutResult<T> fan_out_collection(AggregationManager * agg, const httpli
   auto fan_result = agg->fan_out_get(fan_path, req.get_header_value("Authorization"), target_peers);
 
   if (fan_result.merged_items.is_array()) {
-    for (const auto & item : fan_result.merged_items) {
+    for (size_t index = 0; index < fan_result.merged_items.size(); ++index) {
+      const auto & item = fan_result.merged_items[index];
+      // `item_peers` is built alongside `merged_items` and is the same length;
+      // the bound is checked so a shorter list degrades to an unattributed item
+      // rather than reading past the end.
+      const std::string peer_name = index < fan_result.item_peers.size() ? fan_result.item_peers[index] : std::string{};
       if (!item.is_object()) {
         continue;
       }
       auto parsed = dto::JsonReader<T>::read(item);
       if (parsed.has_value()) {
         result.items.push_back(std::move(parsed.value()));
+        result.item_peers.push_back(peer_name);
         continue;
       }
       dto::DroppedItem dropped;
-      // Best-effort peer URL: per-item provenance is not available from
-      // AggregationManager::fan_out_get today (it coalesces peer responses
-      // into a single merged array). Left empty intentionally; if a future
-      // commit threads per-peer attribution through, this is the place to
-      // populate it.
+      // The wire key is a peer URL and what the fan-out carries is a peer name,
+      // so the two are not interchangeable. Left empty rather than filled with
+      // the wrong kind of identifier.
       dropped.peer = "";
       // Best-effort source_id: scan a small set of common id keys.
       static constexpr std::array<std::string_view, 5> kIdKeys = {"id", "name", "fault_id", "data_id", "operation_id"};
@@ -258,6 +340,7 @@ inline FanOutResult<T> fan_out_collection(AggregationManager * agg, const httpli
   }
   result.partial = fan_result.is_partial;
   result.failed_peers = fan_result.failed_peers;
+  result.peer_failures = fan_result.peer_failures;
   return result;
 }
 

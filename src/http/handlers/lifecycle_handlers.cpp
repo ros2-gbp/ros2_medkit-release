@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "ros2_medkit_gateway/core/http/handlers/lifecycle_handlers.hpp"
+#include "ros2_medkit_gateway/core/logging.hpp"
 
 #include <memory>
 #include <string>
@@ -21,10 +22,11 @@
 #include <tl/expected.hpp>
 
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
+#include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/core/providers/lifecycle_provider.hpp"
 #include "ros2_medkit_gateway/core/status/lifecycle_state_reader.hpp"
-#include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_support.hpp"
 
 namespace ros2_medkit_gateway {
@@ -81,8 +83,7 @@ http::Result<dto::LifecycleStatusResponse> LifecycleHandlers::handle_get_status(
   }
   const auto & entity = *entity_result;
 
-  const std::string base =
-      std::string("/api/v1/") + (entity.type == EntityType::APP ? "apps/" : "components/") + entity.id;
+  const std::string base = api_path((entity.type == EntityType::APP ? "/apps/" : "/components/") + entity.id);
 
   // Delegate to LifecycleProvider when one is registered for this entity.
   if (plugin_mgr_) {
@@ -97,8 +98,8 @@ http::Result<dto::LifecycleStatusResponse> LifecycleHandlers::handle_get_status(
         // The JSON writer only validates the status enum on read, not on write,
         // so guard the SOVD ready/notReady contract against a misbehaving plugin.
         if (resp.status != "ready" && resp.status != "notReady") {
-          RCLCPP_ERROR(HandlerContext::logger(), "LifecycleProvider returned invalid status '%s' for entity '%s'",
-                       resp.status.c_str(), entity_id.c_str());
+          MEDKIT_LOG_ERROR(HandlerContext::logger(), "LifecycleProvider returned invalid status '%s' for entity '%s'",
+                           resp.status.c_str(), entity_id.c_str());
           return tl::make_unexpected(make_error(500, ERR_PLUGIN_ERROR, "Plugin returned invalid lifecycle status"));
         }
         // Fill absolute transition URIs for each present field.
@@ -119,19 +120,19 @@ http::Result<dto::LifecycleStatusResponse> LifecycleHandlers::handle_get_status(
         }
         return resp;
       } catch (const std::exception & e) {
-        RCLCPP_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw for entity '%s': %s", entity_id.c_str(),
-                     e.what());
+        MEDKIT_LOG_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw for entity '%s': %s",
+                         entity_id.c_str(), e.what());
         return tl::make_unexpected(make_error(500, ERR_PLUGIN_ERROR, "Plugin threw exception"));
       } catch (...) {
-        RCLCPP_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw unknown exception for entity '%s'",
-                     entity_id.c_str());
+        MEDKIT_LOG_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw unknown exception for entity '%s'",
+                         entity_id.c_str());
         return tl::make_unexpected(make_error(500, ERR_PLUGIN_ERROR, "Plugin threw unknown exception"));
       }
     }
   }
 
   // No provider registered - build default status from the entity cache.
-  const auto & cache = ctx_.node()->get_thread_safe_cache();
+  const auto & cache = ctx_.services().entity_cache();
   dto::LifecycleStatusResponse resp;
 
   if (entity.type == EntityType::APP) {
@@ -194,7 +195,7 @@ http::Result<dto::LifecycleStatusResponse> LifecycleHandlers::handle_get_status(
 // PUT /{entity}/status/{action}
 // =============================================================================
 
-http::Result<std::pair<http::NoContent, http::ResponseAttachments>>
+http::Result<std::pair<http::Accepted<http::NoContent>, http::ResponseAttachments>>
 LifecycleHandlers::handle_transition(const http::TypedRequest & req, std::string_view transition) {
   auto id_raw = req.path_param("1");
   if (!id_raw) {
@@ -208,8 +209,7 @@ LifecycleHandlers::handle_transition(const http::TypedRequest & req, std::string
   }
   const auto & entity = *entity_result;
 
-  const std::string base =
-      std::string("/api/v1/") + (entity.type == EntityType::APP ? "apps/" : "components/") + entity.id;
+  const std::string base = api_path((entity.type == EntityType::APP ? "/apps/" : "/components/") + entity.id);
 
   if (plugin_mgr_) {
     auto * provider = plugin_mgr_->get_lifecycle_provider_for_entity(entity_id);
@@ -220,15 +220,15 @@ LifecycleHandlers::handle_transition(const http::TypedRequest & req, std::string
           return tl::make_unexpected(to_error_info(result.error()));
         }
         http::ResponseAttachments att;
-        att.with_status(202).with_header("Location", base + "/status");
-        return std::make_pair(http::NoContent{}, std::move(att));
+        att.with_location(base + "/status");
+        return std::make_pair(http::Accepted<http::NoContent>{http::NoContent{}}, std::move(att));
       } catch (const std::exception & e) {
-        RCLCPP_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw for entity '%s': %s", entity_id.c_str(),
-                     e.what());
+        MEDKIT_LOG_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw for entity '%s': %s",
+                         entity_id.c_str(), e.what());
         return tl::make_unexpected(make_error(500, ERR_PLUGIN_ERROR, "Plugin threw exception"));
       } catch (...) {
-        RCLCPP_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw unknown exception for entity '%s'",
-                     entity_id.c_str());
+        MEDKIT_LOG_ERROR(HandlerContext::logger(), "Plugin LifecycleProvider threw unknown exception for entity '%s'",
+                         entity_id.c_str());
         return tl::make_unexpected(make_error(500, ERR_PLUGIN_ERROR, "Plugin threw unknown exception"));
       }
     }
