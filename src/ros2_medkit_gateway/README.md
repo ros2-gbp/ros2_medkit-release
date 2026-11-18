@@ -7,7 +7,7 @@ HTTP gateway node for the ros2_medkit diagnostics system.
 The ROS 2 Medkit Gateway exposes ROS 2 system information and data through a RESTful HTTP API. It automatically discovers nodes in the ROS 2 system, organizes them into a SOVD-aligned entity hierarchy (Areas, Components, Apps, Functions), and provides endpoints to query and interact with them.
 
 **Key Features:**
-- **Auto-discovery**: Automatically detects ROS 2 nodes and topics
+- **Auto-discovery**: Automatically detects ROS 2 nodes and topics. A node the gateway saw running that the ROS graph still lists after its participant left, with no endpoints, is not exposed, and a warning is logged when that starts (see "How long a departed node keeps being listed" in `docs/config/server.rst`)
 - **SOVD entity model**: Areas, Components (host-level), Apps (ROS 2 nodes), and Functions (namespace-based logical grouping)
 - **REST API**: Standard HTTP/JSON interface
 - **Incremental entity cache**: Discovery refresh diffs add/remove/change and performs zero structural allocations in the cache layer at steady state (object-pool backed, fixed capacity reserved at init via `entity_cache.capacity`)
@@ -52,7 +52,7 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 - `GET /api/v1/components/{component_id}/operations` - List all services and actions for a component
 - `GET /api/v1/components/{component_id}/operations/{operation_id}` - Get operation details
 - `POST /api/v1/components/{component_id}/operations/{operation_id}/executions` - Execute operation (call service or send action goal)
-- `GET /api/v1/components/{component_id}/operations/{operation_id}/executions` - List all executions for an operation
+- `GET /api/v1/components/{component_id}/operations/{operation_id}/executions` - List all executions for an operation (empty for a service, which leaves no execution resource)
 - `GET /api/v1/components/{component_id}/operations/{operation_id}/executions/{execution_id}` - Get execution status
 - `DELETE /api/v1/components/{component_id}/operations/{operation_id}/executions/{execution_id}` - Cancel action execution
 
@@ -66,9 +66,11 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 
 ### Bulk Data Endpoints
 
-- `GET /api/v1/{entity}/{id}/bulk-data` - List bulk-data categories (rosbags + configured)
+- `GET /api/v1/{entity}/{id}/bulk-data` - List bulk-data categories (configured, plus `rosbags` when the fault manager serves them)
 - `GET /api/v1/{entity}/{id}/bulk-data/{category}` - List bulk-data items in a category
 - `GET /api/v1/{entity}/{id}/bulk-data/{category}/{item_id}` - Download a bulk-data file
+- `GET /api/v1/{entity}/{id}/bulk-data/rosbags/{recording_id}/manifest` - Manifest of a rosbag recording: its storage files in order, with size and sha256
+- `GET /api/v1/{entity}/{id}/bulk-data/rosbags/{recording_id}/files/{index}` - Download one storage file of a rosbag recording (supports `Range`)
 - `POST /api/v1/{entity}/{id}/bulk-data/{category}` - Upload bulk data (components/apps only)
 - `DELETE /api/v1/{entity}/{id}/bulk-data/{category}/{item_id}` - Delete bulk data (components/apps only)
 
@@ -98,6 +100,18 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 - `DELETE /api/v1/{entity}/{id}/triggers/{trigger_id}` - Delete a trigger
 - `GET /api/v1/{entity}/{id}/triggers/{trigger_id}/events` - SSE stream of trigger events
 
+### Fault-Trigger Endpoints (threshold rules)
+
+- `GET /api/v1/apps/{app_id}/fault-triggers` - List threshold rules for an app
+- `POST /api/v1/apps/{app_id}/fault-triggers` - Create a threshold rule (fires/clears a SOVD fault on value cross)
+- `DELETE /api/v1/apps/{app_id}/fault-triggers/{id}` - Delete a rule (clears any fault it asserts)
+
+Two separate collections by design: `/triggers` is the SOVD notification-trigger
+CRUD (condition subscriptions delivering SSE events), while `/fault-triggers`
+holds server-side threshold rules that raise and clear faults. They share no
+schema or store, so the threshold engine is mounted as a sibling instead of
+overloading the SOVD `/triggers` contract.
+
 ### Scripts Endpoints
 
 - `GET /api/v1/{entity}/{id}/scripts` - List available diagnostic scripts
@@ -112,8 +126,13 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 ### API Documentation (OpenAPI)
 
 - `GET /api/v1/docs` - Full OpenAPI 3.1.0 specification
-- `GET /api/v1/{entity_type}/{id}/docs` - Entity-scoped OpenAPI spec
+- `GET /api/v1/{entity_path}/docs` - Scoped OpenAPI spec, where `{entity_path}` is any
+  entity or resource path (`apps`, `apps/temp_sensor`, `apps/temp_sensor/data`, ...)
 - `GET /api/v1/swagger-ui` - Interactive Swagger UI (requires build with `-DENABLE_SWAGGER_UI=ON`)
+
+Both `/docs` routes are described in the document they serve. So are the routes a
+loaded plugin mounts, provided it exports `describe_plugin_routes`; those carry
+`x-medkit-plugin-served: true`.
 
 ### Status and Lifecycle Endpoints
 
@@ -139,7 +158,10 @@ All endpoints are prefixed with `/api/v1` for API versioning.
 - `GET /api/v1/{entity}/{id}/x-medkit-procfs` - Process info (procfs plugin)
 - `GET /api/v1/{entity}/{id}/x-medkit-systemd` - Systemd unit status
 - `GET /api/v1/{entity}/{id}/x-medkit-container` - Container runtime info
-- `GET /api/v1/{entity}/{id}/x-medkit-graph` - ROS 2 graph details
+- `GET /api/v1/functions/{function_id}/x-medkit-graph` - ROS 2 dataflow graph for a
+  Function. Functions only: the graph provider mounts the route on
+  `functions/([^/]+)/x-medkit-graph` and registers the capability for that entity type
+  alone.
 
 ### API Reference
 
@@ -244,6 +266,220 @@ curl http://localhost:8080/api/v1/areas/nonexistent/components
 - Filter components by domain (only show powertrain components)
 - Hierarchical navigation (select area → view its components)
 - Area-specific health checks
+
+### Item Ids and Their Providers
+
+An entity that draws items from members - an Area, a Function, or a Component
+with hosted apps - names the contributing members of every listed item in
+`x-medkit.member_ids`.
+
+Ids stay bare. An item id is the ROS name its member uses: the topic path for
+`/data`, the service or action short name for `/operations`. That does not
+change with aggregation, which is the ordinary case - in runtime discovery
+every App hangs off the single host Component.
+
+An id is qualified only when it is ambiguous, meaning more than one item in the
+merged collection carries it:
+
+```
+<member_id>:<item_id>
+```
+
+Ambiguity is decided after the peer fan-out, since neither gateway can see the
+collision alone. Two members exposing the operation short name `calibrate` at
+different ROS paths are two items with one id, so both are qualified. A topic
+path names one topic however many members publish and subscribe to it, so it
+stays bare and lists its contributors in `member_ids`; it is qualified only if
+two gateways each contribute an item under that path.
+
+An operation's short name is the last segment of its ROS path, so ONE member
+can carry it twice - `left/calibrate` and `right/calibrate` are two operations
+called `calibrate`. The member half names that member for both copies and
+separates nothing, so those items take the ROS path, leading slash stripped, as
+their item half:
+
+```
+robot/left/calibrate                       # on the App itself
+primary_calibration:robot/left/calibrate   # on an entity that aggregates it
+```
+
+The form is decided per provider: a short name that its own provider carries
+once keeps that short name, whatever any other provider does with it. `/data`
+already addresses its items by path, so the split at the first colon is
+unchanged - a ROS path carries no colon.
+
+A member half a peer supplied is read through the collision rename before it is
+used. A peer names its own leaves as its own tree names them, and an App whose
+id collided with a local one is merged here under `<peer>__<id>` - so the name
+the peer sends names the LOCAL leaf. Items that arrive through the peer fan-out
+are re-attributed to the id the merge gave their owner, in `member_ids` and in
+the member half of the id itself, so every id the collection offers addresses
+the copy it names.
+
+`x-medkit.available` on a listed item is a statement about its MEMBER: it
+appears, as `false`, only when the gateway that owns the item is not answering.
+An entity declared on this gateway alone can still host a member another gateway
+runs; no peer contributes the entity, so its collection fan-out never runs, and
+that says nothing about the member. Such an item is listed as usual and the
+request for it is dispatched to the member's own route.
+
+- A bare id that names one item works on every route, which is what the web UI,
+  the Foxglove panel, the MCP tools and the generated OpenAPI document all send.
+- `POST /{entity}/operations/{id}/executions` with a bare id several members
+  provide is `400 invalid-request`, naming the qualified form and the members.
+  A short name one member carries twice is `400` too, naming the ROS paths that
+  collided. Either refusal carries `parameters.operation_ids`: the ids that do
+  address what collided, as the collection lists them.
+- A qualified id is accepted on single-item routes; an unknown member half, an
+  item half that member does not provide, or a member half followed by nothing,
+  is `404` - which is what tells an absent item apart from one that exists and
+  carries no data.
+- `GET /{entity}/operations/{id}` and `GET /{entity}/operations/{id}/executions`
+  refuse exactly what the execution refuses, with the same body. An unambiguous
+  bare id reads and lists unchanged.
+
+`GET /{entity}/operations/{id}/executions` resolves the id by the same rule, so
+a member-qualified id and a ROS-path id both work, and has three distinct
+answers: an action returns its goals, a service returns `200` with an empty
+`items` array (a service call completes inside its `POST` and leaves no
+execution resource), and an id naming no operation is `404`. Goals live on the
+gateway that sent them, so an id naming a peer-owned member is dispatched to
+that member's own route exactly as the `POST` was.
+
+A member-qualified request is served by the gateway that owns that member, on
+the member's own entity route. An aggregating entity holds nothing itself and
+its members can belong to different gateways, so
+
+```
+POST /api/v1/functions/vehicle_health/operations/peer_calibration:calibrate/executions
+```
+
+becomes, when `peer_calibration` belongs to a peer,
+
+```
+POST /api/v1/apps/peer_calibration/operations/calibrate/executions
+```
+
+on that peer, and the peer's answer is what the client gets. The ROS service or
+topic behind the id lives on the owner's graph and nowhere else. A locally owned
+member is served here as before. This covers `GET` and `PUT` of one `/data` item,
+`POST` of an `/operations` execution, and `GET`, `PUT` and `DELETE` of one
+`/configurations` item.
+
+An id needs no member half to reach its owner. A `/data` item one member provides
+keeps its bare id - qualification follows ambiguity, not aggregation - so the bare
+topic path is the id the collection hands back, and it is dispatched by the member
+the tree records as providing that topic:
+
+```
+GET /api/v1/functions/vehicle_health/data/chassis%2Fbrakes%2Fpressure
+```
+
+becomes, when every member providing `/chassis/brakes/pressure` belongs to one
+peer,
+
+```
+GET /api/v1/apps/pressure_sensor/data/chassis/brakes/pressure
+```
+
+A topic a member this gateway runs provides is sampled here, unchanged; a topic
+whose providers are spread across gateways names no single place, and the local
+graph answers it as before. `/operations` resolves a bare id the same way: the
+operation is resolved first, and the member owning its ROS path is where the
+execution is sent.
+
+`/configurations` keeps its own id scheme, `<app_id>:<param_name>`, whose member
+half is the app id. Nothing on the owning gateway is aggregating, so the
+parameter is addressed there by its bare name:
+
+```
+PUT /api/v1/functions/vehicle_health/configurations/peer_calibration:calibration_offset
+```
+
+becomes
+
+```
+PUT /api/v1/apps/peer_calibration/configurations/calibration_offset
+```
+
+and the write lands on the ROS node that declares the parameter. The
+`GET /{entity}/configurations` listing is unchanged - peer parameters reach it
+through the collection fan-out, and the ids it offers are the ids the
+single-item routes accept.
+
+The member half is recognised when the text before the first colon names a
+member of the addressed entity. How many ROS nodes this gateway resolves for the
+entity does not enter into it: a member another gateway runs reports no ROS
+binding here, so an entity whose members are all peer-owned resolves none and an
+entity running one node of its own can still have peer-owned members beside it.
+Both take the same id form as an entity with several local nodes, and neither
+changes the ids the listing offers. A prefix naming no member is part of the
+parameter name.
+
+`DELETE /{entity}/configurations` resets the nodes this gateway runs, so a
+member another gateway runs is not reset by it. That is reported rather than
+implied: `207` instead of `204`, with the member named and the gateway that owns
+it named with it.
+
+Reachability is settled first, so a
+member whose gateway has gone silent answers `504 not-responding` instead of a
+`502` from a connection that could not be made. `X-Medkit-No-Fan-Out` bounds the
+collection fan-out and does not change where a member-qualified request is
+served - it already names its owner and is one hop.
+
+Ambiguity is decided from the declared tree, which includes a peer's declared
+operations held locally. The answer therefore does not change with who is
+reachable, costs no network call, and cannot be altered by a client-supplied
+header.
+
+A refresh describes a peer or it does not. Reading one takes several requests -
+the four entity lists, the nested `subareas` and `subcomponents` collections,
+the per-entity detail that carries a Component's relationships and a Function's
+hosts, and each app's `operations` - and if any of them cannot be read, the
+whole refresh is dropped instead of published with the missing branch silently
+absent. The peer's last complete declaration stands for another cycle. Two statuses
+carry a meaning of their own and are read instead: a `404` on a nested
+collection route means the peer runs a gateway that predates that route, so
+those members are omitted, the rest of the peer merges normally and the absent
+routes are logged once per refresh; a `504 not-responding` on any route hanging
+off an entity - its detail, or one of its nested collections - is the peer
+saying it holds that id and whoever contributes it has gone quiet, which is what
+an aggregating peer answers for a declaration it is retaining, so the entity is
+kept as its list named it and marked `x-medkit.available: false`. A nested
+collection answering that way costs only the members that route carries; read as
+a failed request it would discard the whole peer, so one unreachable member
+anywhere behind it would freeze this gateway's view of that peer. A `504`
+without `not-responding` says nothing about an entity and still drops the
+refresh.
+
+`x-medkit.available` is read back off a peer's response with a default of
+`true`, since it is emitted only when false. Beyond one hop that is the only
+thing carrying the fact: an App also has `is_online`, a Component has nothing
+else, so without it the head of a three-gateway chain reports a leaf behind a
+dead gateway as reachable.
+
+When a peer stops answering, the entities it declared in its manifest are
+retained and marked unavailable (`x-medkit.available: false`,
+`x-medkit.is_online: false`); the ones it only discovered at runtime disappear.
+`available: false` answers "can a request get there", so it is earned by a
+failed health check alone - a peer that still answers `/health` keeps its
+entities as they were last read even when a refresh against it came back
+incomplete.
+A retained member keeps the operations it last reported: they stay listed on the
+aggregating entity marked `x-medkit.available: false`, and still count towards
+ambiguity, so a qualified id never degrades back to a bare one that execution
+would refuse. A request addressed to a retained entity answers
+`504 not-responding` naming the member, instead of being forwarded to the silent
+peer as a `502`. `/health`
+still reports the peer itself as `offline` - entity availability and peer
+health are separate questions.
+
+`/configurations` predates this rule and keeps its own: on a multi-node entity
+every parameter id is `<app_id>:<param_name>`, a bare id is refused on write,
+and items carry `x-medkit.source` rather than `member_ids`. The node count
+decides which ids the listing offers; which ids it accepts is decided by the
+member set, so the qualified form works on an entity whose members are all
+peer-owned too.
 
 ### Component Data Read Endpoints
 
@@ -497,13 +733,36 @@ Cancel a running action execution.
 curl -X DELETE http://localhost:8080/api/v1/components/long_calibration/operations/long_calibration/executions/abc123def456
 ```
 
-**Response (200 OK):**
-```json
-{
-  "status": "canceling",
-  "goal_id": "abc123def456...",
-  "message": "Cancel request sent"
-}
+**Response:** `204 No Content` (empty body) - the cancellation is underway. Also
+returned when the cancel response was lost but the action's status stream
+already shows the goal cancelling.
+
+**Other outcomes:**
+
+| Status | Meaning |
+|--------|---------|
+| `400` | The action server answered and refused (`x-medkit-ros2-action-rejected`, `return_code` 1-3) |
+| `404` | No such execution (`resource-not-found`) - including one evicted while the request was in flight |
+| `500` | The cancel could not be delivered or parsed (`x-medkit-ros2-action-unavailable`) |
+| `503` | The cancel service is gone - the action server died (`x-medkit-ros2-action-unavailable`) |
+| `504` | No answer within the cancel budget and the status stream does not show the goal cancelling, so the outcome is unknown (`not-responding`) |
+
+The cancel budget is `service_call_timeout_sec` (default 10 s) plus up to 2 s of
+cancel-service discovery. On `504`, poll the execution resource above and read
+`x-medkit.ros2_status` - the SOVD `status` field renders both `CANCELED` and
+`ABORTED` as `failed`, so it cannot tell you whether the cancellation took
+effect.
+
+#### PUT /api/v1/components/{component_id}/operations/{operation_id}/executions/{execution_id}
+
+Send a control command to a running execution. ROS 2 actions implement the SOVD
+`stop` capability, which maps to action cancel and shares the outcome table
+above (with `202 Accepted` in place of `204`, plus `409` when `execute` is
+requested on an execution that is still running).
+
+```bash
+curl -X PUT -H 'Content-Type: application/json' -d '{"capability": "stop"}' \
+  http://localhost:8080/api/v1/components/long_calibration/operations/long_calibration/executions/abc123def456
 ```
 
 ### Authentication Endpoints
@@ -723,12 +982,13 @@ Faults represent errors or warnings reported by system components. The gateway p
 
 - `GET /api/v1/faults` - List all faults across the system (convenience API for dashboards)
 - `GET /api/v1/faults/stream` - Real-time fault event stream via Server-Sent Events (SSE)
-- `GET /api/v1/faults/{fault_code}/snapshots` - Get topic snapshots captured when fault was confirmed
-- `GET /api/v1/faults/{fault_code}/snapshots/bag` - Download rosbag file for fault (if rosbag capture enabled)
 - `GET /api/v1/components/{component_id}/faults` - List faults for a specific component
 - `GET /api/v1/components/{component_id}/faults/{fault_code}` - Get a specific fault
-- `GET /api/v1/components/{component_id}/faults/{fault_code}/snapshots` - Get snapshots for a component's fault
 - `DELETE /api/v1/components/{component_id}/faults/{fault_code}` - Clear a fault
+
+Snapshots are not a separate endpoint. A fault response carries them inline in
+`environment_data.snapshots[]`, and a rosbag recording is downloaded through the
+bulk-data endpoints (`GET /api/v1/{entity-path}/bulk-data/rosbags/{id}`).
 
 #### GET /api/v1/faults
 
@@ -781,13 +1041,14 @@ Real-time fault event stream using Server-Sent Events (SSE). Clients receive ins
 - **Real-time notifications**: Events pushed instantly when fault state changes
 - **Automatic reconnection**: Supports `Last-Event-ID` header for seamless reconnection
 - **Keepalive**: Sends `:keepalive` comment every 30 seconds to prevent timeouts
-- **Event buffer**: Buffers up to 100 recent events for reconnecting clients
-- **Entity context (SOVD payload extension)**: When the gateway can resolve the fault's first reporting source back to an entity, the payload carries an `x-medkit` object with `entity_type` and `entity_id` fields so consumers can hit `/{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}` directly without enumerating entities
+- **Event buffer**: Buffers up to 100 recent events for reconnecting clients. Under overflow the buffer evicts entries every live client has already received, then `fault_updated` entries superseded by a newer event for the same fault code - a lagging client still converges on the current state of every fault and loses no status transition. Anything beyond that (a superseded transition, or an event with no newer sibling) is genuinely lost for lagging clients: those losses are counted and logged as drops, and an affected client should refetch `GET /api/v1/faults` to resynchronize
+- **Entity context (SOVD payload extension)**: When the gateway can resolve the fault's first reporting source back to an entity, the payload carries an `x-medkit` object with `entity_type` and `entity_id` fields so consumers can hit `/{entity_type}/{entity_id}/bulk-data/rosbags/{fault_code}` directly without enumerating entities. That address serves the fault's newest recording; to reach an older one, list `/bulk-data/rosbags` and use the descriptor `id` (the recording id)
+- **Correlation payload**: when a root-cause event auto-clears correlated symptom faults, the payload carries their codes in `auto_cleared_codes` (omitted when empty); those symptoms get no event of their own
 
 **Event Types:**
 - `fault_confirmed` - Fault transitioned to CONFIRMED status
-- `fault_updated` - Fault data changed (occurrence_count, sources, etc.)
-- `fault_cleared` - Fault was cleared via ClearFault service
+- `fault_updated` - Fault data changed without a status transition (`last_occurred`, severity, reporting sources). Not `occurrence_count`, which only changes on an occurrence edge
+- `fault_cleared` - Fault ended: cleared via ClearFault service, or auto-healed by PASSED events (check `fault.status` for `CLEARED` vs `HEALED`)
 
 **Example:**
 ```bash
@@ -821,7 +1082,7 @@ data: {"event_type":"fault_cleared","fault":{"fault_code":"MOTOR_OVERHEAT",...},
 curl -N -H "Last-Event-ID: 5" http://localhost:8080/api/v1/faults/stream
 ```
 
-This replays any buffered events with ID > 5, then continues streaming new events.
+This replays any buffered events with ID > 5, then continues streaming new events. Replayed `id` sequences may contain holes (e.g. 41, 43, 44) where buffer eviction removed superseded events; ids are monotonically increasing but never guaranteed contiguous. A `Last-Event-ID` beyond the newest issued id is treated as "caught up": the client receives only events published after it connected.
 
 #### GET /api/v1/components/{component_id}/faults
 
@@ -845,79 +1106,12 @@ curl http://localhost:8080/api/v1/components/nav2_controller/faults
 }
 ```
 
-#### GET /api/v1/faults/{fault_code}/snapshots
+#### Snapshots
 
-Get topic snapshots captured when a fault transitioned to CONFIRMED status. Snapshots provide system state at the moment of fault confirmation for debugging purposes.
-
-**Query Parameters:**
-- `topic` - (optional) Filter by specific topic name
-
-**Example:**
-```bash
-curl http://localhost:8080/api/v1/faults/MOTOR_OVERHEAT/snapshots
-curl http://localhost:8080/api/v1/faults/MOTOR_OVERHEAT/snapshots?topic=/joint_states
-```
-
-**Response (200 OK):**
-```json
-{
-  "fault_code": "MOTOR_OVERHEAT",
-  "captured_at": 1735830000.123,
-  "topics": {
-    "/joint_states": {
-      "message_type": "sensor_msgs/msg/JointState",
-      "data": {"name": ["joint1"], "position": [1.57]}
-    },
-    "/cmd_vel": {
-      "message_type": "geometry_msgs/msg/Twist",
-      "data": {"linear": {"x": 0.5}, "angular": {"z": 0.1}}
-    }
-  }
-}
-```
-
-**Response (200 OK - No snapshots):**
-```json
-{
-  "fault_code": "MOTOR_OVERHEAT",
-  "topics": {}
-}
-```
-
-**Response (404 Not Found):**
-```json
-{
-  "error": "Fault not found",
-  "fault_code": "NONEXISTENT_FAULT"
-}
-```
-
-#### GET /api/v1/components/{component_id}/faults/{fault_code}/snapshots
-
-Get topic snapshots for a specific component's fault. Same as the system-wide endpoint but scoped to a component.
-
-**Query Parameters:**
-- `topic` - (optional) Filter by specific topic name
-
-**Example:**
-```bash
-curl http://localhost:8080/api/v1/components/motor_controller/faults/MOTOR_OVERHEAT/snapshots
-```
-
-**Response (200 OK):**
-```json
-{
-  "component_id": "motor_controller",
-  "fault_code": "MOTOR_OVERHEAT",
-  "captured_at": 1735830000.123,
-  "topics": {
-    "/motor/temperature": {
-      "message_type": "sensor_msgs/msg/Temperature",
-      "data": {"temperature": 85.5, "variance": 0.1}
-    }
-  }
-}
-```
+Snapshots captured when a fault transitioned to CONFIRMED are returned inline
+with the fault itself, in `environment_data.snapshots[]` of
+`GET /api/v1/{entity-path}/faults/{fault_code}`. There is no separate snapshot
+endpoint.
 
 **Snapshot Configuration:**
 
@@ -956,45 +1150,30 @@ default_topics:
   - /diagnostics
 ```
 
-#### GET /api/v1/faults/{fault_code}/snapshots/bag
+#### Rosbag Recordings
 
-Download the rosbag file associated with a fault. This endpoint is only available when rosbag capture is enabled in FaultManager.
+Rosbag capture provides "black box" style recording - a ring buffer continuously
+records configured topics, and when a fault is confirmed the buffer is flushed to
+a bag file. This captures system state both **before and after** fault
+confirmation.
 
-Rosbag capture provides "black box" style recording - a ring buffer continuously records configured topics, and when a fault is confirmed, the buffer is flushed to a bag file. This allows capturing system state both **before and after** fault confirmation.
+A recording is listed and downloaded through the bulk-data endpoints:
+`GET /api/v1/{entity-path}/bulk-data/rosbags` for the descriptors and
+`GET /api/v1/{entity-path}/bulk-data/rosbags/{recording_id}` for the bytes. The
+download serves one storage file, verbatim, named `<recording_id>.<format>`
+(`.mcap` or `.sqlite3`). It is not an archive and it does not include the bag's
+`metadata.yaml`.
 
-**Example:**
-```bash
-# Download rosbag archive
-curl -O -J http://localhost:8080/api/v1/faults/MOTOR_OVERHEAT/snapshots/bag
-
-# Or save with custom filename
-curl http://localhost:8080/api/v1/faults/MOTOR_OVERHEAT/snapshots/bag -o motor_fault.tar.gz
-```
-
-**Response (200 OK):**
-- For directory-based bags (default rosbag2 format): compressed tar.gz archive containing the full bag directory with metadata.yaml and all storage segments
-- Content-Type: `application/gzip`
-- Content-Disposition: `attachment; filename="fault_MOTOR_OVERHEAT_20260124_153045.tar.gz"`
-
-The archive can be extracted and played directly with `ros2 bag play`.
-
-**Response (404 Not Found - Fault or rosbag not found):**
-```json
-{
-  "error": "Rosbag not found",
-  "fault_code": "MOTOR_OVERHEAT",
-  "details": "No rosbag file associated with this fault"
-}
-```
-
-**Response (404 Not Found - Rosbag file deleted):**
-```json
-{
-  "error": "Rosbag file not found",
-  "fault_code": "MOTOR_OVERHEAT",
-  "details": "File was deleted or moved"
-}
-```
+For a recording held in a single storage file, which is the normal case, the
+descriptor `size` is that file's length and therefore the length of the
+download. A recording that grew past `snapshots.rosbag.max_bag_size_mb` is split
+across several storage files. The download then hands over the first file the
+recording's own metadata names, and fails if that file is missing. It never
+serves another file in its place. `x-medkit.storage_files` says how many files
+the metadata names, and `size` is the sum of those files, the `total_bytes` of
+the recording's manifest, so it exceeds the download's `Content-Length`. See
+[the size rule](../../docs/api/rest.rst) in the REST API reference for the full
+statement.
 
 **Rosbag Configuration:**
 
@@ -1008,8 +1187,8 @@ Rosbag capture is configured via FaultManager parameters. See `config/snapshots.
 | `snapshots.rosbag.topics` | string | `"entity"` | Topic selection: `"entity"` (default; faulting node's topics + `/tf`), `"config"`, `"all"`, or `"explicit"` |
 | `snapshots.rosbag.exclude_sensor_topics` | bool | `true` | Auto-exclude image/points/depth/compressed in broad modes (`include_topics` re-adds) |
 | `snapshots.rosbag.qos_match` | bool | `true` | Match each topic's publisher QoS for faithful capture |
-| `snapshots.rosbag.format` | string | `"sqlite3"` | Bag format: `"sqlite3"` or `"mcap"` |
-| `snapshots.rosbag.auto_cleanup` | bool | `true` | Delete bag when fault is cleared |
+| `snapshots.rosbag.format` | string | `"mcap"` | Bag format: `"mcap"` (default; opens directly in Foxglove and Lichtblick) or `"sqlite3"`. Neither is privileged - an unavailable plugin falls back automatically to the other one |
+| `snapshots.rosbag.auto_cleanup` | bool | `true` | Delete a fault's bag when the fault is cleared. No effect once `snapshots.rosbag.max_bags_per_fault` is anything other than `1`, where the cap governs retention instead |
 | `snapshots.rosbag.max_buffer_mb` | int | `256` | Ring-buffer RAM cap (oldest messages drop past it) |
 | `snapshots.rosbag.max_bag_size_mb` | int | `50` | Max size per bag file |
 | `snapshots.rosbag.max_total_storage_mb` | int | `500` | Total storage limit |
@@ -1022,16 +1201,30 @@ ros2 run ros2_medkit_fault_manager fault_manager_node \
 ```
 
 **Playback downloaded rosbag:**
+
+The downloaded file is a bag in itself. Point `ros2 bag` straight at it, with no
+unpacking step and no `--storage` flag - rosbag2 reads the storage id out of the
+file, so the same two commands work for `.mcap` and for `.sqlite3`.
+
 ```bash
-# Extract the downloaded archive
-tar -xzf fault_MOTOR_OVERHEAT_20260124_153045.tar.gz
+# Inspect the downloaded file
+ros2 bag info fault_MOTOR_OVERHEAT_1738664999000.mcap
 
-# Play back the bag
-ros2 bag play fault_MOTOR_OVERHEAT_1735830000/
-
-# Inspect bag contents
-ros2 bag info fault_MOTOR_OVERHEAT_1735830000/
+# Play it back
+ros2 bag play fault_MOTOR_OVERHEAT_1738664999000.mcap
 ```
+
+```bash
+# The same, for a recording captured with snapshots.rosbag.format: sqlite3
+ros2 bag info fault_MOTOR_OVERHEAT_1738664999000.sqlite3
+ros2 bag play fault_MOTOR_OVERHEAT_1738664999000.sqlite3
+```
+
+A lone storage file needs no `metadata.yaml` beside it: both commands read the
+topics, the message count and the duration out of the file itself.
+
+On Humble, reading `.mcap` needs the plugin installed first:
+`sudo apt install ros-humble-rosbag2-storage-mcap`.
 
 **Differences from JSON Snapshots:**
 
@@ -1312,6 +1505,7 @@ ros2 launch ros2_medkit_gateway gateway.launch.py \
 | `server_host`         | `127.0.0.1`                           | Host to bind the REST server (`127.0.0.1` or `0.0.0.0`). Launch-arg only.                           |
 | `server_port`         | `8080`                                | Port for the REST API. Launch-arg only.                                                              |
 | `refresh_interval_ms` | `30000`                               | Safety-backstop refresh interval in ms (graph events drive the primary refresh). Launch-arg only.    |
+| `cors_allowed_origins` | `http://localhost:3000,http://localhost:5173` | Comma-separated browser origins, matched exactly (`http://127.0.0.1:3000` is not `http://localhost:3000`). A value replaces the defaults; empty disables CORS. With a custom `config_file` and this argument unset, CORS comes from the config files only. |
 
 ### Authentication Configuration Examples
 
@@ -1490,8 +1684,30 @@ curl --cacert ./certs/ca.crt https://localhost:8443/api/v1
 
 The package compiles into two layered static libraries with a strict dependency direction:
 
-- **`gateway_core`** - middleware-neutral business logic. Sources live under `src/core/` and headers under `include/ros2_medkit_gateway/core/`. Links only header-only and C-level externals (cpp-httplib, nlohmann/json, yaml-cpp, tl::expected, jwt-cpp, OpenSSL, SQLite, dl). Carries no rclcpp / rcl_interfaces / message-package dependency. Hosts the neutral HTTP request handlers, JWT authentication, fault model (debounce, storage, cache, correlation), peer aggregation, manifest parsing, the entity cache, the neutral managers (lock, bulk-data, subscription, script, update, plugin), and every provider interface contract.
-- **`gateway_ros2`** - ROS adapter layer. Compiles the remaining sources under `src/` and links `gateway_core` publicly via `medkit_target_dependencies`. Hosts `GatewayNode` (the `rclcpp::Node` entry point), the ROS-coupled managers (data access, operation, configuration, fault facade, log, trigger), runtime discovery, the native topic sampler, and the ROS-specific provider default implementations.
+- **`gateway_core`** - the ROS-free layer, defined in `cmake/gateway_core.cmake`. Sources: `src/core/`, the HTTP server and REST server, `src/http/handlers/`, `src/openapi/`, the plugin manager and loader, aggregation, and the script manager. Headers live under `include/ros2_medkit_gateway/core/` and the neighbouring `http/`, `plugins/` and `aggregation/` directories. Links only header-only and C-level externals (cpp-httplib, nlohmann/json, yaml-cpp, tl::expected, jwt-cpp, OpenSSL, SQLite, dl). Carries no rclcpp / rcl_interfaces / message-package dependency.
+- **`gateway_ros2`** - the ROS adapters. Compiles the remaining sources under `src/` and links `gateway_core` publicly via `medkit_target_dependencies`. Hosts `GatewayNode` (the `rclcpp::Node` entry point), the ROS transports and providers, runtime discovery, the native topic sampler, and the plugin context of the node (a `CorePluginContext` whose `node()` is the gateway node).
+
+The core compiles and is tested without ROS and without DDS setup. `cmake/gateway_core.cmake` is plain CMake. The ament build includes it by path, and so does `scripts/check_cores_without_ros`, which links `gateway_core`:
+
+```cmake
+include(path/to/ros2_medkit_gateway/cmake/gateway_core.cmake)
+target_link_libraries(check_cores_without_ros PRIVATE gateway_core)
+```
+
+The file takes a target the including build already defines, else `find_package`, else the copy vendored in `src/vendored/` (cpp-httplib, jwt-cpp, tl::expected). An existing `httplib::httplib` target is reused when it is older than 0.20 (or has no version), because 0.20 removed the multipart API the handlers use. `gateway_core` requires C++17 from its consumers (`cxx_std_17` is a public compile feature) and works with CMake 3.16. `-DENABLE_SWAGGER_UI=ON` works in both builds and needs network access and `xxd` at configure time. The check implements `GatewayServices` with minimal stand-ins and starts `RESTServer`. A program that hosts the core names its server through `RestConfig::server_name`, `vendor_name` and `server_version` (`name` and `version` on `GET /`, `vendor_info` on `GET /version-info`, and the OpenAPI title and version). The defaults are the ROS 2 node's values. `scripts/check_cores_without_ros/` builds and runs it on Ubuntu 20.04 with gcc 9, the oldest compiler the cores are checked with.
+
+A program that hosts the core gets the cyclic-subscription samplers and the bulk-data store from the core, and passes the following:
+
+- **Samplers.** `register_builtin_samplers(services)` (`core/builtin_samplers.hpp`) registers `data`, `faults`, `configurations` and `logs` on `services.sampler_registry()`, plus `updates` when `services.update_manager()` is set. Each sampler reads through the same managers and helpers as its GET route. A `data` subscription on an entity a plugin owns reads through that plugin's `DataProvider` (or its `x-plc-data` route), and on any other entity through `services.data_access_manager()` and its `TopicDataProvider`. A collection with no manager behind it answers with the error text of its GET route, not a crash. The host passes `GatewayServices` (it must outlive the samplers) and registers a subscription transport itself, for example `SseTransportProvider`. `GET /` reports `cyclic_subscriptions` true only when a transport and at least one sampler are registered.
+- **Bulk data.** `BulkDataConfig` (`core/config.hpp`: `storage_dir`, `max_upload_size`, `categories`, with the defaults of the `bulk_data.*` parameters) and `make_bulk_data_store(config)` (`core/managers/bulk_data_store.hpp`) build the store. The host returns it from `GatewayServices::bulk_data_store()` before it starts `RESTServer`, which sizes the upload limit from it. The `rosbags` category is listed only when `FaultServiceTransport::serves_rosbags()` is true; otherwise a request for it answers 404 like any unknown category. The default is true; a host whose fault manager records no rosbags overrides it. `GET /` reports `bulk_data` true only when a store exists or rosbags are served.
+- **Freeze frames.** `make_freeze_frame_capture(config, events, plugins)` (`core/faults/freeze_frame_capture.hpp`) builds a `FreezeFrameCapture`. On a `fault_confirmed` event it reads the data of each reporting source through the same path as `GET /{entity}/data` (`plugin_data_readers()` in `core/data/data_item_reader.hpp`: the plugin's `DataProvider`, else its `x-plc-data` route) and keeps the frames, so the fault detail's `environment_data` carries a `freeze_frame` with the values from the confirmation. The host passes a `FreezeFrameCaptureConfig` (`enabled` = `entity_freeze_frame.enabled`, default true; `max_faults`, default 256, the oldest fault's frames are evicted past it), a `FaultEventSource` (the capture subscribes on construction and its subscription ends on destruction; a source serves several subscribers, so this can be the source the host returns from `GatewayServices::fault_events()`, which the fault SSE stream subscribes to), and the `PluginManager` that owns the entities. The factory returns null when the configuration is disabled or no plugin is loaded. The host returns the capture from `GatewayServices::freeze_frames()` and keeps it alive as long as the services. Optional: a `StandingFaultLister` that frames faults already confirmed at start, and an `EventsReadyWaiter` that holds the lister until the event feed delivers. An entity no plugin serves gets no frame. The ROS 2 node feeds the same class from the fault manager's events topic (`EntityFreezeFrameCapture`).
+- **Lock expiry.** `LockReaper(locks, subscriptions, interval_sec, logger)` (`core/managers/lock_reaper.hpp`) calls `LockManager::cleanup_expired()` every `interval_sec` (`LockConfig::cleanup_interval`, default 30, raised to 1 when lower) on a thread it owns. For each expired lock whose scope is empty or includes `cyclic-subscriptions` it removes the cyclic subscriptions of the locked entity. `subscriptions` may be null. The destructor and `stop()` join the thread. Without a reaper a host keeps expired locks until it calls `cleanup_expired()` itself. The ROS 2 node runs the same class.
+- **Scripts.** `make_script_host(config, plugin_backend)` (`core/managers/script_manager.hpp`) returns a `ScriptManager` and, when no plugin backend is given and `ScriptsConfig::scripts_dir` is not empty, the `DefaultScriptProvider` (fork/execvp) behind it. `ScriptsConfig` (`core/script_types.hpp`) has the defaults of the `scripts.*` parameters, and `entries` carries predefined scripts. The host returns `host.manager` from `GatewayServices::script_manager()` and keeps the `ScriptHost` alive as long as the services. With neither a backend nor a directory the script routes answer 501.
+- **Aggregation.** `AggregationHost(config, listen_port, mdns_name, logger)` (`core/aggregation/aggregation_host.hpp`) builds the `AggregationManager` from an `AggregationConfig` (the defaults of the `aggregation.*` parameters; the host range-checks values it reads from its own configuration) and, when `announce` or `discover` is set, the mDNS discovery that adds and removes peers and ignores this gateway's own announcements. The host passes `host.manager()` to `RESTServer::set_aggregation_manager()` and calls `host.merge_peers(areas, components, apps, functions)` on every entity refresh, before it fills the entity cache. The call merges the peers' entities into the four vectors and publishes the routing table, the leaf warnings and the per-entity peer contributors. It does nothing while there is no peer. Call `host.shutdown()` before `RESTServer::stop()`.
+- **Triggers.** `make_trigger_host(config, notifier, conditions, wiring)` (`core/trigger_host.hpp`) builds the `SqliteTriggerStore` and the `TriggerManager`, wires the entity hierarchy, entity existence and topic lookups to `wiring.cache`, and restores persistent triggers. `TriggerHostConfig` has the names and defaults of the `triggers.*` parameters (`enabled`, `max_triggers`, `on_restart_behavior`, `storage_path`), and `data_poll_interval_ms` (default 1000, clamped to 100-60000 ms), which the node does not read. `register_builtin_conditions()` fills the `ConditionRegistry`. The host passes the manager to `RESTServer::set_trigger_handlers()` and returns it from `GatewayServices::trigger_manager()`. A trigger past `max_triggers` answers 503. Where its events come from is chosen by the wiring: `fault_events` (a `FaultEventSource`; it serves several subscribers, so this can be the source the host returns from `GatewayServices::fault_events()`) starts a `TriggerFaultFeed` that subscribes to it and turns each fault event into a `faults` notification, and a fault trigger fires on it. The feed's subscription ends when the host is destroyed. A data trigger reads from `topic_transport` (a `TopicSubscriptionTransport`, the ROS 2 node's choice) when its topic is known, else from `polled_plugins`: a `PollingDataItemSource` that reads the item through `read_plugin_data_item`, as `GET /{entity}/data/{item}` does once per `data_poll_interval_ms`, starting at once. The item name is the trigger `resource` path percent-decoded as the GET path is. It delivers the `data` field of the body (the whole body when there is none), so a trigger `path` is relative to the value, as it is for a topic. A host without topics sets only `polled_plugins`; a host with neither gets data triggers that never fire. The trigger's condition runs on every sample, so `EnterRange` fires once at the crossing and `OnChange` at each difference. An item that cannot be read in a round delivers nothing in that round. Keep the host alive as long as the services. The ROS 2 node uses the same builder with its topic transport and feeds fault triggers through `TriggerFaultSubscriber`, a `Ros2FaultEventSource` under a `TriggerFaultFeed`.
+- **Plugin context.** `make_core_plugin_context(services, wiring)` (`core/plugins/core_plugin_context.hpp`) builds the context for plugins from `GatewayServices`: entities and the entity snapshot from `entity_cache()`, locks from `lock_manager()`, faults from `fault_manager()`, samplers from `sampler_registry()`. The host passes it to `PluginManager::set_context()` and keeps it alive as long as the plugins. `CorePluginContextWiring` carries what `GatewayServices` does not: getters for the change notifier and the condition registry (a null getter or a null result gives the plugin a null), a getter for the `AggregationManager` (the fault listings add the peers' faults), a callback for `notify_entities_changed()` (none: the call is ignored) and a sink for notices. The context is a `RosPluginContext`, so `as_ros_plugin_context()` is valid for every plugin, and its `node()` returns null: a plugin that needs ROS checks for it and declines to start. Plugins that use no ROS (a provider, a route, an introspection source) run unchanged. `PluginManager::load_plugins()` loads them from shared objects as on the node. The ROS 2 node derives its context from the same class and overrides only `node()`.
+- **Fault-trigger engine.** `make_fault_trigger_host(config, wiring)` (`core/fault_trigger_host.hpp`) builds the threshold-rule engine behind `/apps/{id}/fault-triggers` and the thread that evaluates its rules. `FaultTriggerHostConfig` has the names and defaults of the `fault_triggers.*` parameters (`enabled`, `poll_interval_ms`, raised to 50 ms and capped at `INT_MAX`, `storage_path`). The wiring has the entity cache, the `PluginManager` the rules read their values from (through the plugin's `x-plc-data` route), and the `FaultManager` a crossed rule reports to and clears through. The factory returns null when the configuration is disabled or no plugin is loaded. The host returns the engine from `GatewayServices::fault_trigger_engine()`; without it the routes answer 501. The engine consumes no fault events. The fault it reports confirms in the fault manager and reaches the fault SSE stream, the freeze-frame capture and fault triggers through the host's event source. Destroy the host before the plugins and the fault manager go. The ROS 2 node uses the same builder.
+- **Lifecycle.** `RESTServer` takes a `LifecycleStateReader` or null. A host without one passes null. `GET /{entity}/status` then reports `ready` for an online app and `notReady` for an offline one, also when the app exposes the lifecycle services, because graph presence is the only signal left. A component is ready unless every app it hosts is offline. `PUT /{entity}/status/{action}` answers 501 unless a plugin `LifecycleProvider` serves the entity.
 
 The `gateway_node` executable and existing test targets link `gateway_ros2`, so they transitively get both layers from a single dependency. The neutral contract is enforced by two CTest checks:
 
@@ -1543,6 +1759,63 @@ Runtime mode mapping:
 /body/lights/controller         -> Component: <hostname>, Function: body, App: controller
 /standalone_node                -> Component: <hostname>, App: standalone_node
 ```
+
+### Asset Identity (nameplate) and merge-by-identity
+
+Each Component can carry an **asset identity**: the stable nameplate of the physical
+or logical asset it represents (an ECU, PLC, drive, sensor), separate from its runtime
+ROS 2 footprint. The model lives in `core/discovery/models/asset_identity.hpp`.
+
+Typed fields (queryable, AAS-mappable) plus a generic `extra` key-value map for
+vendor-specific attributes we do not model up front:
+
+| Field | JSON key | AAS Nameplate (IDTA 02006) |
+|-------|----------|----------------------------|
+| `manufacturer` | `manufacturer` | ManufacturerName |
+| `model` (order code) | `model` | ManufacturerProductDesignation |
+| `serial_number` | `serialNumber` | SerialNumber |
+| `hardware_revision` | `hardwareRevision` | HardwareVersion |
+| `firmware_version` | `firmwareVersion` | FirmwareVersion |
+| `software_version` | `softwareVersion` | SoftwareVersion |
+| `network_endpoint` | `networkEndpoint` | Asset Interface Description (AID) endpoint |
+| `role` | `role` | functional role (BoM/usage context) |
+| `extra` | `extra` | additional Nameplate properties |
+
+The whole block maps to an Asset Administration Shell later without rework: the asset
+itself is the shell (`Component.id` as localId), this block is the **Nameplate** submodel,
+the Component hierarchy is the **BoM** submodel, and `network_endpoint` is an **AID** entry.
+
+Identity is emitted under `x-medkit.identity` only when populated, so identity-less
+components keep their existing JSON unchanged.
+
+**Why typed fields and a map?** Typed fields are the common, queryable, standard-mappable
+attributes; the `extra` map is the escape hatch for vendor keys (rack/slot, MAC, asset tag)
+that do not warrant a schema change. Both merge with the same rules.
+
+**Merge-by-identity with provenance.** A single asset is usually described by several
+sources (a hand-authored manifest, a live protocol device-info read, runtime discovery).
+`merge_identity()` (`core/discovery/identity_merge.hpp`) combines them field by field and
+records **per-field provenance** (which source set each field) under `_provenance`.
+
+- **Precedence** is config-driven (`IdentityMergeConfig::source_precedence`, highest first)
+  and is deliberately **decoupled from the structural `MergePolicy`**: a manifest can be the
+  authoritative *structure* source while a live protocol read is the authoritative *identity*
+  source. Authority is ranked on each contributing entity's canonical `Component.source` tag
+  ("manifest", "inventory", "plugin", "runtime", "node", "config", or a protocol-class tag a
+  provider sets such as "opcua"), **not** the free-form discovery-layer name. Default order:
+  protocol device-info (`opcua`, `s7`, `ethernet_ip`, `modbus`, `ads`, `profinet`, and the
+  generic `plugin`) > `manifest` > `inventory` (CSV import / manifest `assets:` list) >
+  `config` > runtime sources. A higher-authority source overrides a field; lower-authority
+  sources only fill gaps; unknown sources rank lowest. Empty values never overwrite.
+
+Components are correlated for merging by `Component.id`; identity is merged whenever two
+sources contribute the same Component id (in the discovery pipeline, and gap-filled across
+peer aggregation).
+
+The pipeline calls `merge_identity` inside the `IDENTITY` field group for Components, seeding
+provenance with the base (highest-priority) layer's source tag. Configure via
+`MergePipeline::set_identity_merge_config()`; precedence entries must equal the canonical
+`Component.source` values you expect at runtime.
 
 ## Demo Nodes
 

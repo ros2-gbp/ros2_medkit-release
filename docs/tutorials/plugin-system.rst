@@ -252,7 +252,7 @@ Plugin Lifecycle
 3. ``create_plugin()`` factory function creates the plugin instance
 4. Provider interfaces are queried via ``get_update_provider()`` / ``get_introspection_provider()`` / ``get_log_provider()`` / ``get_script_provider()`` / ``get_data_provider()`` / ``get_operation_provider()`` / ``get_fault_provider()``
 5. ``configure()`` is called with per-plugin JSON config
-6. ``set_context()`` provides ``PluginContext`` with ROS 2 node, entity cache, faults, and HTTP utilities
+6. ``set_context()`` provides ``PluginContext`` with entity cache, faults, locks, and HTTP utilities, and the ROS 2 node when the host has one
 7. ``get_routes()`` returns custom REST endpoint definitions as ``vector<PluginRoute>``
 8. Runtime: subsystem managers call provider methods as needed
 9. ``shutdown()`` is called before the plugin is destroyed
@@ -263,7 +263,7 @@ PluginContext
 After ``configure()``, the gateway calls ``set_context()`` with a ``PluginContext`` reference
 providing access to gateway data and utilities:
 
-- ``node()`` - ROS 2 node pointer for service clients, timers, and parameter access.
+- ``node()`` - ROS 2 node pointer for service clients, timers, and parameter access. Null when the host is a program that hosts the core without a ROS 2 node (see ``CorePluginContext`` in the gateway README). A plugin that needs ROS checks it and declines to start; a plugin that needs no ROS never calls it. ``as_ros_plugin_context()`` is valid on every host.
 
   .. warning::
 
@@ -339,10 +339,16 @@ call ``fn(entity_id, resource_path)`` on each tick. The function must return
 ``tl::expected<nlohmann::json, std::string>``. See `Cyclic Subscription Extensions`_
 for the lower-level registry API.
 
+A sampler registered through the plugin context streams its whole collection on every
+tick. A subscription whose resource URI names a single item of that collection is
+refused with 400 ``x-medkit-invalid-resource-uri`` rather than accepted and answered
+with everything, so the URI must end at the collection.
+
 .. note::
 
    The ``PluginContext`` interface is versioned alongside ``PLUGIN_API_VERSION``.
-   Breaking changes to existing methods or removal of methods increment the version.
+   Breaking changes to existing methods or removal of methods increment the version, and so
+   does a layout change of a type that crosses the plugin boundary (see `API Versioning`_).
    New non-breaking methods (like ``check_lock``, ``get_entity_snapshot``,
    ``list_all_faults``, and ``register_sampler``) provide default no-op implementations
    so plugins that do not use these methods need no code changes. However, a rebuild is
@@ -461,6 +467,73 @@ For entity-scoped endpoints, register a matching capability via ``register_capab
 or ``register_entity_capability()`` in ``set_context()`` so the endpoint appears in the
 entity's capabilities array in discovery responses.
 
+Documenting a Plugin Route
+--------------------------
+
+``get_routes()`` mounts a route; it does not describe one. A plugin route is
+mounted straight onto the HTTP server by ``PluginManager``, so the gateway's
+``RouteRegistry`` - the source of the OpenAPI document - knows nothing about it,
+and a client reading ``GET /api/v1/docs`` sees no trace of it.
+
+Export the optional C symbol ``describe_plugin_routes`` to fix that. The gateway
+resolves it with ``dlsym`` for each loaded plugin, skipping any that does not
+have it, and folds what it returns into the root document served at
+``GET /api/v1/docs``:
+
+.. code-block:: cpp
+
+   #include "ros2_medkit_gateway/core/openapi/route_descriptions.hpp"
+
+   extern "C" GATEWAY_PLUGIN_EXPORT openapi::RouteDescriptions describe_plugin_routes() {
+     openapi::RouteDescriptionBuilder builder;
+
+     openapi::OperationDesc op;
+     op.tag("Traces")
+         .operation_id("getAppTraces")
+         .requires_role("admin")
+         .description("What the endpoint does, and what a caller has to know about it.")
+         .path_param("app_id", "The app identifier")
+         .response(200, openapi::SchemaDesc::object()
+                            .property("entity", openapi::SchemaDesc::string())
+                            .required({"entity"}),
+                   "Traces for the app")
+         .error_response(404, "GenericError");
+
+     builder.add("/apps/{app_id}/x-medkit-traces")
+         .summary("Get app traces")
+         .get(std::move(op));
+
+     return builder.build();
+   }
+
+The path key is the OpenAPI template a client fills in, not the cpp-httplib
+regex ``get_routes()`` mounts - keep the two in step by hand, because nothing
+checks that they agree.
+
+What the gateway adds, so a plugin need not:
+
+- ``x-medkit-plugin-served: true`` on every folded operation. It is what tells
+  the test suite that the emitted-status recorder is structurally unable to
+  observe this route, rather than that a run failed to reach it.
+- ``416``, which cpp-httplib answers for an unparseable ``Range`` header before
+  routing, on every operation.
+- A global tag entry for whatever tag the operation declares.
+
+What the plugin owns, and what the document contract requires of it:
+
+- A **unique** ``operationId``. It shares one namespace with every gateway
+  operation, and a collision turns the contract test red.
+- A ``summary`` (on the path) and a ``description`` (on the operation).
+- The role in ``requires_role()`` must be the one ``AuthConfig``'s permission
+  table grants for that path. Note that ``*`` in that table matches a single
+  path segment, so a vendor collection under ``/functions/{id}/...`` is not
+  covered by the ``viewer`` entries for ``/functions/*``.
+- Every error status the handler can answer, as an ``error_response(...)``
+  reference to ``GenericError`` - the body ``PluginResponse::send_error`` writes.
+
+``route_descriptions.hpp`` is header-only and free of ``httplib``, so including
+it does not couple the plugin to the gateway's vendored copy.
+
 Cyclic Subscription Extensions
 -------------------------------
 
@@ -468,8 +541,8 @@ Plugins can extend cyclic subscriptions by registering custom resource samplers
 and transport providers during ``set_context()``.
 
 **Resource Samplers** provide the data for a collection when sampled by a subscription.
-Built-in samplers (``data``, ``faults``, ``configurations``, ``updates``) are registered
-by the gateway during startup. Custom samplers are registered via ``ResourceSamplerRegistry``
+Built-in samplers (``data``, ``faults``, ``configurations``, ``logs``, ``updates``) are
+registered by the gateway during startup. Custom samplers are registered via ``ResourceSamplerRegistry``
 on the ``GatewayNode``:
 
 .. code-block:: cpp
@@ -571,6 +644,29 @@ The returned ``IntrospectionResult`` wraps two fields:
 New entities in ``new_entities`` only appear in responses when
 ``allow_new_entities`` is true in the plugin configuration (or an equivalent
 policy is set).
+
+If the plugin publishes ROS 2 topics that back an entity's data points (the
+PLC-bridge pattern: values mirrored to ``/plc/...`` topics), declare them on
+the entity via ``App::topics`` / ``Component::topics``. This works for
+entities the plugin itself adds in ``new_entities``. It does NOT work as an
+enrichment of an app that runtime discovery already found: for live-data
+fields the runtime layer is authoritative and the plugin layer is enrichment,
+so a ``topics`` list declared on a shadow of a runtime-discovered app is
+dropped by the merge. If you need extra topics on a runtime-discovered app,
+bind them through a manifest instead:
+
+.. code-block:: cpp
+
+   App app;
+   app.id = "my_device";
+   app.topics.publishes.push_back("/plc/main/counter");
+
+Runtime graph discovery attributes a topic to the ROS node that publishes it -
+for plugin-published topics that is the gateway's own node, not the plugin
+entity. Without the declaration, entity-scoped topic lookups on the plugin
+entity return nothing, and in particular data triggers
+(``POST /apps/<id>/triggers`` with a ``data/...`` resource) can never resolve
+and never fire. Declare only topics that actually get a publisher.
 
 ScriptProvider Example
 ----------------------
@@ -819,6 +915,9 @@ each SOVD ``Function`` entity. It lives in a separate colcon package,
   (``healthy``, ``degraded``, or ``broken``).
 - Supports cyclic subscriptions on the ``x-medkit-graph`` collection so clients can
   stream live graph updates.
+- Exports ``describe_plugin_routes``, so its endpoint and the shape of the graph
+  document appear in ``GET /api/v1/docs`` like any gateway route. It is the worked
+  example for `Documenting a Plugin Route`_.
 
 **Package layout**
 
@@ -883,6 +982,18 @@ Per-function overrides are also supported:
        plugins.graph_provider.function_overrides.my_pipeline.degraded_frequency_ratio: 0.3
        plugins.graph_provider.function_overrides.my_pipeline.drop_rate_percent_threshold: 2.0
 
+.. note::
+
+   The keys above are not the full set. There are also two freshness-window keys
+   (``freshness_floor_sec``, ``freshness_headroom_factor``), a stale-grace
+   debounce key (``stale_grace_sec``), and a ``multi_publisher_rate`` policy key
+   that control when and how an edge with no recent ``/diagnostics`` sample
+   flips from ``active`` to ``error``/``metrics_stale``, and how a topic with
+   more than one live publisher is reported. See :doc:`/config/graph-provider`
+   for the complete reference, and :doc:`graph-provider` for the ``/diagnostics``
+   producer contract this plugin depends on - without a matching producer,
+   every edge stays ``pending`` forever.
+
 **Disabling the plugin**
 
 To disable graph functionality without uninstalling the package, remove ``"graph_provider"``
@@ -909,8 +1020,11 @@ Plugins export ``plugin_api_version()`` which must return the gateway's ``PLUGIN
 If the version does not match, the plugin is rejected with a clear error message suggesting
 a rebuild against matching gateway headers.
 
-The current API version is **5**. It is incremented when the ``PluginContext`` vtable changes
-or breaking changes are made to ``GatewayPlugin`` or provider interfaces.
+The current API version is **7**. It is incremented when the ``PluginContext`` vtable changes
+or breaking changes are made to ``GatewayPlugin`` or provider interfaces. A change to the layout
+of a type that crosses the plugin boundary, such as the entity models in ``IntrospectionInput`` /
+``NewEntities``, bumps the version too. A plugin built against the old layout would read those
+types wrongly, so it must be rebuilt even when its source compiles unchanged.
 
 Build Requirements
 ------------------

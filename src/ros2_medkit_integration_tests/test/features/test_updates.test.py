@@ -21,18 +21,30 @@ import unittest
 
 from launch import LaunchDescription
 from launch.actions import TimerAction
-import launch_ros.actions
 import launch_testing
 import launch_testing.actions
 import requests
 
 from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, API_BASE_PATH, get_test_port
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
-from ros2_medkit_test_utils.launch_helpers import get_coverage_env
+from ros2_medkit_test_utils.launch_helpers import create_gateway_node
 
 
 PORT_NO_PLUGIN = get_test_port(0)
 PORT_WITH_PLUGIN = get_test_port(1)
+
+HTTP_METHODS = {'get', 'post', 'put', 'delete', 'patch', 'head', 'options'}
+
+# x-medkit.phase values while an operation runs on a package, or a DELETE is in
+# flight. prepare, execute and automated start in status pending with phase
+# preparing or executing, and leave both phases when they finish.
+RUNNING_PHASES = {'preparing', 'executing', 'deleting'}
+
+
+def _operation_running(status):
+    """Whether a GET /updates/{id}/status body shows an operation still running."""
+    return (status.get('status') == 'inProgress'
+            or status.get('x-medkit', {}).get('phase') in RUNNING_PHASES)
 
 
 def _get_test_plugin_path():
@@ -46,42 +58,27 @@ def _get_test_plugin_path():
 
 
 def generate_test_description():
-    """Launch two gateways: one without plugin (501 mode), one with demo plugin.
-
-    Uses raw Node construction instead of create_gateway_node() because we need
-    two gateway instances with distinct ROS node names.
-    """
-    coverage_env = get_coverage_env()
+    """Launch two gateways: one without plugin (501 mode), one with demo plugin."""
     plugin_path = _get_test_plugin_path()
 
-    gateway_no_plugin = launch_ros.actions.Node(
-        package='ros2_medkit_gateway',
-        executable='gateway_node',
+    gateway_no_plugin = create_gateway_node(
         name='gateway_no_plugin',
-        output='screen',
-        parameters=[{
+        port=PORT_NO_PLUGIN,
+        extra_params={
             'server.host': '127.0.0.1',
-            'server.port': PORT_NO_PLUGIN,
-            'refresh_interval_ms': 1000,
             'updates.enabled': True,
-        }],
-        additional_env=coverage_env,
+        },
     )
 
-    gateway_with_plugin = launch_ros.actions.Node(
-        package='ros2_medkit_gateway',
-        executable='gateway_node',
+    gateway_with_plugin = create_gateway_node(
         name='gateway_with_plugin',
-        output='screen',
-        parameters=[{
+        port=PORT_WITH_PLUGIN,
+        extra_params={
             'server.host': '127.0.0.1',
-            'server.port': PORT_WITH_PLUGIN,
-            'refresh_interval_ms': 1000,
             'updates.enabled': True,
             'plugins': ['test_update_backend'],
             'plugins.test_update_backend.path': plugin_path,
-        }],
-        additional_env=coverage_env,
+        },
     )
 
     return LaunchDescription([
@@ -114,7 +111,7 @@ class _UpdatesTestMixin:
         return r
 
     def _cleanup_package(self, pkg_id):
-        """Best-effort cleanup: wait for idle, then delete."""
+        """Best-effort cleanup: wait while an operation runs, then delete."""
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             r = requests.get(
@@ -122,10 +119,7 @@ class _UpdatesTestMixin:
             )
             if r.status_code == 404:
                 break
-            if r.status_code == 200 and r.json().get('status') in (
-                'completed',
-                'failed',
-            ):
+            if r.status_code == 200 and not _operation_running(r.json()):
                 break
             time.sleep(0.2)
         requests.delete(f'{self.BASE_URL}/updates/{pkg_id}', timeout=5)
@@ -217,6 +211,41 @@ class TestUpdatesNoPlugin(GatewayTestCase):
         r = requests.delete(f'{self.BASE_URL}/updates/some-pkg', timeout=5)
         self.assertEqual(r.status_code, 501)
         self.assertEqual(r.json()['error_code'], 'not-implemented')
+
+    # @verifies REQ_INTEROP_083
+    def test_09_malformed_json_returns_400_not_501(self):
+        """A malformed body outranks the feature gate.
+
+        The gate runs inside the typed wrapper, after body parsing, so a broken
+        payload is still reported as the client's own error. Moving the guard
+        ahead of the parse would answer 501 here and hide the real problem.
+        """
+        r = requests.post(
+            f'{self.BASE_URL}/updates',
+            data='not{valid json',
+            headers={'Content-Type': 'application/json'},
+            timeout=5,
+        )
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(r.json()['error_code'], 'invalid-request')
+
+    # @verifies REQ_INTEROP_002
+    def test_disabled_feature_returns_501_and_declares_it(self):
+        """Every /updates operation documents the 501 the gate returns.
+
+        The eight tests above prove the gateway answers 501 with the feature
+        off. This one proves the generated document says so, which is what a
+        generated client needs to handle the response instead of treating it
+        as an undeclared surprise.
+        """
+        spec = self.get_json('/docs')
+        for path, item in spec['paths'].items():
+            if not path.startswith('/updates'):
+                continue
+            for method, op in item.items():
+                if method not in HTTP_METHODS:
+                    continue
+                self.assertIn('501', op['responses'], f'{method.upper()} {path}')
 
 
 class TestUpdatesCRUD(_UpdatesTestMixin, GatewayTestCase):
