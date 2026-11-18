@@ -115,6 +115,79 @@ TEST_F(FaultHandlersTest, BuildSovdFaultResponseWithFreezeFrame) {
   EXPECT_DOUBLE_EQ(snap["data"].get<double>(), 85.5);  // Primary value extracted
   EXPECT_EQ(snap["x-medkit"]["topic"], "/motor/temperature");
   EXPECT_EQ(snap["x-medkit"]["message_type"], "sensor_msgs/msg/Temperature");
+  EXPECT_FALSE(snap["x-medkit"].contains("capture_origin"));  // confirm-edge capture
+}
+
+// @verifies REQ_INTEROP_088
+TEST_F(FaultHandlersTest, BuildSovdFaultResponsePropagatesCaptureOrigin) {
+  // Startup catch-up frames (entity freeze-frames taken for faults that were
+  // already confirmed at gateway start) carry capture_origin through to the
+  // wire x-medkit block, so consumers can tell them from confirm-time frames.
+  ros2_medkit_msgs::msg::Fault fault;
+  fault.fault_code = "STANDING_FAULT";
+
+  json env_data = {{"snapshots", json::array({{{"type", "freeze_frame"},
+                                               {"snapshot_type", "freeze_frame"},
+                                               {"name", "plc_app"},
+                                               {"data", R"({"level": 7.0})"},
+                                               {"topic", ""},
+                                               {"message_type", ""},
+                                               {"captured_at_ns", 1234},
+                                               {"capture_origin", "startup"}}})}};
+
+  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_data, "/apps/plc_app"));
+
+  auto & snap = response["environment_data"]["snapshots"][0];
+  EXPECT_EQ(snap["type"], "freeze_frame");
+  EXPECT_EQ(snap["x-medkit"]["capture_origin"], "startup");
+}
+
+TEST_F(FaultHandlersTest, BuildSovdFaultResponseServesEntityFrameSource) {
+  // A plugin-captured entity frame reaches the wire with an empty topic and
+  // message_type (the values are not a ROS message) plus x-medkit.source
+  // naming the capture path that read them.
+  ros2_medkit_msgs::msg::Fault fault;
+  fault.fault_code = "PLC_ALARM";
+
+  json env_data = {{"snapshots", json::array({{{"type", "freeze_frame"},
+                                               {"snapshot_type", "freeze_frame"},
+                                               {"name", "plc_app"},
+                                               {"data", R"({"tank_level": 87.5})"},
+                                               {"topic", ""},
+                                               {"message_type", ""},
+                                               {"captured_at_ns", 1234},
+                                               {"source", "plugin_x_plc_data_route"}}})}};
+
+  auto response = to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_data, "/apps/plc_app"));
+
+  auto & snap = response["environment_data"]["snapshots"][0];
+  EXPECT_EQ(snap["x-medkit"]["source"], "plugin_x_plc_data_route");
+  EXPECT_EQ(snap["x-medkit"]["topic"], "");
+  EXPECT_EQ(snap["x-medkit"]["message_type"], "");
+}
+
+TEST_F(FaultHandlersTest, BuildSovdFaultResponseOmitsSourceWhenTheSnapshotHasNone) {
+  // Absence control for the test above, on the same harness: a topic-captured
+  // freeze frame (the fault_manager's own) carries no source, and none is
+  // invented for it.
+  ros2_medkit_msgs::msg::Fault fault;
+  fault.fault_code = "TEMP_FAULT";
+
+  ros2_medkit_msgs::msg::EnvironmentData env_data;
+  ros2_medkit_msgs::msg::Snapshot freeze_frame;
+  freeze_frame.type = "freeze_frame";
+  freeze_frame.name = "temperature";
+  freeze_frame.data = R"({"temperature": 85.5})";
+  freeze_frame.topic = "/motor/temperature";
+  freeze_frame.message_type = "sensor_msgs/msg/Temperature";
+  env_data.snapshots.push_back(freeze_frame);
+
+  auto response =
+      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/motor"));
+
+  auto & snap = response["environment_data"]["snapshots"][0];
+  EXPECT_FALSE(snap["x-medkit"].contains("source"));
+  EXPECT_EQ(snap["x-medkit"]["topic"], "/motor/temperature");
 }
 
 // Conversion layer must emit an explicit "snapshot_type" discriminator so
@@ -503,6 +576,77 @@ TEST(FaultInSourceScopeTest, RootFqnEdgeCase) {
   EXPECT_FALSE(FaultHandlers::fault_in_source_scope(make_fault({"/something"}), {"/other"}));
 }
 
+// -----------------------------------------------------------------------------
+// External protocol-plugin entity ownership: bare-id scope sets.
+//
+// An external entity (e.g. a PLC over OPC UA) has no ROS FQN, so fault-scope
+// resolution grants it a scope set of exactly {its bare id}. These pins prove
+// the guard treats a bare id like any other scope token: it owns faults
+// reported under that id, and still blocks cross-entity disclosure (GET) and
+// cross-entity clear (DELETE), which both flow through this predicate.
+// -----------------------------------------------------------------------------
+
+TEST(FaultInSourceScopeTest, BareEntityIdScopeMatchesOwnFault) {
+  // The entity owns the fault it reported under its own id.
+  EXPECT_TRUE(FaultHandlers::fault_in_source_scope(make_fault({"process"}), {"process"}));
+}
+
+TEST(FaultInSourceScopeTest, BareEntityIdScopeMatchesOwnSubPath) {
+  // A sub-node under the entity id (path boundary) is still the same owner.
+  EXPECT_TRUE(FaultHandlers::fault_in_source_scope(make_fault({"process/sub"}), {"process"}));
+}
+
+TEST(FaultInSourceScopeTest, BareEntityIdScopeRejectsOtherEntityFault) {
+  // Cross-entity GET stays blocked: entity "process" must not see a fault that
+  // another external entity ("s7_status") reported under its own id.
+  EXPECT_FALSE(FaultHandlers::fault_in_source_scope(make_fault({"s7_status"}), {"process"}));
+}
+
+TEST(FaultInSourceScopeTest, BareEntityIdScopeRejectsMixedSourceFault) {
+  // Cross-entity clear/disclosure stays blocked under the all-sources rule: a
+  // fault co-reported by "process" and another entity is out of scope for
+  // "process" alone.
+  EXPECT_FALSE(FaultHandlers::fault_in_source_scope(make_fault({"process", "s7_status"}), {"process"}));
+}
+
+TEST(FaultInSourceScopeTest, BareEntityIdScopeRejectsPrefixCollision) {
+  // "process_2" shares the "process" prefix but is a distinct entity id; the
+  // path-boundary check must reject it (no bare-substring escalation).
+  EXPECT_FALSE(FaultHandlers::fault_in_source_scope(make_fault({"process_2"}), {"process"}));
+}
+
+// The per-entity detail for an external plugin entity must carry the
+// freeze-frame the fault_manager holds, mirroring the non-plugin detail path.
+// This pins the shape build_sovd_fault_response produces for the PLC case:
+// reporting_sources=[bare id] + a freeze-frame snapshot under a plugin entity
+// path.
+TEST_F(FaultHandlersTest, BuildSovdFaultResponseExternalEntityFreezeFrame) {
+  ros2_medkit_msgs::msg::Fault fault;
+  fault.fault_code = "PLC_LEVEL_HIGH";
+  fault.severity = ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR;
+  fault.status = "CONFIRMED";
+  fault.reporting_sources = {"process"};  // bare external entity id
+
+  ros2_medkit_msgs::msg::EnvironmentData env_data;
+  ros2_medkit_msgs::msg::Snapshot freeze_frame;
+  freeze_frame.type = "freeze_frame";
+  freeze_frame.name = "/plc/process/level";
+  freeze_frame.data = R"({"data": 150.0})";
+  freeze_frame.topic = "/plc/process/level";
+  freeze_frame.message_type = "std_msgs/msg/Float64";
+  freeze_frame.captured_at_ns = 1707044400000000000;
+  env_data.snapshots.push_back(freeze_frame);
+
+  auto response =
+      to_json(FaultHandlers::build_sovd_fault_response(fault_json(fault), env_json(env_data), "/apps/process"));
+
+  auto & snap = response["environment_data"]["snapshots"][0];
+  EXPECT_EQ(snap["type"], "freeze_frame");
+  EXPECT_EQ(snap["name"], "/plc/process/level");
+  EXPECT_DOUBLE_EQ(snap["data"].get<double>(), 150.0);
+  EXPECT_EQ(response["x-medkit"]["reporting_sources"][0], "process");
+}
+
 // =============================================================================
 // FaultListItem schema <-> fault_to_json producer contract.
 //
@@ -521,6 +665,7 @@ TEST(FaultListItemSchema, FaultToJsonConformsAndRoundTrips) {
   fault.occurrence_count = 3;
   fault.status = "active";
   fault.reporting_sources = {"brake_ecu", "abs_node"};
+  fault.last_passed.sec = 1200;  // absent-when-zero covered separately below
 
   const json wire = conversions::fault_to_json(fault);
 
@@ -529,6 +674,20 @@ TEST(FaultListItemSchema, FaultToJsonConformsAndRoundTrips) {
   ASSERT_TRUE(parsed.has_value()) << "fault_to_json output does not conform to FaultListItem";
   // ... and round-trip back to identical wire (no field added or dropped).
   EXPECT_EQ(dto::JsonWriter<dto::FaultListItem>::write(parsed.value()), wire);
+}
+
+TEST(FaultListItemSchema, LastPassedOmittedWhenNeverPassed) {
+  // last_passed carries the last PASSED instant; zero means the fault never
+  // reported PASSED, and the wire says that by omitting the key entirely.
+  ros2_medkit_msgs::msg::Fault fault;
+  fault.fault_code = "NEVER_PASSED";
+  fault.status = "active";
+
+  EXPECT_FALSE(conversions::fault_to_json(fault).contains("last_passed"));
+
+  fault.last_passed.sec = 1200;
+  fault.last_passed.nanosec = 500000000;
+  EXPECT_DOUBLE_EQ(conversions::fault_to_json(fault)["last_passed"].get<double>(), 1200.5);
 }
 
 TEST(FaultListItemSchema, UnknownSeverityLabelIsAcceptedByEnum) {
@@ -545,4 +704,63 @@ TEST(FaultListItemSchema, UnknownSeverityLabelIsAcceptedByEnum) {
   const auto parsed = dto::JsonReader<dto::FaultListItem>::read(wire);
   ASSERT_TRUE(parsed.has_value()) << "UNKNOWN severity_label rejected by FaultListItem enum";
   EXPECT_EQ(dto::JsonWriter<dto::FaultListItem>::write(parsed.value()), wire);
+}
+
+// =============================================================================
+// classify_fault_failure - 404-vs-503 on a failed fault-manager call
+// =============================================================================
+//
+// The split has to rest on which layer failed, not on how the failure reads.
+// It rested on a substring match for "not found" over the store's message, so
+// a refusal the fault manager worded any other way - its own `fault_code`
+// validation among them - was served as 503, telling the client the gateway
+// had a problem when the request did.
+
+// A fault the store does not hold. The wording here is the fault manager's
+// own, and the classification must not depend on it.
+// @verifies REQ_INTEROP_013
+// @verifies REQ_INTEROP_015
+TEST(ClassifyFaultFailureTest, DeclinedIsAClientError) {
+  const auto err =
+      FaultHandlers::classify_fault_failure(ros2_medkit_gateway::FaultFailure::Declined, "Fault not found: NO_SUCH",
+                                            "Failed to get fault", "app_id", "lidar_sensor", "NO_SUCH");
+  EXPECT_EQ(err.http_status, 404);
+  EXPECT_EQ(err.code, ros2_medkit_gateway::ERR_RESOURCE_NOT_FOUND);
+  EXPECT_EQ(err.params["details"], "Fault not found: NO_SUCH");
+  EXPECT_EQ(err.params["app_id"], "lidar_sensor");
+  EXPECT_EQ(err.params["fault_code"], "NO_SUCH");
+}
+
+// The regression case: a refusal that never contains "not found". Before the
+// classification was typed, this fell through the substring match to 503.
+// @verifies REQ_INTEROP_013
+// @verifies REQ_INTEROP_015
+TEST(ClassifyFaultFailureTest, ARefusalWordedAnyOtherWayIsStillAClientError) {
+  for (const char * message : {"fault_code exceeds maximum length of 256",
+                               "fault_code contains invalid character '~'. Only alphanumeric, underscore, hyphen, "
+                               "and dot are allowed",
+                               "fault_code cannot contain '..'", "some wording nobody has written yet"}) {
+    const auto err = FaultHandlers::classify_fault_failure(ros2_medkit_gateway::FaultFailure::Declined, message,
+                                                           "Failed to get fault", "app_id", "lidar_sensor", "F~F");
+    EXPECT_EQ(err.http_status, 404) << "declined refusal reported as " << err.http_status
+                                    << " for message: " << message;
+    EXPECT_LT(err.http_status, 500) << "a refusal must never be a server error: " << message;
+  }
+}
+
+// The other direction must keep working: a fault manager that never answered
+// is a real server-side failure and has to stay 503, or an outage would be
+// indistinguishable from a missing fault.
+// @verifies REQ_INTEROP_013
+// @verifies REQ_INTEROP_015
+TEST(ClassifyFaultFailureTest, UnavailableIsAServerError) {
+  for (const char * message :
+       {"GetFault service not available", "GetFault service call timed out", "GetFault transport not initialised"}) {
+    const auto err = FaultHandlers::classify_fault_failure(ros2_medkit_gateway::FaultFailure::Unavailable, message,
+                                                           "Failed to clear fault", "component_id", "host", "CODE");
+    EXPECT_EQ(err.http_status, 503) << "message: " << message;
+    EXPECT_EQ(err.code, ros2_medkit_gateway::ERR_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(err.message, "Failed to clear fault");
+    EXPECT_EQ(err.params["details"], message);
+  }
 }

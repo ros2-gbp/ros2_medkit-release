@@ -59,6 +59,11 @@ namespace dto {
 //   timestamp        - sample timestamp in nanoseconds since epoch (int64)
 //   publisher_count  - number of publishers on the topic at sample time (int64)
 //   subscriber_count - number of subscribers on the topic at sample time (int64)
+//
+// Additional keys on an aggregating entity's list items:
+//   member_ids - the members of the grouping that provide the topic
+//   available  - present only as false, marking an item whose provider is not
+//                answering; absent means it can be served
 // =============================================================================
 struct XMedkitDataItem {
   std::optional<XMedkitRos2> ros2;
@@ -69,6 +74,19 @@ struct XMedkitDataItem {
   std::optional<std::int64_t> timestamp;         // sample timestamp in ns (read responses)
   std::optional<std::int64_t> publisher_count;   // publisher count at sample time (read responses)
   std::optional<std::int64_t> subscriber_count;  // subscriber count at sample time (read responses)
+  /// Members of the grouping that contribute this item.
+  ///
+  /// Absent on a leaf entity, where the entity is the only contributor.
+  /// A list rather than one id because an item can genuinely have several:
+  /// a topic published by one member and subscribed by another is merged
+  /// into a single item, and two members can expose the same operation
+  /// short name. More than one entry is what makes the bare item id
+  /// ambiguous for addressing.
+  std::optional<std::vector<std::string>> member_ids;
+  /// Absent while the item can be served. False marks an item listed from a
+  /// retained declaration because the member that owns it is not answering -
+  /// the item is still part of the tree, and still addressable.
+  std::optional<bool> available;
 };
 
 template <>
@@ -78,7 +96,8 @@ inline constexpr auto dto_fields<XMedkitDataItem> =
                     field("publisher_created", &XMedkitDataItem::publisher_created),
                     field("timestamp", &XMedkitDataItem::timestamp),
                     field("publisher_count", &XMedkitDataItem::publisher_count),
-                    field("subscriber_count", &XMedkitDataItem::subscriber_count));
+                    field("subscriber_count", &XMedkitDataItem::subscriber_count),
+                    field("member_ids", &XMedkitDataItem::member_ids), field("available", &XMedkitDataItem::available));
 
 template <>
 inline constexpr std::string_view dto_name<XMedkitDataItem> = "XMedkitDataItem";
@@ -119,6 +138,7 @@ inline constexpr std::string_view dto_name<DataItem> = "DataItem";
 //   total_count        - total number of items in the response
 //   partial            - true when a fan-out peer request failed
 //   failed_peers       - list of peer addresses that returned errors
+//   peer_failures      - why each of those peers failed (timeout, unreachable, ...)
 //   peer_dropped_items - per-peer items dropped due to malformed JSON
 //                        (observability for invisible drift)
 // =============================================================================
@@ -130,6 +150,10 @@ struct DataListXMedkit {
   std::optional<std::size_t> total_count;
   std::optional<bool> partial;
   std::optional<std::vector<std::string>> failed_peers;
+  /// Why each peer in `failed_peers` contributed nothing. Sibling rather than a
+  /// widening of `failed_peers`, whose wire shape (a list of names) every
+  /// existing client already reads.
+  std::optional<std::vector<PeerFailure>> peer_failures;
   std::optional<std::vector<DroppedItem>> peer_dropped_items;
 };
 
@@ -140,6 +164,7 @@ inline constexpr auto dto_fields<DataListXMedkit> =
                     field("aggregation_level", &DataListXMedkit::aggregation_level),
                     field("total_count", &DataListXMedkit::total_count), field("partial", &DataListXMedkit::partial),
                     field("failed_peers", &DataListXMedkit::failed_peers),
+                    field("peer_failures", &DataListXMedkit::peer_failures),
                     field("peer_dropped_items", &DataListXMedkit::peer_dropped_items));
 
 template <>
@@ -166,22 +191,15 @@ template <>
 inline constexpr std::string_view dto_name<DataWriteRequest> = "DataWriteRequest";
 
 // =============================================================================
-// Collection<DataItem> - named "DataList"
-// =============================================================================
-template <>
-inline constexpr std::string_view dto_name<Collection<DataItem>> = "DataList";
-
-// =============================================================================
-// Collection<DataItem, DataListXMedkit> - typed list shape returned by
-// list_data (PR-403 commit 28).
+// Collection<DataItem, DataListXMedkit> - named "DataList", the list shape
+// list_data returns for a ROS 2-backed entity.
 //
-// Same wire shape as the legacy `Collection<DataItem>` named "DataList", but
-// the `x-medkit` payload carries the rich `DataListXMedkit` fields (entity_id,
-// aggregated, aggregation_sources, aggregation_level, total_count, partial,
-// failed_peers, peer_dropped_items) instead of the generic
-// `XMedkitCollection`. The schema name is kept identical to the legacy
-// `DataList` $ref so existing OpenAPI clients are not affected; the
-// difference is purely server-side typing.
+// The `x-medkit` payload is `DataListXMedkit` (entity_id, aggregated,
+// aggregation_sources, aggregation_level, total_count, partial, failed_peers,
+// peer_dropped_items), which is what the handler writes. The single-argument
+// `Collection<DataItem>` used to carry this name too, defaulting `x-medkit` to
+// the generic `XMedkitCollection` no data route has ever emitted; naming only
+// the emitted shape keeps the document from advertising the other one.
 // =============================================================================
 template <>
 inline constexpr std::string_view dto_name<Collection<DataItem, DataListXMedkit>> = "DataList";
@@ -255,7 +273,22 @@ struct JsonReader<DataListResult> {
 template <>
 struct SchemaWriter<DataListResult> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"description",
+         "Data-resource list whose shape depends on who owns the entity. An entity backed by the ROS 2 "
+         "graph answers with `DataList`. A plugin-owned entity answers with whatever its DataProvider "
+         "returns and the gateway emits that verbatim. Which branch applies is discoverable ahead of the "
+         "call: `x-medkit.source` on the entity's own document (`GET /{entity_type}/{entity_id}`) reads "
+         "`plugin` for a plugin-owned entity."},
+        {"anyOf", nlohmann::json::array(
+                      {nlohmann::json{{"$ref", "#/components/schemas/DataList"}},
+                       nlohmann::json{{"title", "PluginDataList"},
+                                      {"type", "object"},
+                                      {"additionalProperties", true},
+                                      {"x-medkit-opaque", true},
+                                      {"description",
+                                       "Plugin-defined list. The in-tree OPC-UA plugin adds value / unit / "
+                                       "data_type / writable per item. Read the plugin's own documentation."}}})}};
   }
 };
 
@@ -317,7 +350,16 @@ struct JsonReader<DataValue> {
 template <>
 struct SchemaWriter<DataValue> {
   static nlohmann::json schema() {
-    return nlohmann::json{{"type", "object"}, {"additionalProperties", true}, {"x-medkit-opaque", true}};
+    return nlohmann::json{
+        {"type", "object"},
+        {"additionalProperties", true},
+        {"x-medkit-opaque", true},
+        {"description",
+         "One data resource's value. No fixed shape exists: on the ROS 2 path the body carries the live "
+         "message, whose fields come from the topic's IDL type, and on a plugin-owned entity it carries "
+         "whatever the DataProvider returns (an OPC-UA node adds unit / data_type / writable, a UDS DID "
+         "its own record layout). Discover the concrete shape from the item's entry in `GET "
+         "/{entity_type}/{entity_id}/data`, whose `x-medkit` names the ROS 2 message type."}};
   }
 };
 

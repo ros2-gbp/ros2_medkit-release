@@ -105,7 +105,11 @@ TEST_F(AreaModelTest, ToCapabilities_ContainsSubResources) {
   EXPECT_TRUE(j.contains("x-medkit"));
   EXPECT_EQ(j["x-medkit"]["entityType"], "Area");
   EXPECT_TRUE(j.contains("subareas"));
-  EXPECT_TRUE(j.contains("related-components"));
+  // `/areas/{area_id}/components` is the registered route. The former
+  // "related-components" key named a segment no entity type serves, so a green
+  // assertion on it read as evidence that the segment was real.
+  EXPECT_TRUE(j.contains("components"));
+  EXPECT_FALSE(j.contains("related-components"));
 }
 
 // =============================================================================
@@ -172,6 +176,33 @@ TEST_F(ComponentModelTest, ToCapabilities_ContainsConfigurationsForNodes) {
   // Node-based components should have configurations capability
   EXPECT_TRUE(j.contains("configurations"));
   EXPECT_EQ(j["configurations"], "http://localhost:8080/api/v1/components/motor_controller/configurations");
+
+  // `/hosts` is registered for components; "related-apps" named no route.
+  EXPECT_TRUE(j.contains("hosts"));
+  EXPECT_FALSE(j.contains("related-apps"));
+}
+
+TEST_F(ComponentModelTest, ToJson_OmitsExternalWhenUnsetOrFalse) {
+  // Default: external unset -> field absent (stable wire shape).
+  json j = comp_.to_json();
+  EXPECT_FALSE(j["x-medkit"].contains("external"));
+
+  comp_.external = false;  // explicit ROS component -> still absent
+  json j2 = comp_.to_json();
+  EXPECT_FALSE(j2["x-medkit"].contains("external"));
+}
+
+TEST_F(ComponentModelTest, ToJson_ExternalWhenTrue) {
+  comp_.external = true;
+  json j = comp_.to_json();
+  EXPECT_EQ(j["x-medkit"]["external"], true);
+}
+
+TEST_F(ComponentModelTest, Equality_DistinguishesExternal) {
+  Component other = comp_;
+  ASSERT_EQ(comp_, other);
+  other.external = true;
+  EXPECT_NE(comp_, other);
 }
 
 // =============================================================================
