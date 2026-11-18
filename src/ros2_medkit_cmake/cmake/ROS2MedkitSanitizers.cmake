@@ -63,7 +63,39 @@ list(JOIN _FSANITIZE_FLAGS "," _FSANITIZE_VALUE)
 
 # -O1: sanitizers produce fewer false positives and run faster than -O0.
 # This intentionally overrides Debug's -O0 for sanitizer builds.
-add_compile_options(-fsanitize=${_FSANITIZE_VALUE} -fno-omit-frame-pointer -O1)
+#
+# -g1: line tables only, no variable/type DWARF. Until this was set the module
+# overrode the build type's -O but never its -g, so RelWithDebInfo's full -g
+# stayed in force and the instrumented ASan tree reached ~27 GB, the large
+# majority of it debug info. That is not just disk: every one of those bytes is
+# written by the compiler, read by the linker, and stored in ccache, and at the
+# CI cache ceiling it meant ccache evicted the objects it was still producing.
+#
+# Nothing needed to diagnose a sanitizer finding is lost. Symbolication of the
+# stack frames in an ASan/UBSan report needs the line table, which -g1 keeps, so
+# reports still name file:line. The variable named in a stack-buffer-overflow
+# report ("in frame ... at offset N ... 'buf'") comes from the frame descriptor
+# ASan embeds at instrumentation time, not from DWARF, so it survives too. What
+# -g1 does drop is the ability to inspect locals in a debugger on a core file.
+#
+# -UNDEBUG: keep assert() live whatever build type the caller picked. Release
+# and RelWithDebInfo both carry -DNDEBUG, which compiles every assert away, and
+# the CI sanitizer jobs build RelWithDebInfo. A sanitizer build exists to abort
+# on a broken invariant, so the one build where asserts must fire was the one
+# silently compiling them out. Debug is not a substitute here: it would bring
+# -O0 with it, and -O1 above is deliberate.
+#
+# This is directory-scoped like the rest, so it also enables the assertions in
+# headers compiled into a participating package - nlohmann/json routes
+# JSON_ASSERT to assert, and the vendored cpp-httplib and dynmsg carry their
+# own. That is far more than the three assertions the repository writes itself,
+# and it is the intent: a sanitizer build should be running those checks.
+#
+# All three flags come from add_compile_options, which CMake places after
+# CMAKE_CXX_FLAGS_<CONFIG> on the command line, so these win over the build
+# type's -O2 -g -DNDEBUG. Do not move them into CMAKE_CXX_FLAGS, where they
+# would lose.
+add_compile_options(-fsanitize=${_FSANITIZE_VALUE} -fno-omit-frame-pointer -O1 -g1 -UNDEBUG)
 add_link_options(-fsanitize=${_FSANITIZE_VALUE})
 
 message(STATUS "Sanitizers enabled: ${SANITIZER} (-fsanitize=${_FSANITIZE_VALUE})")

@@ -166,13 +166,26 @@ inline bool is_runtime_source(const std::string & source) {
 /**
  * @brief Check if an entity source is protected from orphan suppression
  *
- * Whitelist approach: only manifest and plugin sources are preserved during
- * orphan filtering. Everything else (heuristic, topic, synthetic, node, runtime,
- * peer:xxx) is eligible for suppression.
+ * Whitelist approach: manifest, inventory (operator-declared assets), and
+ * plugin sources are preserved during orphan filtering. Everything else
+ * (heuristic, topic, synthetic, node, runtime, peer:xxx) is eligible for
+ * suppression.
  */
 inline bool is_protected_source(const std::string & source) {
-  return source == "manifest" || source.rfind("plugin", 0) == 0;
+  return source == "manifest" || source == "inventory" || source.rfind("plugin", 0) == 0;
 }
+
+/// Source runtime introspection gives every App it discovers from a ROS node.
+/// No other producer in the gateway sets it. A plugin layer keeps whatever
+/// source its provider sets, so a provider could also set this one.
+inline constexpr char kRuntimeAppSource[] = "heuristic";
+
+/// Source runtime introspection gives every Function it creates for a
+/// namespace. It does not prove the origin: a plugin can set it, and a merged
+/// Function keeps its first contributor's source. The gateway tracks the ids
+/// only introspection created apart from the Function
+/// (MergeResult::introspection_only_function_ids in hybrid mode).
+inline constexpr char kRuntimeFunctionSource[] = "runtime";
 
 }  // namespace discovery
 }  // namespace ros2_medkit_gateway

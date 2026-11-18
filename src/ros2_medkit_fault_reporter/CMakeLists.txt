@@ -22,29 +22,30 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
+include(ROS2MedkitCoverage)
 include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
-
-# Code coverage option
-option(ENABLE_COVERAGE "Enable code coverage reporting" OFF)
-if(ENABLE_COVERAGE)
-  message(STATUS "Code coverage enabled")
-  add_compile_options(--coverage -O0 -g)
-  add_link_options(--coverage)
-endif()
 
 find_package(ament_cmake REQUIRED)
 
 include(ROS2MedkitCompat)
 
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
+find_package(ros2_medkit_fault_detection REQUIRED)
 find_package(ros2_medkit_msgs REQUIRED)
+
+# ROS-free core: filter and reporting logic
+include(cmake/fault_reporter_core.cmake)
 
 # Library target
 add_library(fault_reporter_lib SHARED
   src/fault_reporter.cpp
-  src/local_filter.cpp
 )
+
+# The core is linked into the library and not installed on its own.
+target_link_libraries(fault_reporter_lib $<BUILD_INTERFACE:fault_reporter_core>
+  ros2_medkit_fault_detection::ros2_medkit_fault_detection)
 
 target_include_directories(fault_reporter_lib PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -53,13 +54,9 @@ target_include_directories(fault_reporter_lib PUBLIC
 
 medkit_target_dependencies(fault_reporter_lib
   rclcpp
+  rclcpp_lifecycle
   ros2_medkit_msgs
 )
-
-if(ENABLE_COVERAGE)
-  target_compile_options(fault_reporter_lib PRIVATE --coverage -O0 -g)
-  target_link_options(fault_reporter_lib PRIVATE --coverage)
-endif()
 
 # Install library
 install(TARGETS fault_reporter_lib
@@ -76,7 +73,7 @@ install(DIRECTORY include/
 
 # Export for downstream packages
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
-ament_export_dependencies(rclcpp ros2_medkit_msgs)
+ament_export_dependencies(rclcpp rclcpp_lifecycle ros2_medkit_fault_detection ros2_medkit_msgs)
 
 # Testing
 if(BUILD_TESTING)
@@ -84,32 +81,51 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(launch_testing_ament_cmake REQUIRED)
 
-  set(ament_cmake_clang_format_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../.clang-format")
+  medkit_lint_config(.clang-format ament_cmake_clang_format_CONFIG_FILE)
   list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_uncrustify ament_cmake_cpplint ament_cmake_clang_tidy)
   ament_lint_auto_find_test_dependencies()
 
   ros2_medkit_clang_tidy()
 
-  # Unit tests
-  ament_add_gtest(test_local_filter test/test_local_filter.cpp)
-  target_link_libraries(test_local_filter fault_reporter_lib)
-  medkit_target_dependencies(test_local_filter rclcpp ros2_medkit_msgs)
+  include(ROS2MedkitTestDomain)
 
-  if(ENABLE_COVERAGE)
-    target_compile_options(test_local_filter PRIVATE --coverage -O0 -g)
-    target_link_options(test_local_filter PRIVATE --coverage)
-  endif()
+  # Unit tests
+  medkit_add_gtest(test_local_filter test/test_local_filter.cpp)
+  target_link_libraries(test_local_filter fault_reporter_lib)
+  medkit_target_dependencies(test_local_filter rclcpp rclcpp_lifecycle ros2_medkit_msgs)
+
+  medkit_add_gtest(test_fault_reporter_construction test/test_fault_reporter_construction.cpp)
+  target_link_libraries(test_fault_reporter_construction fault_reporter_lib)
+  medkit_target_dependencies(test_fault_reporter_construction rclcpp rclcpp_lifecycle ros2_medkit_msgs)
+
+  # Pure logic: links the ROS-free core only, creates no node.
+  medkit_add_gtest(test_validate_filter_params test/test_validate_filter_params.cpp)
+  target_link_libraries(test_validate_filter_params fault_reporter_core)
+  medkit_test_needs_no_domain(test_validate_filter_params)
+
+  # Test node of the delivery tests.
+  add_executable(delivery_probe_node test/delivery_probe_node.cpp)
+  target_link_libraries(delivery_probe_node fault_reporter_lib)
+  medkit_target_dependencies(delivery_probe_node rclcpp ros2_medkit_msgs)
+  install(TARGETS delivery_probe_node DESTINATION lib/${PROJECT_NAME})
 
   # Integration tests
   install(DIRECTORY test
     DESTINATION share/${PROJECT_NAME}
   )
 
-  add_launch_test(
-    test/test_integration.test.py
-    TARGET test_integration
-    TIMEOUT 60
-  )
+  medkit_add_launch_test(test_integration test/test_integration.test.py TIMEOUT 60)
+
+  medkit_add_launch_test(test_delivery test/test_delivery.test.py TIMEOUT 300)
+
+  # A launch test and its children on one domain. It lives here rather than in
+  # ros2_medkit_cmake because that package is declared NONE, and on Humble
+  # launch_testing_ament_cmake reaches the deprecated FindPythonLibs, which
+  # cannot find libpython without a language enabled. This package compiles and
+  # already runs a launch test on every distro.
+  medkit_add_launch_test(test_domain_launch test/test_domain_launch.test.py TIMEOUT 300
+    LABELS "integration")
+
   ros2_medkit_relax_vendor_warnings()
 endif()
 
