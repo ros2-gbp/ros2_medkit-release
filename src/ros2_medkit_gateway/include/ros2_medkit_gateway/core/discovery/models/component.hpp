@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "ros2_medkit_gateway/core/discovery/models/asset_identity.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/common.hpp"
 
 #include <nlohmann/json.hpp>
@@ -46,10 +47,28 @@ struct Component {
   std::string parent_component_id;        ///< Parent component ID for sub-components
   std::vector<std::string> depends_on;    ///< Component IDs this component depends on
   std::vector<std::string> contributors;  ///< Aggregation provenance: "local" and/or "peer:<name>"
-  std::vector<ServiceInfo> services;      ///< Services exposed by this component
-  std::vector<ActionInfo> actions;        ///< Actions exposed by this component
-  ComponentTopics topics;                 ///< Topics this component publishes/subscribes
-  std::optional<json> host_metadata;      ///< Host system metadata (for runtime default component)
+  /// What the contributing gateway itself called this entity: "manifest",
+  /// "runtime", "node" or "topic". `source` is overwritten with `peer:<name>`
+  /// on arrival, because the identity-merge precedence keys on it, so the
+  /// origin would otherwise be lost - and the origin is what decides whether
+  /// the entity is retained when its peer stops answering. Empty for entities
+  /// this gateway discovered itself.
+  std::string declared_source;
+  /// False while the peer contributing this entity is not answering and the
+  /// entity is being retained from its last known declaration. A retained
+  /// entity stays addressable and reports why it cannot be reached.
+  bool available{true};
+  std::vector<ServiceInfo> services;  ///< Services exposed by this component
+  std::vector<ActionInfo> actions;    ///< Actions exposed by this component
+  ComponentTopics topics;             ///< Topics this component publishes/subscribes
+  std::optional<json> host_metadata;  ///< Host system metadata (for runtime default component)
+  AssetIdentity identity;             ///< Asset-identity nameplate (merged across sources, per-field provenance)
+
+  /// Tri-state: nullopt = no layer classified this component, true = non-ROS
+  /// external asset (PLC/fieldbus/device), false = explicitly a ROS component.
+  /// Mirrors App::external so a device Component owns its fault_manager faults
+  /// without a synthetic child App (#516).
+  std::optional<bool> external;
 
   /**
    * @brief Convert to JSON representation
@@ -93,6 +112,14 @@ struct Component {
     x_medkit["topics"] = topics.to_json();
     if (host_metadata.has_value()) {
       x_medkit["host"] = host_metadata.value();
+    }
+    if (!identity.empty()) {
+      x_medkit["identity"] = identity.to_json();
+    }
+    // Emit only when effectively external; omitted and explicit-false both leave
+    // the field absent, keeping the wire shape stable (absence == not external).
+    if (external.value_or(false)) {
+      x_medkit["external"] = true;
     }
     j["x-medkit"] = x_medkit;
 
@@ -160,7 +187,9 @@ struct Component {
     }
     j["faults"] = component_url + "/faults";
     j["subcomponents"] = component_url + "/subcomponents";
-    j["related-apps"] = component_url + "/related-apps";
+    // `/hosts` is the registered route that lists a component's apps.
+    // `/related-apps` named no route for any entity type.
+    j["hosts"] = component_url + "/hosts";
     if (!depends_on.empty()) {
       j["depends-on"] = component_url + "/depends-on";
     }
@@ -178,7 +207,8 @@ inline bool operator==(const Component & a, const Component & b) {
          a.description == b.description && a.variant == b.variant && a.tags == b.tags &&
          a.parent_component_id == b.parent_component_id && a.depends_on == b.depends_on &&
          a.contributors == b.contributors && a.services == b.services && a.actions == b.actions &&
-         a.topics == b.topics && a.host_metadata == b.host_metadata;
+         a.topics == b.topics && a.host_metadata == b.host_metadata && a.identity == b.identity &&
+         a.external == b.external && a.declared_source == b.declared_source && a.available == b.available;
 }
 inline bool operator!=(const Component & a, const Component & b) {
   return !(a == b);
