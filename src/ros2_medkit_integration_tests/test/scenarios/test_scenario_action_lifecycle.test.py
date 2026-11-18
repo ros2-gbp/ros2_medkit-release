@@ -26,7 +26,7 @@ import launch_testing
 import launch_testing.actions
 import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
+from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, get_time_scale
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_test_launch
 
@@ -68,9 +68,18 @@ class TestScenarioActionLifecycle(GatewayTestCase):
     ENTITY_ENDPOINT = '/apps/long_calibration'
 
     def _ensure_operation_ready(self):
-        """Wait for the long_calibration operation to be discovered."""
-        self.wait_for_operation(
-            self.ENTITY_ENDPOINT, self.OPERATION_ID, max_wait=15.0
+        """Wait for the long_calibration operation to be USABLE, not just listed.
+
+        An operation appears under /operations as soon as it is discovered by
+        name, but the gateway cannot send a goal until it has also resolved the
+        underlying ROS interface type. Waiting on the name alone races that
+        second step, and creating an execution in the gap returns 500
+        x-medkit-ros2-action-unavailable, because the empty type string fails
+        typesupport lookup. Wait for the resolved schema instead.
+        """
+        self.wait_for_operation_type_info(
+            self.ENTITY_ENDPOINT, self.OPERATION_ID,
+            ('goal', 'result', 'feedback'), max_wait=15.0
         )
 
     def _create_action_execution(self, order=5):
@@ -135,12 +144,33 @@ class TestScenarioActionLifecycle(GatewayTestCase):
             f'Execution should be running or completed, got {status_data["status"]}',
         )
 
-        # Cancel the execution
+        # Cancel the execution. The client budget must exceed the gateway's: cancelling is
+        # a service round-trip to the action server (up to 2s to find the service plus the
+        # configured service_call_timeout_sec, default 10s), so a 10s client timeout would
+        # surface a slow-but-successful cancel as an opaque ReadTimeout instead of the
+        # server's own diagnosable error.
         response = self.delete_request(
             self._exec_endpoint(execution_id),
+            timeout=25,
             expected_status=204,
         )
         self.assertEqual(len(response.content), 0)
+
+        # The /_action/status stream is the authority for the goal's state,
+        # and the accepted-cancel reply raced it: whichever of the two the
+        # gateway processed second used to win. When the stream's terminal
+        # frame lost that race the execution was pinned at "canceling"
+        # forever - no further frame is ever published - so this is the only
+        # place the defect is visible end to end. Any terminal state is fine
+        # (the goal may also have completed before the cancel landed); what
+        # must not happen is the execution never leaving a running state.
+        terminal = {'canceled', 'succeeded', 'aborted'}
+        self.poll_endpoint_until(
+            self._exec_endpoint(execution_id),
+            lambda d: d if (d.get('x-medkit') or {}).get('ros2_status') in terminal else None,
+            timeout=20.0 * get_time_scale(),
+            interval=0.3,
+        )
 
     def test_03_service_execution_returns_immediately(self):
         """Create a Trigger service execution, get immediate result.
@@ -216,20 +246,18 @@ class TestScenarioActionLifecycle(GatewayTestCase):
         """GET operation details, verify type_info with goal/result/feedback schemas."""
         self._ensure_operation_ready()
 
-        ops_data = self.get_json(f'{self.ENTITY_ENDPOINT}/operations')
-        ops = ops_data['items']
+        # The operation appears by name before its interface type is resolved,
+        # so wait until type_info actually carries the action schema keys rather
+        # than reading the list once and racing type resolution.
+        action_op = self.wait_for_operation_type_info(
+            self.ENTITY_ENDPOINT, self.OPERATION_ID,
+            ('goal', 'result', 'feedback'),
+        )
 
-        # Find the long_calibration action operation
-        action_op = None
-        for op in ops:
-            if op['name'] == self.OPERATION_ID:
-                x_medkit = op.get('x-medkit', {})
-                ros2 = x_medkit.get('ros2', {})
-                if ros2.get('kind') == 'action':
-                    action_op = op
-                    break
-
-        self.assertIsNotNone(action_op, 'Long calibration action should be listed')
+        # Confirm it is the action operation (not a same-named service).
+        ros2 = action_op.get('x-medkit', {}).get('ros2', {})
+        self.assertEqual(ros2.get('kind'), 'action',
+                         'Long calibration action should be listed')
 
         # Verify type_info in x-medkit
         x_medkit = action_op['x-medkit']
