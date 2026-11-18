@@ -6,7 +6,14 @@
 # Topic resolution priority:
 #   1. fault_specific - exact fault code match (highest priority)
 #   2. patterns - regex pattern match on fault code
-#   3. default_topics - fallback for all other faults (lowest priority)
+#   3. default_topics - fallback for all other faults
+#   4. entity-default - zero-config fallback when nothing above matches:
+#      the reporting source node's own published topics are captured
+#      (parameter snapshots.entity_default, on by default)
+#
+# A fault code listed in fault_specific (or matched by a pattern) with an
+# EMPTY topic list is an explicit per-fault opt-out: nothing is captured and
+# the entity-default fallback is skipped for that code.
 #
 # Usage:
 #   ros2 run ros2_medkit_fault_manager fault_manager_node \
@@ -72,6 +79,14 @@ default_topics:
 # `default_topics` from this YAML file. Rosbag settings must be configured
 # via ROS 2 parameters (--ros-args -p snapshots.rosbag.*) or launch files.
 
+# Keeping a fault's value snapshots when it is acknowledged is the ROS 2 parameter
+# `snapshots.retain_on_clear` (default: false), not a key here - this file is not
+# read for it, exactly like the rosbag block below. Off is the historical
+# behaviour: clearing a fault deletes them. Turn it on together with
+# rosbag.max_bags_per_fault, or acknowledging leaves the fault holding recordings
+# whose matching readings are gone - evidence that no longer lines up. Growth stays
+# bounded by max_per_fault either way.
+
 rosbag:
   # Enable/disable rosbag capture (default: false)
   # When disabled, only JSON snapshots are captured
@@ -123,26 +138,49 @@ rosbag:
   # When false, ring buffer runs continuously from node startup
   lazy_start: false
 
-  # Bag file format (default: "sqlite3")
+  # Bag file format (default: "mcap")
   # Options:
-  #   "sqlite3" - Default; always shipped with rosbag2, zero extra setup
-  #   "mcap"    - Opt-in; efficient and Foxglove-readable, needs rosbag2_storage_mcap
-  # If the selected plugin is not installed, capture automatically falls back to
-  # sqlite3, and disables itself only if no backend is usable (never crashes).
-  format: "sqlite3"
+  #   "mcap"    - Default; opens directly in Foxglove and Lichtblick
+  #   "sqlite3" - Also what an unknown format string lands on
+  # Neither backend is privileged over the other: whichever is configured, if
+  # its plugin is unavailable at startup the FaultManager logs a warning
+  # naming the missing package and falls back to the other one automatically,
+  # disabling capture only if neither loads (never crashes). Both
+  # rosbag2_storage_mcap and rosbag2_storage_default_plugins (the sqlite3
+  # plugin) are runtime dependencies of this package, so a normal install
+  # pulls in both backends.
+  format: "mcap"
 
   # Storage path for bag files (default: "" = system temp directory)
   # Empty string uses /tmp/rosbag_snapshots/
-  # Bag files are named: {fault_code}_{timestamp}/
+  # Bag files are named: fault_{fault_code}_{timestamp}/ and that directory name is
+  # the recording's public id - the last segment of its bulk-data URL.
   storage_path: ""
 
   # Maximum size per bag file in MB (default: 50)
-  # If a bag exceeds this size, it will be closed even if still recording
+  # A recording past this size is split into several storage files. manifest.json
+  # in the recording directory lists them in order with size and sha256.
   max_bag_size_mb: 50
 
   # Maximum total storage for all bag files in MB (default: 500)
-  # Oldest bags are deleted when this limit is exceeded
+  # Oldest bags are deleted when this limit is exceeded. This is the real disk bound;
+  # max_bags_per_fault below only decides how the budget is shared out.
+  # The recording just written is never deleted by this limit, even when it alone
+  # is larger: it is kept and a warning is logged.
   max_total_storage_mb: 500
+
+  # Recordings kept per fault code (default: 1, 0 = unlimited)
+  # A fault that keeps re-confirming leaves a trail of black boxes instead of only
+  # the latest one. Past the cap the fault's OLDEST recording is dropped, and the bag
+  # is deleted once no fault still references it (a burst shares one recording).
+  #
+  # 1 is the historical behaviour: each re-confirmation replaces the previous bag.
+  # 3 is a good starting point for an intermittent fault you are chasing.
+  #
+  # Think of this as fairness rather than depth: the disk is bounded by
+  # max_total_storage_mb either way, and a high value lets one flapping fault consume
+  # the budget and evict every other fault's recording.
+  max_bags_per_fault: 1
 
   # Maximum in-memory ring buffer size in MB (default: 256)
   # Oldest buffered messages are dropped once the buffer exceeds this, so a broad
@@ -157,6 +195,8 @@ rosbag:
   # Auto-cleanup bag files when fault is cleared (default: true)
   # When true, bag files are deleted when ClearFault is called
   # When false, bag files persist until manually deleted or storage limit hit
+  # No effect once max_bags_per_fault is anything other than 1: a configured
+  # history governs retention instead, and an acknowledgement leaves it alone
   auto_cleanup: true
 
 # =============================================================================
