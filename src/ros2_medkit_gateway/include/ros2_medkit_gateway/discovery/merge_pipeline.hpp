@@ -15,6 +15,7 @@
 #pragma once
 
 #include "ros2_medkit_gateway/core/discovery/discovery_layer.hpp"
+#include "ros2_medkit_gateway/core/discovery/identity_merge.hpp"
 #include "ros2_medkit_gateway/core/discovery/manifest/manifest.hpp"
 #include "ros2_medkit_gateway/core/discovery/merge_types.hpp"
 #include "ros2_medkit_gateway/discovery/manifest/runtime_linker.hpp"
@@ -23,6 +24,8 @@
 #include <rclcpp/logging.hpp>
 
 #include <memory>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace ros2_medkit_gateway {
@@ -36,6 +39,8 @@ struct MergeResult {
   std::vector<Component> components;
   std::vector<App> apps;
   std::vector<Function> functions;
+  /// Ids of the Functions only the runtime layer contributed.
+  std::unordered_set<std::string> introspection_only_function_ids;
   MergeReport report;
   LinkingResult linking_result;
 };
@@ -56,6 +61,16 @@ class MergePipeline {
    * @param layer Layer to add (priority = insertion order, first = highest)
    */
   void add_layer(std::unique_ptr<DiscoveryLayer> layer);
+
+  /**
+   * @brief Set the asset-identity merge configuration (source precedence).
+   *
+   * Identity authority is independent of the structural MergePolicy: this controls
+   * which source wins per identity field, ranked on `Component.source`.
+   */
+  void set_identity_merge_config(IdentityMergeConfig config) {
+    identity_config_ = std::move(config);
+  }
 
   /**
    * @brief Execute all layers and merge results
@@ -81,6 +96,29 @@ class MergePipeline {
   void set_linker(std::unique_ptr<RuntimeLinker> linker, const ManifestConfig & config);
 
   /**
+   * @brief Replace the ManifestConfig the pipeline runs on, keeping the linker
+   *
+   * Used after a manifest reload. The config reached the pipeline once, at
+   * construction, while `/health` reads it live from the ManifestManager - so
+   * without this the two disagree after a reload and the documented
+   * `orphan_count > 0 && unmanifested_policy == "error"` recipe reports a
+   * policy the orphan filter is not running.
+   *
+   * Deliberately not "rebuild the pipeline": plugin layers are added at
+   * runtime through DiscoveryManager::add_plugin_layer and a rebuild would
+   * drop them.
+   */
+  void set_manifest_config(const ManifestConfig & config) {
+    manifest_config_ = config;
+  }
+
+  /**
+   * @brief Find a layer by name, or nullptr. Used to re-apply layer policies
+   *        after a reload without disturbing layer order or membership.
+   */
+  DiscoveryLayer * find_layer(const std::string & name);
+
+  /**
    * @brief Get the last linking result (returned by value for thread safety)
    * @warning NOT thread-safe on its own. In production, access only through
    * DiscoveryManager which holds a mutex around the cached pipeline result.
@@ -97,8 +135,15 @@ class MergePipeline {
 
   rclcpp::Logger logger_;
   std::vector<std::unique_ptr<DiscoveryLayer>> layers_;
+  IdentityMergeConfig identity_config_;
   MergeReport last_report_;
   std::unique_ptr<RuntimeLinker> linker_;
+
+  /// Ids of entities whose OWNING layer declares them protected from orphan
+  /// suppression (see DiscoveryLayer::owns_protected_entities). Rebuilt from
+  /// scratch on every execute() - a layer that stops contributing an entity
+  /// must stop protecting it.
+  std::unordered_set<std::string> protected_entity_ids_;
   ManifestConfig manifest_config_;
   LinkingResult linking_result_;
 };

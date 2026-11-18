@@ -19,8 +19,10 @@
 #include <chrono>
 #include <thread>
 
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/core/providers/introspection_provider.hpp"
+#include "ros2_medkit_gateway/http/handlers/cyclic_subscription_handlers.hpp"
 #include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
 
 using namespace ros2_medkit_gateway;
@@ -160,6 +162,44 @@ class MockRoutePlugin : public GatewayPlugin {
   std::string last_path_param_;
 };
 
+/// Commercial-bridge-shaped plugin: serves live values only through a
+/// registered x-plc-data route (no DataProvider), like the S7comm/Modbus/ADS
+/// bridges. Exercises PluginManager::fetch_entity_data_via_route.
+class MockPlcRoutePlugin : public GatewayPlugin {
+ public:
+  std::string name() const override {
+    return "mock_plc";
+  }
+  void configure(const json & /*cfg*/) override {
+  }
+  std::vector<PluginRoute> get_routes() override {
+    ++get_routes_calls_;
+    return {
+        {"GET", R"(apps/([^/]+)/x-plc-data)",
+         [this](const PluginRequest & req, PluginResponse & res) {
+           last_path_ = req.path();
+           auto entity = req.path_param(1);
+           if (entity != "plc_app") {
+             res.send_error(404, "resource-not-found", "No PLC data mapped for entity: " + entity);
+             return;
+           }
+           res.send_json({{"connected", connected_},
+                          {"items", json::array({{{"name", "level"}, {"value", 87.5}, {"unit", "mm"}},
+                                                 {{"name", "alarm"}, {"value", true}}})}});
+         }},
+        // Longer sibling pattern must not shadow the exact match above.
+        {"GET", R"(apps/([^/]+)/x-plc-data/([^/]+))",
+         [this](const PluginRequest & req, PluginResponse & res) {
+           last_path_ = req.path();
+           res.send_json({{"single", true}});
+         }},
+    };
+  }
+  bool connected_ = true;
+  int get_routes_calls_ = 0;
+  std::string last_path_;
+};
+
 /// Plugin that throws during get_routes
 class MockThrowOnGetRoutes : public GatewayPlugin, public IntrospectionProvider {
  public:
@@ -188,6 +228,56 @@ class MockThrowOnShutdown : public GatewayPlugin {
   void shutdown() override {
     throw std::runtime_error("shutdown failed");
   }
+};
+
+/// Plugin that registers a cyclic-subscription sampler during set_context(),
+/// mirroring GraphProviderPlugin::set_context(). The callable captures `this`
+/// so a dangling registration after teardown would be a use-after-free.
+class MockSamplerPlugin : public GatewayPlugin {
+ public:
+  explicit MockSamplerPlugin(std::string collection) : collection_(std::move(collection)) {
+  }
+  std::string name() const override {
+    return "sampler_plugin";
+  }
+  void configure(const json & /*cfg*/) override {
+  }
+  void set_context(PluginContext & context) override {
+    context.register_sampler(collection_,
+                             [this](const std::string &, const std::string &) -> tl::expected<json, std::string> {
+                               return json{{"plugin", name()}};
+                             });
+  }
+
+ private:
+  std::string collection_;
+};
+
+/// Same sampler-registering behavior as MockSamplerPlugin, but also throws
+/// from get_routes() - the reachable ordering the design doc calls out:
+/// set_context() has already registered the sampler by the time a later
+/// get_routes() failure disables the plugin.
+class MockSamplerThrowOnGetRoutes : public GatewayPlugin {
+ public:
+  explicit MockSamplerThrowOnGetRoutes(std::string collection) : collection_(std::move(collection)) {
+  }
+  std::string name() const override {
+    return "sampler_throw_get_routes";
+  }
+  void configure(const json & /*cfg*/) override {
+  }
+  void set_context(PluginContext & context) override {
+    context.register_sampler(collection_,
+                             [](const std::string &, const std::string &) -> tl::expected<json, std::string> {
+                               return json{{"ok", true}};
+                             });
+  }
+  std::vector<PluginRoute> get_routes() override {
+    throw std::runtime_error("get_routes failed");
+  }
+
+ private:
+  std::string collection_;
 };
 
 TEST(PluginManagerTest, EmptyManagerHasNoPlugins) {
@@ -324,6 +414,105 @@ TEST(PluginManagerTest, ThrowOnSetContextDisablesPlugin) {
   EXPECT_EQ(mgr.plugin_names()[0], "mock");
 }
 
+TEST(PluginManagerTest, DisablePluginRemovesItsSampler) {
+  ResourceSamplerRegistry sampler_registry;
+  TransportRegistry transport_registry;
+  PluginManager mgr;
+  mgr.set_registries(sampler_registry, transport_registry);
+  mgr.add_plugin(std::make_unique<MockSamplerThrowOnGetRoutes>("x-mock-disable-sampler"));
+  mgr.configure_plugins();
+
+  auto ctx = make_gateway_plugin_context(nullptr, nullptr, &sampler_registry);
+  mgr.set_context(*ctx);
+  ASSERT_TRUE(sampler_registry.has_sampler("x-mock-disable-sampler"));
+
+  httplib::Server srv;
+  mgr.register_routes(srv, "/api/v1");  // get_routes() throws -> disable_plugin
+
+  EXPECT_FALSE(sampler_registry.has_sampler("x-mock-disable-sampler"));
+  EXPECT_FALSE(sampler_registry.get_sampler("x-mock-disable-sampler").has_value());
+  EXPECT_FALSE(mgr.has_plugins());
+}
+
+TEST(PluginManagerTest, ShutdownAllRemovesPluginSamplers) {
+  ResourceSamplerRegistry sampler_registry;
+  TransportRegistry transport_registry;
+  PluginManager mgr;
+  mgr.set_registries(sampler_registry, transport_registry);
+  mgr.add_plugin(std::make_unique<MockSamplerPlugin>("x-mock-shutdown-sampler"));
+  mgr.configure_plugins();
+
+  auto ctx = make_gateway_plugin_context(nullptr, nullptr, &sampler_registry);
+  mgr.set_context(*ctx);
+  ASSERT_TRUE(sampler_registry.has_sampler("x-mock-shutdown-sampler"));
+
+  mgr.shutdown_all();
+
+  EXPECT_FALSE(sampler_registry.has_sampler("x-mock-shutdown-sampler"));
+}
+
+/// A plugin registers a sampler through PluginContext, which carries no way of
+/// saying that the sampler narrows its payload to a named resource. Such a
+/// sampler therefore streams its whole collection, and a subscription URI
+/// naming a single item of that collection is refused rather than accepted and
+/// answered with everything on every tick.
+TEST(PluginManagerTest, PluginSamplerRefusesAResourcePath) {
+  ResourceSamplerRegistry sampler_registry;
+  TransportRegistry transport_registry;
+  PluginManager mgr;
+  mgr.set_registries(sampler_registry, transport_registry);
+  mgr.add_plugin(std::make_unique<MockSamplerPlugin>("x-mock-metrics"));
+  mgr.configure_plugins();
+
+  auto ctx = make_gateway_plugin_context(nullptr, nullptr, &sampler_registry);
+  mgr.set_context(*ctx);
+
+  ASSERT_TRUE(sampler_registry.has_sampler("x-mock-metrics"));
+
+  const std::string item_uri = "/api/v1/apps/node1/x-mock-metrics/cpu_usage";
+  auto item_parsed = handlers::CyclicSubscriptionHandlers::parse_resource_uri(item_uri);
+  ASSERT_TRUE(item_parsed.has_value());
+  auto item_result =
+      handlers::CyclicSubscriptionHandlers::validate_resource_path_support(sampler_registry, *item_parsed, item_uri);
+  ASSERT_FALSE(item_result.has_value());
+  EXPECT_EQ(item_result.error().http_status, 400);
+  EXPECT_EQ(item_result.error().code, ERR_X_MEDKIT_INVALID_RESOURCE_URI);
+  EXPECT_EQ(item_result.error().params["collection"], "x-mock-metrics");
+
+  // The collection URI is the one form such a sampler can answer.
+  const std::string collection_uri = "/api/v1/apps/node1/x-mock-metrics";
+  auto collection_parsed = handlers::CyclicSubscriptionHandlers::parse_resource_uri(collection_uri);
+  ASSERT_TRUE(collection_parsed.has_value());
+  EXPECT_TRUE(handlers::CyclicSubscriptionHandlers::validate_resource_path_support(sampler_registry, *collection_parsed,
+                                                                                   collection_uri)
+                  .has_value());
+}
+
+TEST(PluginManagerTest, BuiltinSamplerSurvivesPluginDisable) {
+  ResourceSamplerRegistry sampler_registry;
+  TransportRegistry transport_registry;
+  sampler_registry.register_sampler(
+      "data",
+      [](const std::string &, const std::string &) -> tl::expected<json, std::string> {
+        return json{{"builtin", true}};
+      },
+      true);
+
+  PluginManager mgr;
+  mgr.set_registries(sampler_registry, transport_registry);
+  mgr.add_plugin(std::make_unique<MockSamplerThrowOnGetRoutes>("x-mock-alongside-builtin"));
+  mgr.configure_plugins();
+
+  auto ctx = make_gateway_plugin_context(nullptr, nullptr, &sampler_registry);
+  mgr.set_context(*ctx);
+
+  httplib::Server srv;
+  mgr.register_routes(srv, "/api/v1");  // disables the plugin
+
+  EXPECT_FALSE(sampler_registry.has_sampler("x-mock-alongside-builtin"));
+  EXPECT_TRUE(sampler_registry.has_sampler("data"));
+}
+
 TEST(PluginManagerTest, ThrowOnGetRoutesDisablesPlugin) {
   PluginManager mgr;
   mgr.add_plugin(std::make_unique<MockThrowOnGetRoutes>());
@@ -369,6 +558,84 @@ TEST(PluginManagerTest, RegisterRoutesWrapsPluginHandlers) {
   EXPECT_EQ(body["handled"], true);
   EXPECT_EQ(body["entity"], "test_entity");
   EXPECT_EQ(raw->last_path_param_, "test_entity");
+}
+
+TEST(PluginManagerTest, FetchEntityDataViaRouteDispatchesOwningPluginHandler) {
+  PluginManager mgr;
+  auto plugin = std::make_unique<MockPlcRoutePlugin>();
+  auto * raw = plugin.get();
+  mgr.add_plugin(std::move(plugin));
+  mgr.configure_plugins();
+  mgr.register_entity_ownership("mock_plc", {"plc_app"});
+
+  auto body = mgr.fetch_entity_data_via_route("plc_app");
+  ASSERT_TRUE(body.has_value());
+  EXPECT_EQ((*body)["connected"], true);
+  ASSERT_EQ((*body)["items"].size(), 2u);
+  EXPECT_EQ((*body)["items"][0]["name"], "level");
+  EXPECT_EQ((*body)["items"][0]["value"], 87.5);
+  // The handler saw a real-looking request: full API path with regex captures.
+  EXPECT_EQ(raw->last_path_, "/api/v1/apps/plc_app/x-plc-data");
+}
+
+TEST(PluginManagerTest, FetchEntityDataViaRouteSingleItemDispatchesItemRoute) {
+  PluginManager mgr;
+  auto plugin = std::make_unique<MockPlcRoutePlugin>();
+  auto * raw = plugin.get();
+  mgr.add_plugin(std::move(plugin));
+  mgr.configure_plugins();
+  mgr.register_entity_ownership("mock_plc", {"plc_app"});
+
+  auto body = mgr.fetch_entity_data_via_route("plc_app", "level");
+  ASSERT_TRUE(body.has_value());
+  EXPECT_EQ((*body)["single"], true);
+  // The item must actually reach the dispatched path - a regression to the
+  // list route would still answer 200 here.
+  EXPECT_EQ(raw->last_path_, "/api/v1/apps/plc_app/x-plc-data/level");
+}
+
+TEST(PluginManagerTest, FetchEntityDataViaRouteUnownedEntityReturnsNullopt) {
+  PluginManager mgr;
+  mgr.add_plugin(std::make_unique<MockPlcRoutePlugin>());
+  mgr.configure_plugins();
+
+  EXPECT_FALSE(mgr.fetch_entity_data_via_route("plc_app").has_value());
+}
+
+TEST(PluginManagerTest, FetchEntityDataViaRouteErrorResponseReturnsNullopt) {
+  PluginManager mgr;
+  mgr.add_plugin(std::make_unique<MockPlcRoutePlugin>());
+  mgr.configure_plugins();
+  // Owned by the plugin, but its handler 404s for this entity.
+  mgr.register_entity_ownership("mock_plc", {"unmapped_app"});
+
+  EXPECT_FALSE(mgr.fetch_entity_data_via_route("unmapped_app").has_value());
+}
+
+TEST(PluginManagerTest, FetchEntityDataViaRouteNoMatchingRouteReturnsNullopt) {
+  PluginManager mgr;
+  mgr.add_plugin(std::make_unique<MockRoutePlugin>());  // registers x-test-route only
+  mgr.configure_plugins();
+  mgr.register_entity_ownership("mock_route", {"plc_app"});
+
+  EXPECT_FALSE(mgr.fetch_entity_data_via_route("plc_app").has_value());
+}
+
+TEST(PluginManagerTest, GetRoutesCalledOnceAcrossRegisterAndFetch) {
+  PluginManager mgr;
+  auto plugin = std::make_unique<MockPlcRoutePlugin>();
+  auto * raw = plugin.get();
+  mgr.add_plugin(std::move(plugin));
+  mgr.configure_plugins();
+  mgr.register_entity_ownership("mock_plc", {"plc_app"});
+
+  // Fetch before server setup (lazy cache), then register, then fetch again:
+  // the "called once during REST server setup" plugin contract must hold.
+  EXPECT_TRUE(mgr.fetch_entity_data_via_route("plc_app").has_value());
+  httplib::Server srv;
+  mgr.register_routes(srv, "/api/v1");
+  EXPECT_TRUE(mgr.fetch_entity_data_via_route("plc_app").has_value());
+  EXPECT_EQ(raw->get_routes_calls_, 1);
 }
 
 TEST(PluginManagerTest, ShutdownAllIdempotent) {

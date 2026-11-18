@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include "ros2_medkit_gateway/core/discovery/linking_result.hpp"
 #include "ros2_medkit_gateway/core/discovery/manifest/manifest.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/app.hpp"
 
@@ -23,57 +24,11 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace ros2_medkit_gateway {
 namespace discovery {
-
-/**
- * @brief Result of runtime linking operation
- *
- * Contains all the information about how manifest Apps were linked
- * to runtime ROS 2 nodes, including orphan detection.
- */
-struct LinkingResult {
-  /// Apps with successfully bound ROS nodes (and those that failed)
-  std::vector<App> linked_apps;
-
-  /// App IDs that have no matching ROS node (offline or external)
-  std::vector<std::string> unlinked_app_ids;
-
-  /// ROS node FQNs that have no matching manifest App (orphans)
-  std::vector<std::string> orphan_nodes;
-
-  /// Mapping from App ID to bound node FQN
-  std::unordered_map<std::string, std::string> app_to_node;
-
-  /// Mapping from node FQN to App ID (reverse lookup)
-  std::unordered_map<std::string, std::string> node_to_app;
-
-  /// Number of times two apps competed for the same node
-  size_t binding_conflicts{0};
-
-  /// Number of wildcard bindings that matched >1 node
-  size_t wildcard_multi_match{0};
-
-  /// Human-readable diagnostic warnings
-  std::vector<std::string> warnings;
-
-  /// Check if linking produced any errors based on policy
-  bool has_errors(ManifestConfig::UnmanifestedNodePolicy policy) const {
-    return policy == ManifestConfig::UnmanifestedNodePolicy::ERROR && !orphan_nodes.empty();
-  }
-
-  /// Get statistics summary
-  std::string summary() const {
-    std::string s = std::to_string(app_to_node.size()) + " linked, " + std::to_string(unlinked_app_ids.size()) +
-                    " unlinked, " + std::to_string(orphan_nodes.size()) + " orphan nodes";
-    if (binding_conflicts > 0) {
-      s += ", " + std::to_string(binding_conflicts) + " binding conflict(s)";
-    }
-    return s;
-  }
-};
 
 /**
  * @brief Links manifest Apps to runtime ROS 2 nodes
@@ -94,8 +49,16 @@ class RuntimeLinker {
   /**
    * @brief Constructor
    * @param node ROS node for logging (can be nullptr for testing)
+   * @param filter_internal_nodes The effective
+   *        `discovery.runtime.filter_internal_nodes` setting. It decides
+   *        whether this gateway's own in-process helper nodes are left out of
+   *        `orphan_nodes`, because it is the same setting that decides whether
+   *        they are filtered out of the served apps. With it off the helpers
+   *        ARE served as apps, so reporting them as unmanifested is the truth;
+   *        omitting them there would hide from `/health` exactly the nodes the
+   *        operator turned the filter off to see.
    */
-  explicit RuntimeLinker(rclcpp::Node * node = nullptr);
+  explicit RuntimeLinker(rclcpp::Node * node = nullptr, bool filter_internal_nodes = true);
 
   /**
    * @brief Link manifest apps to runtime apps (nodes)
@@ -103,10 +66,15 @@ class RuntimeLinker {
    * @param manifest_apps Apps from manifest
    * @param runtime_apps Apps discovered from ROS graph (each node is an App)
    * @param config Manifest config with orphan policy
+   * @param protected_ids Ids whose owning discovery layer declares them
+   *        protected from suppression. Passed in rather than recomputed so
+   *        this filter and the pipeline's own orphan sweep decide from one
+   *        source of truth; an empty set falls back to the source-tag rule
+   *        alone, which is what a caller with no pipeline context gets.
    * @return LinkingResult with linked apps and orphan info
    */
   LinkingResult link(const std::vector<App> & manifest_apps, const std::vector<App> & runtime_apps,
-                     const ManifestConfig & config);
+                     const ManifestConfig & config, const std::unordered_set<std::string> & protected_ids = {});
 
   /**
    * @brief Check if a specific app is linked to a runtime node
@@ -184,6 +152,8 @@ class RuntimeLinker {
   void log_error(const std::string & msg) const;
 
   rclcpp::Node * node_;
+  /// See the constructor: the helper-node skip below follows the app filter.
+  bool filter_internal_nodes_{true};
   LinkingResult last_result_;
 };
 
