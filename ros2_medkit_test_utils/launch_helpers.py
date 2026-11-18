@@ -21,6 +21,9 @@ single ``create_test_launch(...)`` call.
 Node names, namespaces, and parameters match ``demo_nodes.launch.py`` exactly.
 """
 
+import os
+
+from ament_index_python.packages import get_package_prefix
 from launch import LaunchDescription
 from launch.actions import TimerAction
 import launch_ros.actions
@@ -43,6 +46,9 @@ from ros2_medkit_test_utils.coverage import get_coverage_env
 DEMO_NODE_REGISTRY = {
     # Sensors
     'temp_sensor': ('demo_engine_temp_sensor', 'temp_sensor', '/powertrain/engine'),
+    # Subscribes to /powertrain/engine/temperature. Pairs with temp_sensor so the
+    # demo stack has a real publisher/subscriber edge inside one Function.
+    'temp_monitor': ('demo_engine_temp_monitor', 'temp_monitor', '/powertrain/engine'),
     'rpm_sensor': ('demo_rpm_sensor', 'rpm_sensor', '/powertrain/engine'),
     'pressure_sensor': ('demo_brake_pressure_sensor', 'pressure_sensor', '/chassis/brakes'),
     'status_sensor': ('demo_door_status_sensor', 'status_sensor', '/body/door/front_left'),
@@ -52,6 +58,10 @@ DEMO_NODE_REGISTRY = {
     'controller': ('demo_light_controller', 'controller', '/body/lights'),
     # Operations (services / actions)
     'calibration': ('demo_calibration_service', 'calibration', '/powertrain/engine'),
+    # Two services under one node whose ROS paths differ only above the last
+    # segment, so one provider carries the operation short name `calibrate`
+    # twice. Its own namespace keeps that collision away from `calibration`.
+    'dual_calibration': ('demo_dual_calibration_service', 'dual_calibration', '/testrig/dual'),
     'long_calibration': ('demo_long_calibration_action', 'long_calibration', '/powertrain/engine'),
     # Lifecycle demo (stays unconfigured by default; auto_activate:=true activates it)
     'managed_lifecycle': ('managed_lifecycle', 'managed_lifecycle', ''),
@@ -59,6 +69,13 @@ DEMO_NODE_REGISTRY = {
     # the "active" lifecycle state (-> status "ready"). Distinct node name so it
     # can run alongside the unconfigured 'managed_lifecycle' in the same test.
     'managed_lifecycle_active': ('managed_lifecycle', 'managed_lifecycle_active', ''),
+    # Proof fixture for GRAPH_NODE_UNREADABLE: advertises get_state/change_state like a
+    # managed lifecycle node, but get_state never answers until its start_answering
+    # parameter is set true (see unreadable_lifecycle_node.cpp's file doc).
+    'unreadable_lifecycle': ('unreadable_lifecycle', 'unreadable_lifecycle', ''),
+    # Regression fixture (#531): parameter services are discoverable
+    # (wait_for_service succeeds) but list_parameters never replies.
+    'unresponsive_param': ('demo_unresponsive_param_node', 'unresponsive_param', ''),
 }
 
 # Convenience groupings for callers that want subsets of demo nodes.
@@ -83,17 +100,51 @@ LIDAR_FAULTY_PARAMS = {
 # Factory: gateway node
 # ---------------------------------------------------------------------------
 
-def create_gateway_node(*, port=DEFAULT_PORT, extra_params=None, coverage=True):
+def create_gateway_node(*, port=DEFAULT_PORT, name='ros2_medkit_gateway',
+                        extra_params=None, parameter_files=(), coverage=True, extra_env=None,
+                        respawn=False, respawn_delay=1.0, namespace=None,
+                        remappings=None, ros_arguments=None):
     """Create a ``gateway_node`` launch action with standard config.
 
     Parameters
     ----------
     port : int
         HTTP server port (default: 8080).
+    name : str
+        ROS node name. Override when a test launches more than one gateway
+        so their names do not collide (e.g. ``gateway_with_scripts``).
     extra_params : dict or None
         Additional ROS parameters merged into the node config.
+    parameter_files : sequence of str
+        Parameter files passed after those parameters, for values a Python dict cannot
+        spell the way a user's file does (``.nan``, ``.inf``). A key set in both takes the
+        file's value.
     coverage : bool
         If True, set GCOV_PREFIX env vars for code coverage collection.
+    extra_env : dict or None
+        Additional environment variables merged into ``additional_env`` on
+        top of the coverage env. Useful for setting ``ROS_DOMAIN_ID`` to
+        isolate a multi-gateway test's peers into distinct DDS domains.
+    respawn : bool
+        If True, ``launch`` restarts the gateway whenever it exits before the
+        launch itself is shutting down. Only for tests whose subject IS a
+        gateway restart (state that must survive one, or must not be
+        resurrected by one): a test kills the process by PID and lets launch
+        bring the same configuration back. Off by default, so an unexpected
+        gateway death stays a visible failure everywhere else.
+    respawn_delay : float
+        Seconds ``launch`` waits before restarting. Non-zero so the HTTP port
+        and the DDS participant are released before the replacement binds
+        them, which also gives a test a window in which the port is provably
+        down - the only way to tell "restarted" from "never died".
+    namespace : str or None
+        ROS namespace for the gateway. ``None`` leaves it unset, which also
+        keeps launch_ros writing the parameters under ``/**``.
+    remappings : list of (str, str) or None
+        Remap rules. launch_ros passes them to the whole process.
+    ros_arguments : list of str or None
+        Extra ``--ros-args`` arguments, for rules ``remappings`` cannot spell
+        (a node-specific ``<node>:__ns:=<ns>``).
 
     Returns
     -------
@@ -105,17 +156,33 @@ def create_gateway_node(*, port=DEFAULT_PORT, extra_params=None, coverage=True):
     if extra_params:
         params.update(extra_params)
 
+    env = dict(get_coverage_env() if coverage else {})
+    if extra_env:
+        env.update(extra_env)
+
+    optional = {}
+    if namespace is not None:
+        optional['namespace'] = namespace
+    if remappings is not None:
+        optional['remappings'] = remappings
+    if ros_arguments is not None:
+        optional['arguments'] = ['--ros-args', *ros_arguments]
+
     return launch_ros.actions.Node(
         package='ros2_medkit_gateway',
         executable='gateway_node',
-        name='ros2_medkit_gateway',
+        name=name,
         output='screen',
-        parameters=[params],
-        additional_env=get_coverage_env() if coverage else {},
+        parameters=[params, *parameter_files],
+        additional_env=env,
+        respawn=respawn,
+        respawn_delay=respawn_delay,
+        **optional,
         # Default SIGINT->SIGTERM escalation is 5s and SIGTERM->SIGKILL is 5s.
-        # Under TSan/ASan the gateway shutdown sequence (mdns stop, REST server
-        # stop, transport teardown, plugin shutdown) easily exceeds 5s on slower
-        # CI runners, causing launch_testing to escalate to SIGKILL and the
+        # Under TSan/ASan/coverage the gateway shutdown sequence (mdns stop,
+        # REST server stop, transport teardown, plugin shutdown, plus flushing
+        # gcov data) easily exceeds 5s on slower CI runners, causing
+        # launch_testing to escalate to SIGKILL and the
         # TestShutdown.test_exit_codes check to report -9. The process still
         # shuts down cleanly given enough time, so widen both windows.
         sigterm_timeout='30',
@@ -129,17 +196,23 @@ def create_gateway_node(*, port=DEFAULT_PORT, extra_params=None, coverage=True):
 
 def create_fault_manager_node(
     *,
+    name='fault_manager',
     storage_type='memory',
     rosbag_enabled=True,
     rosbag_topics=None,
     snapshot_topics=None,
     extra_params=None,
     coverage=True,
+    extra_env=None,
+    namespace=None,
 ):
     """Create a ``fault_manager_node`` with test-friendly defaults.
 
     Parameters
     ----------
+    name : str
+        ROS node name. Override when a test launches more than one fault
+        manager so their names do not collide.
     storage_type : str
         Storage backend: 'memory' (default, avoids filesystem issues in CI)
         or 'sqlite'.
@@ -157,6 +230,11 @@ def create_fault_manager_node(
         ``confirmation_threshold``.
     coverage : bool
         If True, set GCOV_PREFIX env vars for code coverage collection.
+    extra_env : dict or None
+        Additional environment variables merged into ``additional_env`` on
+        top of the coverage env (e.g. ``ROS_DOMAIN_ID`` for a peer).
+    namespace : str or None
+        ROS namespace for the fault manager. ``None`` leaves it unset.
 
     Returns
     -------
@@ -181,12 +259,107 @@ def create_fault_manager_node(
     if extra_params:
         params.update(extra_params)
 
+    # Route this process's .gcda to the fault_manager build dir, not the
+    # gateway default, so its coverage is not written to the wrong package.
+    env = dict(get_coverage_env('ros2_medkit_fault_manager') if coverage else {})
+    if extra_env:
+        env.update(extra_env)
+
+    optional = {}
+    if namespace is not None:
+        optional['namespace'] = namespace
+
     return launch_ros.actions.Node(
         package='ros2_medkit_fault_manager',
         executable='fault_manager_node',
-        name='fault_manager',
+        name=name,
         output='screen',
-        additional_env=get_coverage_env() if coverage else {},
+        additional_env=env,
+        parameters=[params],
+        **optional,
+        # Same rationale as create_gateway_node: under coverage the node must
+        # flush gcov data at shutdown, which can exceed the 5s launch default
+        # and get the process SIGKILLed to -9. Widen both windows.
+        sigterm_timeout='30',
+        sigkill_timeout='15',
+    )
+
+
+# ---------------------------------------------------------------------------
+# Factory: greenwave_monitor node
+# ---------------------------------------------------------------------------
+
+def create_greenwave_node(
+    *,
+    monitored_topics=None,
+    frequency_monitored_topics=None,
+    time_check_preset='header_with_nodetime_fallback',
+    name='greenwave_monitor',
+    extra_params=None,
+):
+    """Create an NVIDIA ``greenwave_monitor`` node for real ``/diagnostics`` metrics.
+
+    ``greenwave_monitor`` resolves its monitored topics ONCE at node
+    startup and never re-resolves them: if a topic has no live publisher
+    yet when this node starts, greenwave logs "No topics to monitor" (or
+    simply never reports on that topic) and nothing is ever emitted for
+    it afterwards. Callers MUST schedule this node's launch action on a
+    LATER ``TimerAction`` than the publishers of every topic it should
+    monitor - see ``create_demo_nodes``'s ``TimerAction`` usage for the
+    earlier stage and give this node its own, later-firing timer.
+
+    ``greenwave_monitor`` also publishes ``/diagnostics`` at only ~1 Hz,
+    with the first useful (non-transient) reading typically a few seconds
+    after it starts, so callers polling for its output need budgets of at
+    least 30 seconds, not the usual 15.
+
+    Parameters
+    ----------
+    monitored_topics : list of str or None
+        Fully-qualified topic names (leading ``/``) for the simple
+        ``gw_monitored_topics`` parameter (no expected-frequency
+        tracking). Omitted entirely from the parameter set when empty -
+        an empty list parameter can crash ``launch`` on type inference.
+        greenwave stamps ``DiagnosticStatus.name`` with exactly this
+        string, and the graph provider plugin keys its metrics map on it,
+        so these must match the ROS topic names byte-for-byte.
+    frequency_monitored_topics : dict or None
+        Topic -> ``{'expected_frequency': float, 'tolerance': float}`` for
+        the ``gw_frequency_monitored_topics`` parameter. When set here, a
+        topic's ``expected_frequency`` is stamped into its ``/diagnostics``
+        status and wins over any graph-provider-side config (function-level
+        override or global default) for that topic. Omitted entirely when
+        empty, for the same launch-type-inference reason as above.
+    time_check_preset : str
+        ``gw_time_check_preset`` value (default matches greenwave's own
+        example config: check header timestamp with a node-time fallback).
+    name : str
+        ROS node name. With no namespace, the node's fully-qualified name
+        is ``/<name>`` - this is also the value the graph provider plugin
+        resolves into ``metrics.source`` for every topic this node reports
+        on (via publisher GID matching against ``/diagnostics``).
+    extra_params : dict or None
+        Additional ROS parameters merged into the node config.
+
+    Returns
+    -------
+    launch_ros.actions.Node
+        Ready-to-use ``greenwave_monitor`` node launch action.
+
+    """
+    params = {'gw_time_check_preset': time_check_preset}
+    if monitored_topics:
+        params['gw_monitored_topics'] = monitored_topics
+    if frequency_monitored_topics:
+        params['gw_frequency_monitored_topics'] = frequency_monitored_topics
+    if extra_params:
+        params.update(extra_params)
+
+    return launch_ros.actions.Node(
+        package='greenwave_monitor',
+        executable='greenwave_monitor',
+        name=name,
+        output='screen',
         parameters=[params],
     )
 
@@ -196,7 +369,7 @@ def create_fault_manager_node(
 # ---------------------------------------------------------------------------
 
 def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True,
-                      extra_env=None):
+                      extra_env=None, namespace=None):
     """Create demo node launch actions.
 
     Parameters
@@ -213,6 +386,9 @@ def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True,
         Additional environment variables merged into each node's
         ``additional_env``. Useful for setting ``ROS_DOMAIN_ID`` to
         isolate nodes into a specific DDS domain.
+    namespace : str or None
+        Namespace for every node in ``nodes``, in place of the one in
+        ``DEMO_NODE_REGISTRY``. ``None`` keeps the registry's.
 
     Returns
     -------
@@ -228,22 +404,28 @@ def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True,
     if nodes is None:
         nodes = ALL_DEMO_NODES
 
-    env = dict(get_coverage_env() if coverage else {})
+    # Demo executables are built in ros2_medkit_integration_tests, so route
+    # their .gcda there instead of polluting the gateway build dir.
+    env = dict(get_coverage_env('ros2_medkit_integration_tests') if coverage else {})
     if extra_env:
         env.update(extra_env)
     actions = []
 
     for key in nodes:
-        executable, ros_name, namespace = DEMO_NODE_REGISTRY[key]
+        executable, ros_name, registry_namespace = DEMO_NODE_REGISTRY[key]
 
-        node_kwargs = dict(
-            package='ros2_medkit_integration_tests',
-            executable=executable,
-            name=ros_name,
-            namespace=namespace,
-            output='screen',
-            additional_env=env,
-        )
+        node_kwargs = {
+            'package': 'ros2_medkit_integration_tests',
+            'executable': executable,
+            'name': ros_name,
+            'namespace': namespace if namespace is not None else registry_namespace,
+            'output': 'screen',
+            'additional_env': env,
+            # Give the node room to flush coverage data at shutdown before
+            # SIGKILL, matching the gateway/fault_manager helpers.
+            'sigterm_timeout': '30',
+            'sigkill_timeout': '15',
+        }
 
         # Apply faulty parameters for lidar_sensor
         if key == 'lidar_sensor' and lidar_faulty:
@@ -256,6 +438,68 @@ def create_demo_nodes(nodes=None, *, lidar_faulty=True, coverage=True,
         actions.append(launch_ros.actions.Node(**node_kwargs))
 
     return actions
+
+
+# ---------------------------------------------------------------------------
+# Gateway parameter presets
+# ---------------------------------------------------------------------------
+
+def graph_provider_params():
+    """Gateway parameters that load the graph provider plugin.
+
+    The only in-tree plugin that exports ``describe_plugin_routes``, so it is
+    what any test about plugin-served routes appearing in the OpenAPI document
+    has to load. Its ``.so`` path is resolved here, in one place, rather than
+    at each fixture.
+
+    Returns
+    -------
+    dict
+        Parameter overrides for ``create_gateway_node(extra_params=...)``.
+
+    """
+    graph_plugin = os.path.join(
+        get_package_prefix('ros2_medkit_graph_provider'), 'lib',
+        'ros2_medkit_graph_provider', 'libros2_medkit_graph_provider_plugin.so')
+    return {
+        'plugins': ['graph_provider'],
+        'plugins.graph_provider.path': graph_plugin,
+    }
+
+
+def full_feature_gateway_params(scripts_dir):
+    """Gateway parameters that turn on every optional feature gate.
+
+    The OpenAPI contract test asserts over the maximal route surface, so
+    scripts, updates, triggers, locking and the graph provider plugin must all
+    be live. Without this the gated routes are absent and assertions about them
+    pass vacuously.
+
+    Authentication is deliberately NOT enabled here. The document a gateway
+    serves describes that gateway, so the per-operation ``security`` a plugin
+    declares is stripped while ``auth.enabled`` is false - which makes this
+    fixture the auth-off half of that pair. The auth-on half is
+    ``test_auth.test.py``.
+
+    Parameters
+    ----------
+    scripts_dir : str
+        Directory for uploaded diagnostic scripts. A non-empty value is what
+        enables the scripts feature.
+
+    Returns
+    -------
+    dict
+        Parameter overrides for ``create_test_launch(gateway_params=...)``.
+
+    """
+    return {
+        'updates.enabled': True,
+        'scripts.scripts_dir': scripts_dir,
+        'triggers.enabled': True,
+        'locking.enabled': True,
+        **graph_provider_params(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +544,8 @@ def create_test_launch(
     tuple[LaunchDescription, dict]
         ``(launch_description, context_dict)`` tuple expected by
         ``launch_testing``. ``context_dict`` maps ``'gateway_node'`` to the
-        gateway ``Node`` action.
+        gateway ``Node`` action and, when one is launched,
+        ``'fault_manager_node'`` to the fault manager's.
 
     """
     gateway_node = create_gateway_node(
@@ -313,10 +558,11 @@ def create_test_launch(
         lidar_faulty=lidar_faulty,
     )
 
+    context = {'gateway_node': gateway_node}
     if fault_manager:
-        delayed_actions.append(
-            create_fault_manager_node(extra_params=fault_manager_params)
-        )
+        fault_manager_node = create_fault_manager_node(extra_params=fault_manager_params)
+        delayed_actions.append(fault_manager_node)
+        context['fault_manager_node'] = fault_manager_node
 
     delayed = TimerAction(
         period=demo_delay,
@@ -331,5 +577,5 @@ def create_test_launch(
 
     return (
         launch_description,
-        {'gateway_node': gateway_node},
+        context,
     )
