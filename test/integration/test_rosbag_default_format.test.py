@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2025 mfaferek93
+# Copyright 2026 bburda
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Integration tests for rosbag capture feature (Issue #120)."""
+"""
+What an operator who configured nothing actually gets on disk.
+
+test_rosbag_integration.test.py sets `snapshots.rosbag.format` explicitly and
+pins it. This launches the fault manager WITHOUT that parameter, so the
+struct/parameter default is what is under test, not an operator's choice.
+"""
 
 import os
 import tempfile
@@ -22,13 +28,15 @@ import unittest
 
 from launch import LaunchDescription
 import launch.actions
+import launch.event_handlers
 import launch_ros.actions
 import launch_testing.actions
-import launch_testing.markers
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from ros2_medkit_msgs.msg import Fault
-from ros2_medkit_msgs.srv import ClearFault, GetRosbag, ReportFault
+from ros2_medkit_msgs.srv import GetRosbag, ReportFault
+from sensor_msgs.msg import Temperature
 
 
 def get_coverage_env():
@@ -51,7 +59,7 @@ def get_coverage_env():
 
 
 # Create a temp directory for rosbag storage that persists for test duration
-ROSBAG_STORAGE_PATH = tempfile.mkdtemp(prefix='rosbag_test_')
+ROSBAG_STORAGE_PATH = tempfile.mkdtemp(prefix='rosbag_default_format_test_')
 
 # Path to temp publisher script (set in generate_test_description, cleaned up in shutdown test)
 PUBLISHER_SCRIPT_PATH = None
@@ -129,10 +137,11 @@ if __name__ == '__main__':
     script_file.close()
     PUBLISHER_SCRIPT_PATH = script_file.name
 
-    # Use explicit ROS settings to ensure processes can discover each other
+    # Inherit the ROS_DOMAIN_ID the domain wrapper allocated for this test, so
+    # it is isolated from everything else running in parallel.
+    # ROS_LOCALHOST_ONLY keeps discovery on loopback.
     env = os.environ.copy()
-    env['ROS_DOMAIN_ID'] = '42'
-    env['ROS_LOCALHOST_ONLY'] = '1'  # Force localhost-only discovery
+    env['ROS_LOCALHOST_ONLY'] = '1'
 
     test_publisher = launch.actions.ExecuteProcess(
         cmd=['python3', script_file.name],
@@ -142,7 +151,6 @@ if __name__ == '__main__':
     )
 
     fault_manager_env = get_coverage_env()
-    fault_manager_env['ROS_DOMAIN_ID'] = '42'
     fault_manager_env['ROS_LOCALHOST_ONLY'] = '1'
 
     fault_manager_node = launch_ros.actions.Node(
@@ -154,13 +162,13 @@ if __name__ == '__main__':
         parameters=[{
             'storage_type': 'memory',
             'confirmation_threshold': -1,  # Single report confirms immediately
-            # Rosbag configuration
+            # Rosbag configuration. Deliberately no 'snapshots.rosbag.format' here:
+            # the default is what this test verifies.
             'snapshots.rosbag.enabled': True,
             'snapshots.rosbag.duration_sec': 2.0,  # 2 second buffer
             'snapshots.rosbag.duration_after_sec': 0.5,  # 0.5 second after confirm
             # Use explicit topics - faster than discovery, more reliable for tests
             'snapshots.rosbag.topics': '/test/temperature,/test/status',
-            'snapshots.rosbag.format': 'mcap',
             'snapshots.rosbag.storage_path': ROSBAG_STORAGE_PATH,
             'snapshots.rosbag.max_bag_size_mb': 10,
             'snapshots.rosbag.max_total_storage_mb': 50,
@@ -168,13 +176,31 @@ if __name__ == '__main__':
             # lazy_start=false: Start recording immediately
             'snapshots.rosbag.lazy_start': False,
         }],
+        # Give the node room to flush coverage data at shutdown before SIGKILL.
+        sigterm_timeout='30',
+        sigkill_timeout='15',
     )
 
     # Delay fault_manager start so test_publisher has time to register topics
     # DDS discovery can take several seconds to propagate topic types
-    delayed_fault_manager = launch.actions.TimerAction(
-        period=8.0,
-        actions=[fault_manager_node],
+    # Start fault_manager once test_publisher has announced its topics. The fault
+    # manager retries topic discovery for 10 s after it starts and then gives up, so
+    # a fixed start delay leaves it without subscriptions when the publisher
+    # process takes longer than that to come up.
+    publisher_up = {'seen': False}
+
+    def start_fault_manager_when_publisher_up(event):
+        if publisher_up['seen'] or b'TestPublisher started' not in event.text:
+            return None
+        publisher_up['seen'] = True
+        return [fault_manager_node]
+
+    start_after_publisher = launch.actions.RegisterEventHandler(
+        launch.event_handlers.OnProcessIO(
+            target_action=test_publisher,
+            on_stdout=start_fault_manager_when_publisher_up,
+            on_stderr=start_fault_manager_when_publisher_up,
+        )
     )
 
     return (
@@ -182,7 +208,7 @@ if __name__ == '__main__':
             # Start publisher node first
             test_publisher,
             # Start fault_manager after delay
-            delayed_fault_manager,
+            start_after_publisher,
             launch_testing.actions.ReadyToTest(),
         ]),
         {
@@ -192,39 +218,73 @@ if __name__ == '__main__':
     )
 
 
-class TestRosbagCaptureIntegration(unittest.TestCase):
-    """Integration tests for rosbag capture feature (@verifies REQ_INTEROP_088)."""
+# Budget for the whole precondition (node start and readiness), from the start of
+# setUpClass. The ctest TIMEOUT is 150 s; this leaves room for the publisher wait, the
+# buffer fill, the tests and the teardown.
+PRECONDITION_BUDGET_SEC = 70.0
+# Time kept for the readiness wait once the node exists.
+READINESS_MIN_SEC = 10.0
+
+
+class TestRosbagDefaultFormat(unittest.TestCase):
+    """A fault manager launched with no format parameter (@verifies REQ_INTEROP_088)."""
 
     @classmethod
     def setUpClass(cls):
         """Initialize ROS 2 context and create service clients."""
-        # Use same ROS settings as launch processes to ensure discovery
-        os.environ['ROS_DOMAIN_ID'] = '42'
+        # Match the launch processes: inherit the CMake-injected
+        # ROS_DOMAIN_ID and keep discovery on loopback.
         os.environ['ROS_LOCALHOST_ONLY'] = '1'
         rclpy.init()
-        cls.node = Node('test_rosbag_client')
+        cls.node = Node('test_rosbag_default_format_client')
 
         # Create service clients
         cls.report_fault_client = cls.node.create_client(
             ReportFault, '/fault_manager/report_fault'
         )
-        cls.clear_fault_client = cls.node.create_client(
-            ClearFault, '/fault_manager/clear_fault'
-        )
         cls.get_rosbag_client = cls.node.create_client(
             GetRosbag, '/fault_manager/get_rosbag'
         )
 
-        # Wait for services to be available
-        assert cls.report_fault_client.wait_for_service(timeout_sec=15.0), \
-            'report_fault service not available'
-        assert cls.clear_fault_client.wait_for_service(timeout_sec=15.0), \
-            'clear_fault service not available'
-        assert cls.get_rosbag_client.wait_for_service(timeout_sec=15.0), \
-            'get_rosbag service not available'
+        # Precondition: the fault manager is up, serves its services and holds
+        # subscriptions on both topics. Without them a recording holds only the
+        # post-fault window. It starts only after the publisher process is up,
+        # which can take long on a loaded machine, so first wait for the node
+        # and then give it time to bring its services and subscriptions up.
+        started = time.time()
 
-        # Give time for rosbag capture to fill buffer with messages from
-        # background publishers (duration_sec=2.0 configured)
+        def node_is_up():
+            return any(name == 'fault_manager'
+                       for name, _ in cls.node.get_node_names_and_namespaces())
+
+        deadline = started + PRECONDITION_BUDGET_SEC - READINESS_MIN_SEC
+        while not node_is_up() and time.time() < deadline:
+            time.sleep(0.2)
+        assert node_is_up(), 'fault_manager node did not start (publisher too slow?)'
+        clients = {'report_fault': cls.report_fault_client, 'get_rosbag': cls.get_rosbag_client}
+        # At least 10 s once the node exists, at most 25 s, inside the budget.
+        now = time.time()
+        deadline = min(now + 25.0, started + PRECONDITION_BUDGET_SEC)
+        missing = []
+        while time.time() < deadline:
+            missing = [f'service {name}' for name, client in clients.items()
+                       if not client.service_is_ready()]
+            missing += [f'subscription on {topic}'
+                        for topic in ('/test/temperature', '/test/status')
+                        if not any(info.node_name == 'fault_manager'
+                                   for info in cls.node.get_subscriptions_info_by_topic(topic))]
+            if not missing:
+                break
+            time.sleep(0.2)
+        assert not missing, 'fault_manager not ready: ' + ', '.join(missing)
+
+        # Wait for the background publisher to come up before letting the rosbag
+        # ring buffer fill (duration_sec=2.0 configured), so a slow publisher
+        # start does not leave the buffer empty.
+        deadline = time.time() + 15.0
+        while (not cls.node.get_publishers_info_by_topic('/test/temperature')
+               and time.time() < deadline):
+            time.sleep(0.2)
         time.sleep(3.0)
 
     @classmethod
@@ -250,166 +310,85 @@ class TestRosbagCaptureIntegration(unittest.TestCase):
         request.source_id = '/test_node'
         return self._call_service(self.report_fault_client, request)
 
-    def test_01_rosbag_created_on_fault_confirmation(self):
-        """Test that rosbag file is created when fault is confirmed."""
-        fault_code = 'ROSBAG_TEST_001'
+    def _wait_for_rosbag(self, fault_code, timeout=12.0):
+        """
+        Poll GetRosbag until the async post-fault recording is written.
 
-        # Report fault - buffer should already have messages from background publishers
-        response = self._report_fault(fault_code, 'Rosbag integration test fault')
+        The recording plus its post-fault flush (duration_after_sec) can take
+        longer than a fixed sleep under sanitizer/coverage load, so a one-shot
+        call flakes. Mirror the polling loop in test_rosbag_entity_scope.
+        """
+        request = GetRosbag.Request()
+        request.fault_code = fault_code
+        deadline = time.time() + timeout
+        response = self._call_service(self.get_rosbag_client, request)
+        while time.time() < deadline:
+            if response is not None and response.success:
+                return response
+            time.sleep(0.5)
+            response = self._call_service(self.get_rosbag_client, request)
+        return response
+
+    def _wait_for_buffered_data(self, count=5, timeout=8.0):
+        """
+        Wait until the rosbag ring buffer holds fresh data before a confirmation.
+
+        Mirror of the same helper in test_rosbag_integration.test.py: subscribe to
+        the same source the fault manager records and wait for messages to arrive,
+        rather than sleeping a fixed amount.
+        """
+        received = 0
+
+        def _cb(_msg):
+            nonlocal received
+            received += 1
+
+        # Match the publisher's BEST_EFFORT sensor QoS, else no messages arrive.
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+        )
+        sub = self.node.create_subscription(Temperature, '/test/temperature', _cb, qos)
+        try:
+            deadline = time.time() + timeout
+            while received < count and time.time() < deadline:
+                rclpy.spin_once(self.node, timeout_sec=0.1)
+        finally:
+            self.node.destroy_subscription(sub)
+        return received >= count
+
+    def test_01_default_format_is_mcap(self):
+        """
+        A fault manager launched with no format parameter writes an mcap bag.
+
+        The unit case pins the struct default; this pins what an operator who
+        configured nothing actually gets on disk, which is the thing the docs
+        and the README promise.
+        """
+        fault_code = 'DEFAULT_FORMAT_TEST'
+
+        # Buffer should already have messages from background publishers.
+        self.assertTrue(self._wait_for_buffered_data(),
+                        'ring buffer never refilled after startup')
+        response = self._report_fault(fault_code, 'Default rosbag format test fault')
         self.assertTrue(response.accepted)
-        print(f'Fault {fault_code} reported and confirmed')
 
-        # Wait for post-fault recording to complete
-        time.sleep(1.0)  # duration_after_sec=0.5 + buffer
-
-        # Query rosbag info
-        rosbag_request = GetRosbag.Request()
-        rosbag_request.fault_code = fault_code
-
-        rosbag_response = self._call_service(self.get_rosbag_client, rosbag_request)
-
+        # Poll until the async post-fault recording is written.
+        rosbag_response = self._wait_for_rosbag(fault_code)
         self.assertTrue(rosbag_response.success,
                         f'GetRosbag failed: {rosbag_response.error_message}')
-        self.assertGreater(len(rosbag_response.file_path), 0)
         self.assertEqual(rosbag_response.format, 'mcap')
-        self.assertGreater(rosbag_response.duration_sec, 0)
-        self.assertGreater(rosbag_response.size_bytes, 0)
 
-        # Verify file exists
-        self.assertTrue(os.path.exists(rosbag_response.file_path),
-                        f'Rosbag file not found: {rosbag_response.file_path}')
-
-        print(f'Rosbag created: {rosbag_response.file_path}')
-        print(f'  Duration: {rosbag_response.duration_sec:.2f}s')
-        print(f'  Size: {rosbag_response.size_bytes} bytes')
-        print(f'  Format: {rosbag_response.format}')
-
-    def test_02_rosbag_auto_cleanup_on_clear(self):
-        """Test that rosbag file is deleted when fault is cleared (auto_cleanup=true)."""
-        fault_code = 'ROSBAG_CLEANUP_TEST'
-
-        # Report fault - buffer has messages from background publishers
-        response = self._report_fault(fault_code, 'Cleanup test fault')
-        self.assertTrue(response.accepted)
-
-        # Wait for post-fault recording
-        time.sleep(1.0)
-
-        # Verify rosbag exists
-        rosbag_request = GetRosbag.Request()
-        rosbag_request.fault_code = fault_code
-        rosbag_response = self._call_service(self.get_rosbag_client, rosbag_request)
-
-        self.assertTrue(rosbag_response.success)
-        bag_path = rosbag_response.file_path
-        self.assertTrue(os.path.exists(bag_path))
-        print(f'Rosbag exists before clear: {bag_path}')
-
-        # Clear the fault
-        clear_request = ClearFault.Request()
-        clear_request.fault_code = fault_code
-
-        clear_response = self._call_service(self.clear_fault_client, clear_request)
-        self.assertTrue(clear_response.success)
-        print('Fault cleared')
-
-        # Small delay for cleanup
-        time.sleep(0.5)
-
-        # Verify rosbag is deleted
-        self.assertFalse(os.path.exists(bag_path),
-                         f'Rosbag should be deleted but still exists: {bag_path}')
-        print('Rosbag auto-deleted on clear')
-
-        # GetRosbag should now fail
-        rosbag_response2 = self._call_service(self.get_rosbag_client, rosbag_request)
-        self.assertFalse(rosbag_response2.success)
-        print(f'GetRosbag after clear: {rosbag_response2.error_message}')
-
-    def test_03_get_rosbag_nonexistent_fault(self):
-        """Test GetRosbag returns error for nonexistent fault."""
-        request = GetRosbag.Request()
-        request.fault_code = 'NONEXISTENT_ROSBAG_FAULT'
-
-        response = self._call_service(self.get_rosbag_client, request)
-
-        self.assertFalse(response.success)
-        self.assertIn('not found', response.error_message.lower())
-        print(f'Nonexistent fault error: {response.error_message}')
-
-    def test_04_get_rosbag_empty_fault_code(self):
-        """Test GetRosbag returns error for empty fault code."""
-        request = GetRosbag.Request()
-        request.fault_code = ''
-
-        response = self._call_service(self.get_rosbag_client, request)
-
-        self.assertFalse(response.success)
-        self.assertIn('empty', response.error_message.lower())
-        print(f'Empty fault code error: {response.error_message}')
-
-    def test_05_multiple_faults_separate_bags(self):
-        """Test that multiple faults create separate rosbag files."""
-        fault_codes = ['MULTI_BAG_A', 'MULTI_BAG_B']
-        bag_paths = []
-
-        # Report multiple faults - buffer has messages from background publishers
-        for fault_code in fault_codes:
-            response = self._report_fault(fault_code, f'Multi-bag test: {fault_code}')
-            self.assertTrue(response.accepted)
-            time.sleep(1.0)  # Wait for post-fault recording
-
-        # Verify each fault has its own rosbag
-        for fault_code in fault_codes:
-            rosbag_request = GetRosbag.Request()
-            rosbag_request.fault_code = fault_code
-
-            rosbag_response = self._call_service(self.get_rosbag_client, rosbag_request)
-
-            self.assertTrue(rosbag_response.success,
-                            f'GetRosbag failed for {fault_code}: {rosbag_response.error_message}')
-            self.assertTrue(os.path.exists(rosbag_response.file_path))
-            bag_paths.append(rosbag_response.file_path)
-            print(f'Rosbag for {fault_code}: {rosbag_response.file_path}')
-
-        # Verify bags are different files
-        self.assertNotEqual(bag_paths[0], bag_paths[1])
-        print('Multiple faults have separate rosbag files')
-
-    def test_06_rosbag_contains_recorded_duration(self):
-        """Test that rosbag duration approximately matches configuration."""
-        fault_code = 'DURATION_TEST'
-
-        # Report fault - buffer should have ~duration_sec worth of messages
-        response = self._report_fault(fault_code, 'Duration test fault')
-        self.assertTrue(response.accepted)
-
-        # Wait for post-fault recording (duration_after_sec=0.5)
-        time.sleep(1.0)
-
-        # Get rosbag info
-        rosbag_request = GetRosbag.Request()
-        rosbag_request.fault_code = fault_code
-
-        rosbag_response = self._call_service(self.get_rosbag_client, rosbag_request)
-
-        self.assertTrue(rosbag_response.success)
-
-        # Duration should be approximately duration_sec + duration_after_sec
-        # Allow some tolerance for timing
-        expected_min = 1.5  # At least some data
-        expected_max = 4.0  # Upper bound with tolerance
-        self.assertGreaterEqual(rosbag_response.duration_sec, expected_min,
-                                f'Duration too short: {rosbag_response.duration_sec}')
-        self.assertLessEqual(rosbag_response.duration_sec, expected_max,
-                             f'Duration too long: {rosbag_response.duration_sec}')
-
-        print(f'Rosbag duration: {rosbag_response.duration_sec:.2f}s '
-              f'(expected: ~2.5s with tolerance)')
+        contents = os.listdir(rosbag_response.file_path)
+        self.assertTrue(
+            any(name.endswith('.mcap') for name in contents),
+            f'no .mcap file in the bag written with the default format: {contents}',
+        )
 
 
 @launch_testing.post_shutdown_test()
-class TestRosbagCaptureShutdown(unittest.TestCase):
+class TestRosbagDefaultFormatShutdown(unittest.TestCase):
     """Post-shutdown tests."""
 
     def test_exit_code(self, proc_info):
