@@ -22,8 +22,11 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "rclcpp/rclcpp.hpp"
 #include "ros2_medkit_fault_manager/fault_storage.hpp"
+#include "ros2_medkit_fault_manager/pending_topic_watcher.hpp"
 
 namespace ros2_medkit_fault_manager {
 
@@ -62,9 +65,13 @@ struct RosbagConfig {
   /// If false (default), ring buffer runs continuously from startup
   bool lazy_start{false};
 
-  /// Storage format: "sqlite3" (default, always shipped with rosbag2) or "mcap"
-  /// (opt-in; needs rosbag2_storage_mcap, falls back to sqlite3 if unavailable).
-  std::string format{"sqlite3"};
+  /// Storage format: "mcap" (default; what Foxglove and Lichtblick open directly)
+  /// or "sqlite3" (also what an unknown format string lands on). Neither is
+  /// privileged over the other: whichever is configured, an unavailable plugin
+  /// falls back automatically to the other one, and capture disables itself
+  /// only if neither loads. Both plugins are runtime dependencies of this
+  /// package.
+  std::string format{"mcap"};
 
   /// Path to store bag files (empty = system temp directory)
   std::string storage_path;
@@ -81,6 +88,12 @@ struct RosbagConfig {
   /// Subscribe with each topic's publisher-offered QoS for faithful capture
   /// (reliable/transient-local where offered) instead of forcing best-effort
   bool qos_match{true};
+
+  /// Recordings retained per fault code (0 = unlimited, bounded only by
+  /// max_total_storage_mb). Keep-newest: past the cap the fault's OLDEST recording
+  /// loses its row, and the bag goes once no fault references it. 1 reproduces the
+  /// pre-#620 behaviour, where a re-confirm replaced the previous recording.
+  size_t max_bags_per_fault{1};
 
   /// If true, delete bag file when fault is cleared
   bool auto_cleanup{true};
@@ -112,6 +125,12 @@ struct SnapshotConfig {
 
   /// Default topics to capture if no specific or pattern match
   std::vector<std::string> default_topics;
+
+  /// Zero-config fallback when NO explicit config matches a fault code: capture
+  /// the topics published by the fault's reporting source node(s) instead of
+  /// skipping the capture entirely. Explicit config (fault_specific / patterns /
+  /// default_topics) always wins when present.
+  bool entity_default{true};
 
   /// Rosbag recording configuration (optional)
   RosbagConfig rosbag;
@@ -147,6 +166,14 @@ class SnapshotCapture {
   SnapshotCapture & operator=(SnapshotCapture &&) = delete;
 
   /// Capture snapshots for a fault that was just confirmed
+  ///
+  /// If the fault code resolves to no capture set (not in fault_specific, no pattern
+  /// match, no default_topics), the entity-default fallback (when enabled) captures
+  /// the reporting source node's own published topics instead. A code explicitly
+  /// listed in fault_specific or matched by a pattern never falls through - a
+  /// present-but-empty topic list is a per-fault opt-out. Only when nothing
+  /// resolves does capture return early: no freeze_frames row is written
+  /// (no empty {} row) and FaultStorage::get_freeze_frame() returns nullopt for it.
   /// @param fault_code The fault code that was confirmed
   void capture(const std::string & fault_code);
 
@@ -163,18 +190,41 @@ class SnapshotCapture {
  private:
   /// Resolve which topics to capture for a given fault code
   /// Priority: fault_specific > patterns > default_topics
-  std::vector<std::string> resolve_topics(const std::string & fault_code) const;
+  /// @param[out] explicit_match true when the code hit fault_specific or a
+  ///             pattern (even with an empty list - an explicit opt-out) or
+  ///             default_topics applied; such codes never fall through to the
+  ///             entity-default capture.
+  std::vector<std::string> resolve_topics(const std::string & fault_code, bool & explicit_match) const;
+
+  /// Entity-default fallback: topics published by the fault's reporting source
+  /// node(s), excluding per-node noise (/rosout, /parameter_events). Non-FQN
+  /// sources (bare plugin entity ids - the gateway covers those) are skipped,
+  /// and empty is returned when no source resolves to a live node. Never
+  /// throws; any failure degrades to empty.
+  std::vector<std::string> resolve_entity_topics(const std::string & fault_code) const;
 
   /// Capture a single topic on-demand (creates temporary subscription)
+  /// On success also records the captured value into @p freeze_frame under the topic key.
   /// @return true if capture was successful
-  bool capture_topic_on_demand(const std::string & fault_code, const std::string & topic);
+  /// Appends to @p rows rather than storing: a capture is persisted as one set,
+  /// so the per-fault cap can drop a whole old capture instead of truncating this
+  /// one topic by topic.
+  bool capture_topic_on_demand(const std::string & fault_code, const std::string & topic, nlohmann::json & freeze_frame,
+                               std::vector<SnapshotData> & rows);
 
   /// Capture a topic from background cache
+  /// On success also records the cached value into @p freeze_frame under the topic key.
   /// @return true if data was available in cache
-  bool capture_topic_from_cache(const std::string & fault_code, const std::string & topic);
+  bool capture_topic_from_cache(const std::string & fault_code, const std::string & topic,
+                                nlohmann::json & freeze_frame, std::vector<SnapshotData> & rows);
 
   /// Initialize background subscriptions for all configured topics
   void init_background_subscriptions();
+
+  /// Create the background subscription for @p topic, whose type is known.
+  /// A failure is logged and not retried: asking again meets the same missing
+  /// type support.
+  void subscribe_background(const std::string & topic, const std::string & msg_type);
 
   /// Collect all unique topics from configuration
   std::vector<std::string> collect_all_configured_topics() const;
@@ -185,6 +235,21 @@ class SnapshotCapture {
   rclcpp::Node * node_;
   FaultStorage * storage_;
   SnapshotConfig config_;
+
+  /// Mints one id per capture, shared by every row of that capture.
+  ///
+  /// Seeded from the highest id in storage: the ids outlive the process on a
+  /// persistent backend, and eviction protects the HIGHEST id, so a counter that
+  /// restarts below what is already stored makes the freshly written capture the
+  /// first one dropped. Seeded at construction, or on the first capture when the
+  /// store could not answer then; no capture runs unseeded.
+  std::atomic<int64_t> capture_seq_{0};
+
+  /// Seed capture_seq_ from storage once. False while the store is unreachable.
+  bool seed_capture_seq();
+
+  std::atomic<bool> capture_seq_seeded_{false};
+  std::mutex capture_seq_seed_mutex_;
 
   /// Compiled regex patterns (cached for performance)
   std::vector<std::pair<std::regex, std::vector<std::string>>> compiled_patterns_;
@@ -198,8 +263,15 @@ class SnapshotCapture {
   /// not thread-safe for concurrent entity creation.
   std::mutex node_ops_mutex_;
 
-  /// Background subscriptions (kept alive for continuous caching)
+  /// Background subscriptions (kept alive for continuous caching). Appended by
+  /// the constructor and, for a topic that appears later, by the watcher on the
+  /// executor thread; never touched by the capture pool.
   std::vector<rclcpp::GenericSubscription::SharedPtr> background_subscriptions_;
+
+  /// Waits for the configured topics the graph had no type for at startup.
+  /// Null when there were none. Declared last so it goes before everything its
+  /// hand-over uses.
+  std::unique_ptr<PendingTopicWatcher> background_topic_watcher_;
 };
 
 }  // namespace ros2_medkit_fault_manager

@@ -18,6 +18,12 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
+#include <unordered_set>
+
+#include "ros2_medkit_gateway/core/discovery/identity_merge.hpp"
+#include "ros2_medkit_gateway/core/discovery/manifest/asset_inventory.hpp"
 
 namespace ros2_medkit_gateway {
 namespace discovery {
@@ -44,6 +50,12 @@ bool ManifestManager::load_manifest(const std::string & file_path, bool strict) 
       // regular validation step so the full error set is reported.
     }
 
+    // Append manually inventoried assets (CSV) on top of the manifest. Errors
+    // are recorded in validation_result_ and surface in the regular flow.
+    if (!apply_inventory_csv(loaded)) {
+      // apply_inventory_csv already recorded the error; fall through.
+    }
+
     // Validate the merged manifest.
     auto merge_errors = std::move(validation_result_);
     validation_result_ = validator_.validate(loaded);
@@ -54,6 +66,7 @@ bool ManifestManager::load_manifest(const std::string & file_path, bool strict) 
     for (auto & warn : merge_errors.warnings) {
       validation_result_.warnings.push_back(std::move(warn));
     }
+    merge_parse_notices(loaded, file_path);
 
     // Always fail on ERRORs (broken references, circular deps, duplicate bindings)
     // These indicate a fundamentally broken manifest that would cause runtime issues
@@ -75,6 +88,7 @@ bool ManifestManager::load_manifest(const std::string & file_path, bool strict) 
     }
 
     manifest_ = std::move(loaded);
+    cached_config_.store(manifest_->config);
     build_lookup_maps();
 
     auto msg = "Manifest loaded successfully: " + std::to_string(manifest_->areas.size()) + " areas, " +
@@ -102,6 +116,7 @@ bool ManifestManager::load_manifest_from_string(const std::string & yaml_content
   try {
     Manifest loaded = parser_.parse_string(yaml_content);
     validation_result_ = validator_.validate(loaded);
+    merge_parse_notices(loaded, "<string>");
 
     // Always fail on ERRORs (broken references, circular deps, duplicate bindings)
     if (validation_result_.has_errors()) {
@@ -122,6 +137,7 @@ bool ManifestManager::load_manifest_from_string(const std::string & yaml_content
     }
 
     manifest_ = std::move(loaded);
+    cached_config_.store(manifest_->config);
     build_lookup_maps();
     return true;
 
@@ -129,6 +145,24 @@ bool ManifestManager::load_manifest_from_string(const std::string & yaml_content
     log_error("Failed to parse manifest: " + std::string(e.what()));
     validation_result_.add_error("LOAD", e.what(), "<string>");
     return false;
+  }
+}
+
+void ManifestManager::merge_parse_notices(const Manifest & loaded, const std::string & source_path) {
+  for (const auto & notice : loaded.log_notices) {
+    // Log-only notices describe the manifest FILE, not this particular load,
+    // so they are emitted once per distinct message rather than once per load.
+    // A plugin that calls notify_entities_changed re-reads the manifest, and
+    // without this a deprecated key would reprint its notice on every refresh
+    // for the life of the process. Validation notices below are rebuilt each
+    // time on purpose: they are the current validation state, which callers
+    // read back through get_validation_result().
+    if (logged_notices_.insert(notice).second) {
+      log_warn(notice);
+    }
+  }
+  for (const auto & notice : loaded.validation_notices) {
+    validation_result_.add_warning(notice.rule_id, notice.message, source_path);
   }
 }
 
@@ -147,6 +181,10 @@ bool ManifestManager::reload_manifest() {
     old_manifest = std::move(manifest_);
     old_strict_mode = strict_mode_;
     manifest_.reset();
+    // cached_config_ deliberately keeps the OLD value across the reload
+    // window. The pipeline is still running the old policy until the reload
+    // completes, so reporting it is accurate; blanking it to defaults would
+    // make /health briefly describe a configuration nothing is using.
   }
 
   std::string path_to_reload = manifest_path_;
@@ -155,6 +193,7 @@ bool ManifestManager::reload_manifest() {
     // Restore old manifest on failure
     std::lock_guard<std::mutex> lock(mutex_);
     manifest_ = std::move(old_manifest);
+    cached_config_.store(manifest_ ? manifest_->config : ManifestConfig{});
     log_warn("Manifest reload failed, keeping previous version");
     return false;
   }
@@ -167,6 +206,7 @@ void ManifestManager::unload_manifest() {
   std::lock_guard<std::mutex> lock(mutex_);
 
   manifest_.reset();
+  cached_config_.store(ManifestConfig{});
   manifest_path_.clear();
   validation_result_ = ValidationResult{};
   area_index_.clear();
@@ -201,11 +241,9 @@ std::optional<ManifestMetadata> ManifestManager::get_metadata() const {
 }
 
 ManifestConfig ManifestManager::get_config() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (manifest_) {
-    return manifest_->config;
-  }
-  return ManifestConfig{};
+  // Deliberately lock-free: see cached_config_. Taking mutex_ here would put
+  // the liveness path behind a full manifest load.
+  return cached_config_.load();
 }
 
 std::unordered_map<std::string, ManifestLockConfig> ManifestManager::get_lock_overrides() const {
@@ -476,6 +514,121 @@ std::string ManifestManager::get_fragments_dir() const {
   return fragments_dir_;
 }
 
+void ManifestManager::set_inventory_csv_path(const std::string & path) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  inventory_csv_path_ = path;
+}
+
+std::string ManifestManager::get_inventory_csv_path() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return inventory_csv_path_;
+}
+
+bool ManifestManager::apply_inventory_csv(Manifest & base) {
+  // Called with mutex_ held by the caller.
+  if (inventory_csv_path_.empty()) {
+    return true;
+  }
+
+  std::filesystem::path csv_path(inventory_csv_path_);
+  std::error_code ec;
+  if (!std::filesystem::exists(csv_path, ec)) {
+    // A missing file is "no inventory", not an error - mirrors fragments_dir.
+    log_warn("Inventory CSV not found (skipping): " + inventory_csv_path_);
+    return true;
+  }
+
+  // Cap file size before reading to bound worst-case allocation on a
+  // misconfigured path (e.g., a symlink to a huge log file).
+  auto size = std::filesystem::file_size(csv_path, ec);
+  if (ec) {
+    validation_result_.add_error("INVENTORY_CSV", "cannot stat inventory CSV: " + ec.message(), inventory_csv_path_);
+    log_error("Cannot stat inventory CSV '" + inventory_csv_path_ + "': " + ec.message());
+    return false;
+  }
+  if (size > ManifestParser::kMaxFragmentBytes) {
+    validation_result_.add_error("INVENTORY_CSV",
+                                 "inventory CSV exceeds " + std::to_string(ManifestParser::kMaxFragmentBytes) +
+                                     "-byte limit (size=" + std::to_string(size) + ")",
+                                 inventory_csv_path_);
+    log_error("Inventory CSV '" + inventory_csv_path_ + "' exceeds size limit");
+    return false;
+  }
+
+  std::ifstream file(csv_path);
+  if (!file.is_open()) {
+    validation_result_.add_error("INVENTORY_CSV", "cannot open inventory CSV", inventory_csv_path_);
+    log_error("Cannot open inventory CSV: " + inventory_csv_path_);
+    return false;
+  }
+  std::stringstream buffer;
+  buffer << file.rdbuf();
+
+  try {
+    auto parsed = parse_asset_csv(buffer.str());
+    for (const auto & warn : parsed.warnings) {
+      log_warn("Inventory CSV: " + warn);
+    }
+
+    // Collision policy: a CSV row never fails the load (the CSV is a bulk
+    // import; one bad line must not take the gateway down) and never beats the
+    // operator-authored manifest. Duplicate ids within the CSV were already
+    // reduced to the first row by parse_asset_csv. An id already defined as a
+    // manifest component keeps the manifest definition; the CSV identity is
+    // folded in as gap-fill ("inventory" ranks below "manifest"). An id
+    // colliding with any other entity kind, or an unknown `area`, is dropped
+    // with a warning so the merged manifest still passes R002-R012 / R006.
+    std::unordered_set<std::string> area_ids;
+    std::unordered_set<std::string> non_component_ids;
+    for (const auto & area : base.areas) {
+      area_ids.insert(area.id);
+      non_component_ids.insert(area.id);
+    }
+    for (const auto & app : base.apps) {
+      non_component_ids.insert(app.id);
+    }
+    for (const auto & func : base.functions) {
+      non_component_ids.insert(func.id);
+    }
+    for (const auto & script : base.scripts) {
+      non_component_ids.insert(script.id);
+    }
+
+    std::size_t added = 0;
+    for (const auto & entry : parsed.entries) {
+      Component comp = asset_entry_to_component(entry);
+      if (!comp.area.empty() && area_ids.count(comp.area) == 0) {
+        log_warn("Inventory CSV: asset '" + comp.id + "' references unknown area '" + comp.area +
+                 "' (placement dropped, asset kept)");
+        comp.area.clear();
+      }
+      auto existing = std::find_if(base.components.begin(), base.components.end(), [&](const Component & c) {
+        return c.id == comp.id;
+      });
+      if (existing != base.components.end()) {
+        stamp_identity_provenance(existing->identity, existing->source);
+        merge_identity(existing->identity, comp.identity, "inventory", IdentityMergeConfig{});
+        log_warn("Inventory CSV: id '" + comp.id +
+                 "' is already defined in the manifest; manifest wins, CSV identity folded as gap-fill");
+        continue;
+      }
+      if (non_component_ids.count(comp.id) != 0) {
+        log_warn("Inventory CSV: id '" + comp.id + "' collides with a non-component manifest entity (row skipped)");
+        continue;
+      }
+      base.components.push_back(std::move(comp));
+      ++added;
+    }
+    log_info("Inventory CSV loaded: " + std::to_string(added) + " assets from " + inventory_csv_path_);
+  } catch (const std::exception & e) {
+    validation_result_.add_error("INVENTORY_CSV", e.what(), inventory_csv_path_);
+    log_error("Failed to parse inventory CSV '" + inventory_csv_path_ + "': " + e.what());
+    return false;
+  }
+
+  return true;
+}
+
 bool ManifestManager::apply_fragments(Manifest & base) {
   // Called with mutex_ held by the caller.
   if (fragments_dir_.empty()) {
@@ -561,8 +714,12 @@ bool ManifestManager::apply_fragments(Manifest & base) {
     // be detected by the struct checks. manifest_version is auto-injected by
     // parse_fragment_file when the fragment omits it, so we do not inspect it
     // here - fragments are free to declare or omit it.
+    // Both spellings of the discovery-configuration block are forbidden: a
+    // fragment that could declare configuration under either one would have it
+    // silently dropped by the merge below, which is the same class of bug one
+    // level down.
     static constexpr const char * kForbiddenKeys[] = {
-        "areas", "metadata", "scripts", "capabilities", "lock_overrides", "discovery",
+        "areas", "metadata", "scripts", "capabilities", "lock_overrides", "config", "discovery",
     };
     static constexpr const char * kAllowedKeys[] = {
         "apps",
