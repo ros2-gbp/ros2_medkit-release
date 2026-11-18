@@ -2,6 +2,19 @@
 Changelog for package ros2_medkit_msgs
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.7.1 (2026-11-18)
+------------------
+* ``Snapshot``, ``GetRosbag`` and ``ListRosbags`` define a recording's size as the sum of the storage files its metadata names. For a split recording that is more than the first file the download serves. The fields are unchanged (`#679 <https://github.com/selfpatch/ros2_medkit/pull/679>`_)
+* Contributors: @bburda
+
+0.7.0 (2026-08-27)
+------------------
+* ``GetRosbag.srv`` gains a ``recording_id`` request field (tried before ``fault_code`` and falling back to it when it names no recording, so a caller holding one identifier that may be either can set both; ``fault_code`` keeps its meaning of "the newest recording of this fault") and ``recording_id`` / ``fault_codes[]`` response fields. ``ListRosbags.srv`` gains a parallel ``recording_ids[]``. ``Snapshot.msg``'s ``bulk_data_id`` now carries a recording id for rosbag snapshots rather than the fault code; the field type is unchanged. Additive, but the service type hashes change, so the gateway and the fault manager must be deployed together (`#623 <https://github.com/selfpatch/ros2_medkit/pull/623>`_, `#620 <https://github.com/selfpatch/ros2_medkit/issues/620>`_)
+* ``last_passed`` is exposed on the fault wire, so a consumer can tell when the monitored condition was last observed healthy without inferring it from the status (`#573 <https://github.com/selfpatch/ros2_medkit/pull/573>`_)
+* Rosbag recordings are addressed by recording id rather than by fault code, so a fault holding several recordings can expose each one (`#623 <https://github.com/selfpatch/ros2_medkit/pull/623>`_)
+* The fault contract documentation now matches the implementation on three points that had drifted: ``occurrence_count`` is an edge counter that advances on a new fault and on every re-raise after CLEARED, ``first_occurred`` marks the start of the current occurrence rather than the first one ever, and healed clears and SSE loss accounting are described as the code implements them (`#618 <https://github.com/selfpatch/ros2_medkit/pull/618>`_)
+* Contributors: @bburda, @mfaferek93
+
 0.6.0 (2026-06-22)
 ------------------
 * No functional changes; version bump for the coordinated 0.6.0 release.
