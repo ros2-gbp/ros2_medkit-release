@@ -18,8 +18,11 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cinttypes>
 #include <cstdio>
 #include <functional>
+#include <limits>
+#include <vector>
 
 #include "action_msgs/msg/goal_status.hpp"
 #include "ros2_medkit_msgs/msg/fault.hpp"
@@ -37,6 +40,10 @@ constexpr size_t kMaxCodeLen = 64;
 constexpr size_t kMaxActionPart = 48;
 // Longest status suffix that may follow the action part, "_CANCELED".
 constexpr size_t kMaxStatusSuffix = 9;
+
+// How long a first report waits for the action server's node name to resolve
+// before it falls back to the action name as source.
+constexpr std::chrono::seconds kSourceResolveGrace{5};
 
 bool contains_substr(const std::vector<std::string> & list, const std::string & value) {
   for (const auto & item : list) {
@@ -69,19 +76,47 @@ bool describe_failure_is_cancel(const action_msgs::msg::GoalStatusArray & msg, b
   return saw_canceled;
 }
 
+// Runs a node callback unless the context is shut down. A graph or entity call
+// racing with shutdown throws; that ends the callback quietly.
+template <typename F>
+void run_unless_shutdown(F && fn) {
+  if (!rclcpp::ok()) {
+    return;
+  }
+  try {
+    fn();
+  } catch (const std::exception &) {
+    if (rclcpp::ok()) {
+      throw;
+    }
+  }
+}
+
 }  // namespace
 
 ActionStatusBridgeNode::ActionStatusBridgeNode(const rclcpp::NodeOptions & options)
   : Node("action_status_bridge", options) {
   load_parameters();
 
+  // Fast retry timer, created up front but kept disarmed (cancelled) until a
+  // report is actually deferred, so an idle bridge does no periodic work.
+  retry_timer_ = create_wall_timer(std::chrono::duration<double>(retry_period_sec_), [this]() {
+    run_unless_shutdown([this]() {
+      reconcile_pending();
+    });
+  });
+  retry_timer_->cancel();
+
   rescan_actions();
   rescan_timer_ = create_wall_timer(std::chrono::duration<double>(rescan_period_sec_), [this]() {
-    rescan_actions();
+    run_unless_shutdown([this]() {
+      rescan_actions();
+    });
   });
 
-  RCLCPP_INFO(get_logger(), "ActionStatusBridge started (prefix=%s, aborted_severity=%u, rescan=%.1fs)",
-              code_prefix_.c_str(), static_cast<unsigned>(aborted_severity_), rescan_period_sec_);
+  RCLCPP_INFO(get_logger(), "ActionStatusBridge started (prefix=%s, aborted_severity=%u, rescan=%.1fs, retry=%.0fms)",
+              code_prefix_.c_str(), static_cast<unsigned>(aborted_severity_), rescan_period_sec_,
+              retry_period_sec_ * 1000.0);
 }
 
 ActionStatusBridgeNode::~ActionStatusBridgeNode() {
@@ -91,15 +126,19 @@ ActionStatusBridgeNode::~ActionStatusBridgeNode() {
   // (subscription destructor pattern). subs_ is only mutated from the (now
   // stopped) rescan path, so no lock is needed here.
   rescan_timer_.reset();
+  retry_timer_.reset();
   subs_.clear();
 }
 
 void ActionStatusBridgeNode::load_parameters() {
-  const int aborted_severity =
-      static_cast<int>(declare_parameter<int>("aborted_severity", ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR));
+  // Read as int64 and checked before narrowing. A ROS parameter is an int64, so
+  // declaring this as int narrowed first and a value above INT_MAX wrapped back
+  // into [0,3] and was accepted in silence: 4294967298 becomes 2.
+  const int64_t aborted_severity =
+      declare_parameter<int64_t>("aborted_severity", ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR);
   if (aborted_severity < ros2_medkit_msgs::msg::Fault::SEVERITY_INFO ||
       aborted_severity > ros2_medkit_msgs::msg::Fault::SEVERITY_CRITICAL) {
-    RCLCPP_WARN(get_logger(), "aborted_severity %d out of range [0,3]; clamping to ERROR", aborted_severity);
+    RCLCPP_WARN(get_logger(), "aborted_severity %" PRId64 " out of range [0,3]; clamping to ERROR", aborted_severity);
     aborted_severity_ = ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR;
   } else {
     aborted_severity_ = static_cast<uint8_t>(aborted_severity);
@@ -113,6 +152,16 @@ void ActionStatusBridgeNode::load_parameters() {
     rescan_period_sec_ = 2.0;
   }
 
+  // Fast retry cadence for delivering reports deferred while the FaultManager
+  // service was undiscovered. Kept short (default 50 ms) so the FaultManager
+  // freeze-frame snapshot is taken as close to the event as the discovery floor
+  // allows; the timer is armed only while a delivery is pending.
+  retry_period_sec_ = declare_parameter<double>("retry_period_sec", 0.05);
+  if (retry_period_sec_ <= 0.0) {
+    RCLCPP_WARN(get_logger(), "retry_period_sec %.3f not positive; using 0.05", retry_period_sec_);
+    retry_period_sec_ = 0.05;
+  }
+
   code_prefix_ = to_upper_snake(declare_parameter<std::string>("code_prefix", "ACTION"), kMaxActionPart);
   if (code_prefix_.empty()) {
     RCLCPP_WARN(get_logger(), "code_prefix empty after normalization; using ACTION");
@@ -123,9 +172,10 @@ void ActionStatusBridgeNode::load_parameters() {
   include_only_actions_ =
       declare_parameter<std::vector<std::string>>("include_only_actions", std::vector<std::string>{});
 
-  const int dedup_capacity = static_cast<int>(declare_parameter<int>("dedup_capacity", 4096));
-  if (dedup_capacity <= 0) {
-    RCLCPP_WARN(get_logger(), "dedup_capacity %d not positive; using 4096", dedup_capacity);
+  // Same reason as aborted_severity: checked as int64, narrowed afterwards.
+  const int64_t dedup_capacity = declare_parameter<int64_t>("dedup_capacity", 4096);
+  if (dedup_capacity <= 0 || dedup_capacity > std::numeric_limits<int>::max()) {
+    RCLCPP_WARN(get_logger(), "dedup_capacity %" PRId64 " out of range; using 4096", dedup_capacity);
     logged_capacity_ = 4096;
   } else {
     logged_capacity_ = static_cast<size_t>(dedup_capacity);
@@ -180,7 +230,9 @@ void ActionStatusBridgeNode::rescan_actions() {
     auto sub = create_subscription<action_msgs::msg::GoalStatusArray>(
         topic, qos,
         [this, action_name](const action_msgs::msg::GoalStatusArray::ConstSharedPtr & msg) {
-          status_callback(action_name, msg);
+          run_unless_shutdown([&]() {
+            status_callback(action_name, msg);
+          });
         },
         sub_options);
     subs_.emplace(topic, sub);
@@ -188,6 +240,12 @@ void ActionStatusBridgeNode::rescan_actions() {
   }
 
   prune_vanished(present);
+
+  // Backstop the fast retry timer: re-attempt any deferred delivery and clean up
+  // healed-and-vanished actions on the (slow) rescan tick too, so a missed timer
+  // arming can never strand a pending report. The fast timer is what keeps the
+  // FaultManager freeze-frame contemporaneous; this is just belt-and-suspenders.
+  reconcile_pending();
 }
 
 void ActionStatusBridgeNode::prune_vanished(const std::map<std::string, std::string> & present_topics) {
@@ -209,20 +267,34 @@ void ActionStatusBridgeNode::prune_vanished(const std::map<std::string, std::str
       std::lock_guard<std::mutex> lock(reporters_mutex_);
       // If a still-failed action vanishes (e.g. Nav2 lifecycle deactivate), heal
       // its fault before forgetting it - otherwise the fault stays stuck active
-      // in the FaultManager and the bridge can no longer clear it.
+      // in the FaultManager and the bridge can no longer clear it. Gate the heal
+      // on service readiness: unlike a live heal, a vanished action cannot be
+      // retried (its state is dropped here), so if the FaultManager service is
+      // not discovered at this instant the heal cannot be delivered. Surface that
+      // narrow case with a warning instead of dropping it silently. See the
+      // delivery-latency note in the README.
       auto rit = reporters_.find(action_name);
       if (was_failed && heal_on_succeeded_ && rit != reporters_.end()) {
-        rit->second->report_passed(fault_code_for(action_name, false));
-        if (canceled_is_fault_) {
-          rit->second->report_passed(fault_code_for(action_name, true));
+        if (rit->second->is_service_ready()) {
+          rit->second->report_passed(fault_code_for(action_name, false));
+          if (canceled_is_fault_) {
+            rit->second->report_passed(fault_code_for(action_name, true));
+          }
+          RCLCPP_INFO(get_logger(), "Action '%s' vanished while failed; healed before dropping", action_name.c_str());
+        } else {
+          RCLCPP_WARN(get_logger(),
+                      "Action '%s' vanished while failed but FaultManager service is not ready; its heal could not be "
+                      "delivered and the fault may remain active",
+                      action_name.c_str());
         }
-        RCLCPP_INFO(get_logger(), "Action '%s' vanished while failed; healed before dropping", action_name.c_str());
       }
       reporters_.erase(action_name);
+      source_wait_since_.erase(action_name);
     }
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       last_reported_state_.erase(action_name);
+      desired_state_.erase(action_name);
     }
     RCLCPP_INFO(get_logger(), "Action '%s' vanished; dropped (topic %s)", action_name.c_str(), topic.c_str());
     it = subs_.erase(it);
@@ -249,56 +321,157 @@ ActionStatusBridgeNode::ActionState ActionStatusBridgeNode::derive_state(const a
 }
 
 ActionStatusBridgeNode::ActionState
-ActionStatusBridgeNode::apply_message(const std::string & action_name, const action_msgs::msg::GoalStatusArray & msg,
-                                      ros2_medkit_fault_reporter::FaultReporter * reporter) {
+ActionStatusBridgeNode::record_desired(const std::string & action_name, const action_msgs::msg::GoalStatusArray & msg) {
   const ActionState net = derive_state(msg, canceled_is_fault_);
   if (net == ActionState::kUnknown) {
     return ActionState::kUnknown;  // no terminal verdict in this message
   }
 
-  ActionState prev;
+  // Record the latest observed action-level state as the desired state, then
+  // reconcile it against what the FaultManager was last told. A SUCCEEDED while
+  // healing is disabled leaves the desired state untouched, so a prior failure
+  // stays failed (the no-heal contract).
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    auto it = last_reported_state_.find(action_name);
-    // Absent state is treated as healthy: a first SUCCEEDED must not heal a
-    // fault that was never raised.
-    prev = (it == last_reported_state_.end()) ? ActionState::kHealthy : it->second;
+    auto & desired = desired_state_[action_name];
+    if (net == ActionState::kFailed) {
+      desired.net = ActionState::kFailed;
+      desired.canceled = describe_failure_is_cancel(msg, canceled_is_fault_);
+    } else if (heal_on_succeeded_) {  // net == kHealthy
+      desired.net = ActionState::kHealthy;
+    }
+  }
+  return net;
+}
+
+ActionStatusBridgeNode::ActionState
+ActionStatusBridgeNode::apply_message(const std::string & action_name, const action_msgs::msg::GoalStatusArray & msg,
+                                      ros2_medkit_fault_reporter::FaultReporter * reporter) {
+  if (record_desired(action_name, msg) == ActionState::kUnknown) {
+    return ActionState::kUnknown;
   }
 
-  // Only the two real transitions act: raise on (not failed)->failed, heal on
-  // failed->(healthy). Everything else is a no-op.
-  if (net == ActionState::kFailed && prev != ActionState::kFailed) {
-    const bool canceled = describe_failure_is_cancel(msg, canceled_is_fault_);
+  const ActionState delivered = reconcile(action_name, reporter);
+  update_retry_timer();  // arm the fast retry if this could not be delivered yet
+  return delivered;
+}
+
+ActionStatusBridgeNode::ActionState
+ActionStatusBridgeNode::reconcile(const std::string & action_name,
+                                  ros2_medkit_fault_reporter::FaultReporter * reporter) {
+  // state_mutex_ is held across the gate, the report() call and the commit so a
+  // second caller (the status callback and the retry timer both reconcile)
+  // cannot pass the gate concurrently and double-report under a multi-threaded
+  // executor. report()/report_passed() are async (fire-and-forget), so the
+  // critical section stays short. Callers must NOT hold state_mutex_.
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
+  auto dit = desired_state_.find(action_name);
+  if (dit == desired_state_.end() || dit->second.net == ActionState::kUnknown) {
+    return ActionState::kUnknown;  // nothing desired yet
+  }
+  const DesiredState desired = dit->second;
+  auto rit = last_reported_state_.find(action_name);
+  // Absent reported state is treated as healthy: a first SUCCEEDED must not heal
+  // a fault that was never raised.
+  const ActionState reported = (rit == last_reported_state_.end()) ? ActionState::kHealthy : rit->second;
+
+  if (desired.net == reported) {
+    return ActionState::kUnknown;  // already in sync, nothing to report
+  }
+
+  // A real reporter can only deliver once the FaultManager service is
+  // discovered; until then keep the transition pending (the fast retry timer
+  // re-attempts it) instead of dropping it. A null reporter is the unit-test
+  // decision-only seam: delivery is a no-op that still commits the transition.
+  const bool deliverable = (reporter == nullptr) || reporter->is_service_ready();
+  if (!deliverable) {
+    RCLCPP_DEBUG(get_logger(), "FaultManager service not ready; deferring %s for action %s",
+                 desired.net == ActionState::kFailed ? "fault" : "heal", action_name.c_str());
+    return ActionState::kUnknown;
+  }
+
+  if (desired.net == ActionState::kFailed) {
     if (reporter != nullptr) {
-      const std::string code = fault_code_for(action_name, canceled);
+      const std::string code = fault_code_for(action_name, desired.canceled);
       reporter->report(code, aborted_severity_,
-                       std::string("Action ") + action_name + (canceled ? " canceled" : " aborted"));
+                       std::string("Action ") + action_name + (desired.canceled ? " canceled" : " aborted"));
       RCLCPP_INFO(get_logger(), "Action %s -> fault %s", action_name.c_str(), code.c_str());
     }
-    {
-      std::lock_guard<std::mutex> lock(state_mutex_);
-      last_reported_state_[action_name] = ActionState::kFailed;
-    }
+    last_reported_state_[action_name] = ActionState::kFailed;
     return ActionState::kFailed;
   }
 
-  if (net == ActionState::kHealthy && prev == ActionState::kFailed && heal_on_succeeded_) {
-    if (reporter != nullptr) {
-      // Heal both possible codes; only the one previously raised exists.
-      reporter->report_passed(fault_code_for(action_name, false));
-      if (canceled_is_fault_) {
-        reporter->report_passed(fault_code_for(action_name, true));
+  // desired.net == kHealthy, and healing was enabled when it was set.
+  if (reporter != nullptr) {
+    // Heal both possible codes; only the one previously raised exists.
+    reporter->report_passed(fault_code_for(action_name, false));
+    if (canceled_is_fault_) {
+      reporter->report_passed(fault_code_for(action_name, true));
+    }
+    RCLCPP_INFO(get_logger(), "Action %s healed", action_name.c_str());
+  }
+  last_reported_state_[action_name] = ActionState::kHealthy;
+  return ActionState::kHealthy;
+}
+
+void ActionStatusBridgeNode::reconcile_pending() {
+  // Collect actions whose desired state has not been delivered to the
+  // FaultManager, then reconcile each outside the lock (reconcile() takes
+  // state_mutex_ itself). reporter_for() is only called for actions with a real
+  // pending transition, so this never creates reporters speculatively.
+  std::vector<std::string> pending;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    for (const auto & [action_name, desired] : desired_state_) {
+      if (desired.net == ActionState::kUnknown) {
+        continue;
       }
-      RCLCPP_INFO(get_logger(), "Action %s healed", action_name.c_str());
+      auto rit = last_reported_state_.find(action_name);
+      const ActionState reported = (rit == last_reported_state_.end()) ? ActionState::kHealthy : rit->second;
+      if (desired.net != reported) {
+        pending.push_back(action_name);
+      }
     }
-    {
-      std::lock_guard<std::mutex> lock(state_mutex_);
-      last_reported_state_[action_name] = ActionState::kHealthy;
+  }
+  for (const auto & action_name : pending) {
+    if (source_pending(action_name)) {
+      continue;  // the retry timer stays armed and tries again
     }
-    return ActionState::kHealthy;
+    reconcile(action_name, reporter_for(action_name));
   }
 
-  return ActionState::kUnknown;
+  update_retry_timer();
+}
+
+void ActionStatusBridgeNode::update_retry_timer() {
+  if (!retry_timer_) {
+    return;
+  }
+  bool any_pending = false;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    for (const auto & [action_name, desired] : desired_state_) {
+      if (desired.net == ActionState::kUnknown) {
+        continue;
+      }
+      auto rit = last_reported_state_.find(action_name);
+      const ActionState reported = (rit == last_reported_state_.end()) ? ActionState::kHealthy : rit->second;
+      if (desired.net != reported) {
+        any_pending = true;
+        break;
+      }
+    }
+  }
+  // Arm only on the no-pending -> pending edge so an already-running timer is not
+  // restarted (which would push out its next fire); disarm once drained.
+  if (any_pending) {
+    if (retry_timer_->is_canceled()) {
+      retry_timer_->reset();
+    }
+  } else {
+    retry_timer_->cancel();
+  }
 }
 
 void ActionStatusBridgeNode::status_callback(const std::string & action_name,
@@ -326,7 +499,28 @@ void ActionStatusBridgeNode::status_callback(const std::string & action_name,
   // valid for this call - prune_vanished() only erases reporters_ from that same
   // thread, never concurrently. This invariant must hold if a multi-threaded
   // executor is ever introduced.
+  if (source_pending(action_name)) {
+    record_desired(action_name, *msg);
+    update_retry_timer();
+    return;
+  }
   apply_message(action_name, *msg, reporter_for(action_name));
+}
+
+bool ActionStatusBridgeNode::source_pending(const std::string & action_name) {
+  {
+    std::lock_guard<std::mutex> lock(reporters_mutex_);
+    if (reporters_.find(action_name) != reporters_.end()) {
+      return false;
+    }
+  }
+  if (!server_fqn_for_action(action_name).empty()) {
+    return false;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lock(reporters_mutex_);
+  const auto since = source_wait_since_.emplace(action_name, now).first->second;
+  return now - since < kSourceResolveGrace;
 }
 
 ros2_medkit_fault_reporter::FaultReporter * ActionStatusBridgeNode::reporter_for(const std::string & action_name) {
@@ -351,6 +545,7 @@ ros2_medkit_fault_reporter::FaultReporter * ActionStatusBridgeNode::reporter_for
   auto reporter = std::make_unique<ros2_medkit_fault_reporter::FaultReporter>(this->shared_from_this(), source_id);
   auto * raw = reporter.get();
   reporters_[action_name] = std::move(reporter);
+  source_wait_since_.erase(action_name);
   return raw;
 }
 
@@ -503,6 +698,38 @@ bool ActionStatusBridgeTestAccess::is_watched(const std::string & action_name) c
 bool ActionStatusBridgeTestAccess::has_state(const std::string & action_name) const {
   std::lock_guard<std::mutex> lock(node_->state_mutex_);
   return node_->last_reported_state_.find(action_name) != node_->last_reported_state_.end();
+}
+
+bool ActionStatusBridgeTestAccess::reported_failed(const std::string & action_name) const {
+  std::lock_guard<std::mutex> lock(node_->state_mutex_);
+  auto it = node_->last_reported_state_.find(action_name);
+  return it != node_->last_reported_state_.end() && it->second == ActionStatusBridgeNode::ActionState::kFailed;
+}
+
+bool ActionStatusBridgeTestAccess::pending_failed(const std::string & action_name) const {
+  std::lock_guard<std::mutex> lock(node_->state_mutex_);
+  auto dit = node_->desired_state_.find(action_name);
+  if (dit == node_->desired_state_.end() || dit->second.net != ActionStatusBridgeNode::ActionState::kFailed) {
+    return false;
+  }
+  auto rit = node_->last_reported_state_.find(action_name);
+  const auto reported =
+      (rit == node_->last_reported_state_.end()) ? ActionStatusBridgeNode::ActionState::kHealthy : rit->second;
+  return reported != ActionStatusBridgeNode::ActionState::kFailed;
+}
+
+ros2_medkit_fault_reporter::FaultReporter *
+ActionStatusBridgeTestAccess::reporter_for(const std::string & action_name) {
+  return node_->reporter_for(action_name);
+}
+
+void ActionStatusBridgeTestAccess::run_reconcile_pending() {
+  node_->reconcile_pending();
+}
+
+ActionStatusBridgeNode::ActionState
+ActionStatusBridgeTestAccess::reconcile_deliverable(const std::string & action_name) {
+  return node_->reconcile(action_name, nullptr);
 }
 
 const void * ActionStatusBridgeTestAccess::reporter_identity(const std::string & action_name) {
