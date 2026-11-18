@@ -32,6 +32,7 @@
 
 #include "ros2_medkit_gateway/core/discovery/models/function.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
 #include "ros2_medkit_gateway/fault_manager_paths.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 
@@ -112,7 +113,7 @@ class TestGatewayNode : public ::testing::Test {
     const std::string health_endpoint = std::string(API_BASE_PATH) + "/health";
 
     while (std::chrono::steady_clock::now() - start < timeout) {
-      if (auto res = client.Get((health_endpoint).c_str())) {
+      if (auto res = client.Get(health_endpoint)) {
         if (res->status == 200) {
           return;
         }
@@ -220,7 +221,7 @@ apps:
 TEST_F(TestGatewayNode, test_health_endpoint) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/health").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/health");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -236,7 +237,7 @@ TEST_F(TestGatewayNode, test_root_endpoint) {
   // @verifies REQ_INTEROP_010
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -273,16 +274,50 @@ TEST_F(TestGatewayNode, test_fault_manager_namespace_configures_event_subscriber
   // Verify the REST API is functional with the namespaced fault manager.
   // The health endpoint works regardless of fault manager namespace.
   auto client = create_client();
-  auto res = client.Get((std::string(API_BASE_PATH) + "/health").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/health");
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
+}
+
+// `service_call_timeout_sec` is the whole cancel budget since the 15s floor
+// was removed (issue #576), yet it was declared with no bounds at all: 0 and
+// negatives were accepted silently (a cancel wait of 0 ms) and an absurd
+// value would pin an HTTP worker for as long as it says. Sweep the documented
+// range's endpoints and both degenerate directions, and observe the budget
+// the gateway actually applies rather than the value that was configured.
+TEST_F(TestGatewayNode, test_service_call_timeout_sec_is_clamped_to_the_documented_range) {
+  const std::pair<int64_t, int> cases[] = {
+      {0, 1},        // degenerate: no budget at all -> floor
+      {-5, 1},       // negative -> floor
+      {1, 1},        // range floor, accepted as-is
+      {10, 10},      // default, accepted as-is
+      {3600, 3600},  // range ceiling, accepted as-is
+      {100000, 3600}
+      // above the ceiling -> ceiling
+  };
+
+  for (const auto & [configured, expected] : cases) {
+    SCOPED_TRACE("service_call_timeout_sec=" + std::to_string(configured));
+    node_.reset();
+
+    int free_port = reserve_free_port();
+    ASSERT_NE(free_port, 0) << "Failed to reserve a free port for test";
+    create_node_with_overrides({
+        rclcpp::Parameter("server.port", free_port),
+        rclcpp::Parameter("service_call_timeout_sec", configured),
+    });
+
+    auto * operation_mgr = node_->get_operation_manager();
+    ASSERT_NE(operation_mgr, nullptr);
+    EXPECT_EQ(operation_mgr->service_call_timeout_sec(), expected);
+  }
 }
 
 TEST_F(TestGatewayNode, test_version_info_endpoint) {
   // @verifies REQ_INTEROP_001
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/version-info").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/version-info");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -307,7 +342,7 @@ TEST_F(TestGatewayNode, test_list_areas_endpoint) {
   // @verifies REQ_INTEROP_003
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/areas").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/areas");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -323,7 +358,7 @@ TEST_F(TestGatewayNode, test_list_components_endpoint) {
   // @verifies REQ_INTEROP_003
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -338,7 +373,7 @@ TEST_F(TestGatewayNode, test_list_components_endpoint) {
 TEST_F(TestGatewayNode, test_nonexistent_endpoint_404) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/nonexistent/path").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/nonexistent/path");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -349,7 +384,7 @@ TEST_F(TestGatewayNode, test_invalid_area_id_bad_request) {
 
   // Test with special characters that should be rejected
   // Note: URL-encoded slash (%2F) is decoded by server, but @#$ characters are invalid
-  auto res = client.Get((std::string(API_BASE_PATH) + "/areas/test@invalid").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/areas/test@invalid");
 
   ASSERT_TRUE(res);
   // Should return 400 for invalid entity ID with special characters
@@ -359,7 +394,7 @@ TEST_F(TestGatewayNode, test_invalid_area_id_bad_request) {
 TEST_F(TestGatewayNode, test_nonexistent_area_404) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/areas/nonexistent_area").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/areas/nonexistent_area");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -368,7 +403,7 @@ TEST_F(TestGatewayNode, test_nonexistent_area_404) {
 TEST_F(TestGatewayNode, test_nonexistent_component_404) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components/nonexistent_component").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/nonexistent_component");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -378,7 +413,7 @@ TEST_F(TestGatewayNode, test_invalid_component_id_bad_request) {
   auto client = create_client();
 
   // Test with special characters that are invalid
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components/test@invalid#id").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/test@invalid#id");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
@@ -391,7 +426,7 @@ TEST_F(TestGatewayNode, test_invalid_component_id_bad_request) {
 TEST_F(TestGatewayNode, test_list_apps_endpoint) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/apps").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/apps");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -406,7 +441,7 @@ TEST_F(TestGatewayNode, test_list_apps_endpoint) {
 TEST_F(TestGatewayNode, test_list_functions_endpoint) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/functions").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/functions");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -421,7 +456,7 @@ TEST_F(TestGatewayNode, test_options_request_for_cors) {
   auto client = create_client();
 
   // OPTIONS request for CORS preflight
-  auto res = client.Options((std::string(API_BASE_PATH) + "/components").c_str());
+  auto res = client.Options(std::string(API_BASE_PATH) + "/components");
 
   ASSERT_TRUE(res);
   // Without CORS configured, server may return various success codes or 404
@@ -432,7 +467,7 @@ TEST_F(TestGatewayNode, test_options_request_for_cors) {
 TEST_F(TestGatewayNode, test_component_data_nonexistent_component) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components/nonexistent_component/data").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/nonexistent_component/data");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -441,7 +476,7 @@ TEST_F(TestGatewayNode, test_component_data_nonexistent_component) {
 TEST_F(TestGatewayNode, test_component_operations_nonexistent_component) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components/nonexistent_component/operations").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/nonexistent_component/operations");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -450,7 +485,7 @@ TEST_F(TestGatewayNode, test_component_operations_nonexistent_component) {
 TEST_F(TestGatewayNode, test_component_configurations_nonexistent_component) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components/nonexistent_component/configurations").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/nonexistent_component/configurations");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -459,7 +494,7 @@ TEST_F(TestGatewayNode, test_component_configurations_nonexistent_component) {
 TEST_F(TestGatewayNode, test_component_faults_nonexistent_component) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components/nonexistent_component/faults").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/nonexistent_component/faults");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -472,7 +507,7 @@ TEST_F(TestGatewayNode, test_component_faults_nonexistent_component) {
 TEST_F(TestGatewayNode, test_root_endpoint_contains_api_base_path) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/");
 
   ASSERT_TRUE(res);
   auto json_response = nlohmann::json::parse(res->body);
@@ -484,7 +519,7 @@ TEST_F(TestGatewayNode, test_root_endpoint_contains_api_base_path) {
 TEST_F(TestGatewayNode, test_root_endpoint_lists_all_capabilities) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/");
 
   ASSERT_TRUE(res);
   auto json_response = nlohmann::json::parse(res->body);
@@ -500,7 +535,7 @@ TEST_F(TestGatewayNode, test_root_endpoint_lists_all_capabilities) {
 TEST_F(TestGatewayNode, test_area_components_nonexistent_area) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/areas/nonexistent_area/components").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/areas/nonexistent_area/components");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -509,7 +544,7 @@ TEST_F(TestGatewayNode, test_area_components_nonexistent_area) {
 TEST_F(TestGatewayNode, test_area_subareas_nonexistent_area) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/areas/nonexistent_area/subareas").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/areas/nonexistent_area/subareas");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -518,7 +553,7 @@ TEST_F(TestGatewayNode, test_area_subareas_nonexistent_area) {
 TEST_F(TestGatewayNode, test_post_to_nonexistent_operation) {
   auto client = create_client();
 
-  auto res = client.Post((std::string(API_BASE_PATH) + "/components/nonexistent/operations/do_something").c_str(), "",
+  auto res = client.Post(std::string(API_BASE_PATH) + "/components/nonexistent/operations/do_something", "",
                          "application/json");
 
   ASSERT_TRUE(res);
@@ -533,7 +568,7 @@ TEST_F(TestGatewayNode, test_set_configuration_invalid_json) {
   auto client = create_client();
 
   // POST with invalid JSON body
-  auto res = client.Put((std::string(API_BASE_PATH) + "/components/gateway_node/configurations/test_param").c_str(),
+  auto res = client.Put(std::string(API_BASE_PATH) + "/components/gateway_node/configurations/test_param",
                         "{ invalid json }", "application/json");
 
   ASSERT_TRUE(res);
@@ -548,7 +583,7 @@ TEST_F(TestGatewayNode, test_set_configuration_missing_value_field) {
   auto client = create_client();
 
   // POST with valid JSON but missing 'data' field
-  auto res = client.Put((std::string(API_BASE_PATH) + "/components/gateway_node/configurations/test_param").c_str(),
+  auto res = client.Put(std::string(API_BASE_PATH) + "/components/gateway_node/configurations/test_param",
                         R"({"name": "test_param"})", "application/json");
 
   ASSERT_TRUE(res);
@@ -565,8 +600,8 @@ TEST_F(TestGatewayNode, test_set_configuration_missing_value_field) {
 TEST_F(TestGatewayNode, test_set_configuration_invalid_component_id) {
   auto client = create_client();
 
-  auto res = client.Put((std::string(API_BASE_PATH) + "/components/invalid@id/configurations/param").c_str(),
-                        R"({"value": 42})", "application/json");
+  auto res = client.Put(std::string(API_BASE_PATH) + "/components/invalid@id/configurations/param", R"({"value": 42})",
+                        "application/json");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
@@ -575,8 +610,7 @@ TEST_F(TestGatewayNode, test_set_configuration_invalid_component_id) {
 TEST_F(TestGatewayNode, test_get_configuration_nonexistent_component) {
   auto client = create_client();
 
-  auto res =
-      client.Get((std::string(API_BASE_PATH) + "/components/nonexistent_comp/configurations/some_param").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/nonexistent_comp/configurations/some_param");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -585,8 +619,7 @@ TEST_F(TestGatewayNode, test_get_configuration_nonexistent_component) {
 TEST_F(TestGatewayNode, test_delete_configuration_nonexistent_component) {
   auto client = create_client();
 
-  auto res =
-      client.Delete((std::string(API_BASE_PATH) + "/components/nonexistent_comp/configurations/some_param").c_str());
+  auto res = client.Delete(std::string(API_BASE_PATH) + "/components/nonexistent_comp/configurations/some_param");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -600,7 +633,7 @@ TEST_F(TestGatewayNode, test_post_operation_invalid_json_body) {
   auto client = create_client();
 
   // First we need a valid component - use the gateway_node itself
-  auto res = client.Post((std::string(API_BASE_PATH) + "/components/gateway_node/operations/some_service").c_str(),
+  auto res = client.Post(std::string(API_BASE_PATH) + "/components/gateway_node/operations/some_service",
                          "{ not valid json }", "application/json");
 
   ASSERT_TRUE(res);
@@ -611,9 +644,8 @@ TEST_F(TestGatewayNode, test_post_operation_invalid_json_body) {
 TEST_F(TestGatewayNode, test_post_operation_invalid_component_id) {
   auto client = create_client();
 
-  auto res =
-      client.Post((std::string(API_BASE_PATH) + "/components/invalid@component/operations/test/executions").c_str(),
-                  R"({})", "application/json");
+  auto res = client.Post(std::string(API_BASE_PATH) + "/components/invalid@component/operations/test/executions",
+                         R"({})", "application/json");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
@@ -622,9 +654,8 @@ TEST_F(TestGatewayNode, test_post_operation_invalid_component_id) {
 TEST_F(TestGatewayNode, test_post_operation_invalid_operation_id) {
   auto client = create_client();
 
-  auto res =
-      client.Post((std::string(API_BASE_PATH) + "/components/gateway_node/operations/invalid@op/executions").c_str(),
-                  R"({})", "application/json");
+  auto res = client.Post(std::string(API_BASE_PATH) + "/components/gateway_node/operations/invalid@op/executions",
+                         R"({})", "application/json");
 
   ASSERT_TRUE(res);
   // 400 for invalid operation name or 404 if component not found
@@ -634,8 +665,7 @@ TEST_F(TestGatewayNode, test_post_operation_invalid_operation_id) {
 TEST_F(TestGatewayNode, test_execution_status_invalid_component_id) {
   auto client = create_client();
 
-  auto res =
-      client.Get((std::string(API_BASE_PATH) + "/components/invalid@id/operations/test/executions/some-id").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/invalid@id/operations/test/executions/some-id");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
@@ -645,8 +675,7 @@ TEST_F(TestGatewayNode, test_execution_cancel_invalid_component_id) {
   auto client = create_client();
 
   // Cancel with invalid component ID
-  auto res =
-      client.Delete((std::string(API_BASE_PATH) + "/components/invalid@id/operations/test/executions/some-id").c_str());
+  auto res = client.Delete(std::string(API_BASE_PATH) + "/components/invalid@id/operations/test/executions/some-id");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
@@ -658,7 +687,7 @@ TEST_F(TestGatewayNode, test_execution_not_found) {
   // Get execution status for non-existent execution
   const std::string path =
       std::string(API_BASE_PATH) + "/components/gateway_node/operations/test/executions/nonexistent-id";
-  auto res = client.Get((path).c_str());
+  auto res = client.Get(path);
 
   ASSERT_TRUE(res);
   // Should be 404 for not found execution
@@ -670,9 +699,8 @@ TEST_F(TestGatewayNode, test_execution_update_invalid_component_id) {
   auto client = create_client();
 
   // PUT with invalid component ID
-  auto res =
-      client.Put((std::string(API_BASE_PATH) + "/components/invalid@id/operations/test/executions/some-id").c_str(),
-                 R"({"capability": "stop"})", "application/json");
+  auto res = client.Put(std::string(API_BASE_PATH) + "/components/invalid@id/operations/test/executions/some-id",
+                        R"({"capability": "stop"})", "application/json");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
@@ -683,9 +711,8 @@ TEST_F(TestGatewayNode, test_execution_update_missing_capability) {
   auto client = create_client();
 
   // PUT without capability field
-  auto res =
-      client.Put((std::string(API_BASE_PATH) + "/components/gateway_node/operations/test/executions/some-id").c_str(),
-                 R"({"timeout": 60})", "application/json");
+  auto res = client.Put(std::string(API_BASE_PATH) + "/components/gateway_node/operations/test/executions/some-id",
+                        R"({"timeout": 60})", "application/json");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
@@ -696,9 +723,8 @@ TEST_F(TestGatewayNode, test_execution_update_unsupported_capability) {
   auto client = create_client();
 
   // PUT with unsupported capability (freeze is I/O control specific)
-  auto res =
-      client.Put((std::string(API_BASE_PATH) + "/components/gateway_node/operations/test/executions/some-id").c_str(),
-                 R"({"capability": "freeze"})", "application/json");
+  auto res = client.Put(std::string(API_BASE_PATH) + "/components/gateway_node/operations/test/executions/some-id",
+                        R"({"capability": "freeze"})", "application/json");
 
   ASSERT_TRUE(res);
   // Either 400 for unsupported capability or 404 if execution not found
@@ -710,9 +736,8 @@ TEST_F(TestGatewayNode, test_execution_update_execution_not_found) {
   auto client = create_client();
 
   // PUT with stop capability for non-existent execution
-  auto res = client.Put(
-      (std::string(API_BASE_PATH) + "/components/gateway_node/operations/test/executions/nonexistent").c_str(),
-      R"({"capability": "stop"})", "application/json");
+  auto res = client.Put(std::string(API_BASE_PATH) + "/components/gateway_node/operations/test/executions/nonexistent",
+                        R"({"capability": "stop"})", "application/json");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -725,8 +750,8 @@ TEST_F(TestGatewayNode, test_execution_update_execution_not_found) {
 TEST_F(TestGatewayNode, test_publish_to_topic_invalid_json) {
   auto client = create_client();
 
-  auto res = client.Post((std::string(API_BASE_PATH) + "/components/gateway_node/data/some_topic").c_str(),
-                         "invalid{json}", "application/json");
+  auto res = client.Post(std::string(API_BASE_PATH) + "/components/gateway_node/data/some_topic", "invalid{json}",
+                         "application/json");
 
   ASSERT_TRUE(res);
   // 400 for invalid JSON or 404 if component not found
@@ -737,7 +762,7 @@ TEST_F(TestGatewayNode, test_publish_to_topic_missing_type_field) {
   auto client = create_client();
 
   // Missing 'type' field in request body
-  auto res = client.Post((std::string(API_BASE_PATH) + "/components/gateway_node/data/some_topic").c_str(),
+  auto res = client.Post(std::string(API_BASE_PATH) + "/components/gateway_node/data/some_topic",
                          R"({"data": {"value": 1.0}})", "application/json");
 
   ASSERT_TRUE(res);
@@ -749,7 +774,7 @@ TEST_F(TestGatewayNode, test_publish_to_topic_missing_data_field) {
   auto client = create_client();
 
   // Missing 'data' field in request body
-  auto res = client.Post((std::string(API_BASE_PATH) + "/components/gateway_node/data/some_topic").c_str(),
+  auto res = client.Post(std::string(API_BASE_PATH) + "/components/gateway_node/data/some_topic",
                          R"({"type": "std_msgs/msg/Float32"})", "application/json");
 
   ASSERT_TRUE(res);
@@ -761,7 +786,7 @@ TEST_F(TestGatewayNode, test_publish_to_topic_invalid_message_type_format) {
   auto client = create_client();
 
   // Invalid message type format (should be pkg/msg/Type)
-  auto res = client.Post((std::string(API_BASE_PATH) + "/components/gateway_node/data/some_topic").c_str(),
+  auto res = client.Post(std::string(API_BASE_PATH) + "/components/gateway_node/data/some_topic",
                          R"({"type": "invalid_type", "data": {}})", "application/json");
 
   ASSERT_TRUE(res);
@@ -776,7 +801,7 @@ TEST_F(TestGatewayNode, test_publish_to_topic_invalid_message_type_format) {
 TEST_F(TestGatewayNode, test_area_related_components_nonexistent) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/areas/nonexistent_area/related-components").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/areas/nonexistent_area/related-components");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -785,7 +810,7 @@ TEST_F(TestGatewayNode, test_area_related_components_nonexistent) {
 TEST_F(TestGatewayNode, test_component_subcomponents_nonexistent) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components/nonexistent_comp/subcomponents").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/nonexistent_comp/subcomponents");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -794,7 +819,7 @@ TEST_F(TestGatewayNode, test_component_subcomponents_nonexistent) {
 TEST_F(TestGatewayNode, test_component_related_apps_nonexistent) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components/nonexistent_comp/related-apps").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/nonexistent_comp/related-apps");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -804,7 +829,7 @@ TEST_F(TestGatewayNode, test_area_contains_nonexistent) {
   // @verifies REQ_INTEROP_006
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/areas/nonexistent_area/contains").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/areas/nonexistent_area/contains");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -814,7 +839,7 @@ TEST_F(TestGatewayNode, test_component_hosts_nonexistent) {
   // @verifies REQ_INTEROP_007
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/components/nonexistent_comp/hosts").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/components/nonexistent_comp/hosts");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -823,7 +848,7 @@ TEST_F(TestGatewayNode, test_component_hosts_nonexistent) {
 TEST_F(TestGatewayNode, test_app_nonexistent) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/apps/nonexistent_app").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/apps/nonexistent_app");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -832,7 +857,7 @@ TEST_F(TestGatewayNode, test_app_nonexistent) {
 TEST_F(TestGatewayNode, test_function_nonexistent) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/functions/nonexistent_function").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/functions/nonexistent_function");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -842,7 +867,7 @@ TEST_F(TestGatewayNode, test_function_detail_includes_cyclic_subscriptions_capab
   load_function_fixture("graph_func");
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/functions/graph_func").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/functions/graph_func");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -862,7 +887,7 @@ TEST_F(TestGatewayNode, test_function_detail_includes_cyclic_subscriptions_capab
 TEST_F(TestGatewayNode, test_function_hosts_nonexistent) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/functions/nonexistent_function/hosts").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/functions/nonexistent_function/hosts");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 404);
@@ -875,7 +900,7 @@ TEST_F(TestGatewayNode, test_function_hosts_nonexistent) {
 TEST_F(TestGatewayNode, test_invalid_app_id_bad_request) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/apps/invalid@app#id").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/apps/invalid@app#id");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
@@ -886,7 +911,7 @@ TEST_F(TestGatewayNode, test_app_is_located_on_endpoint) {
   load_app_location_fixture();
 
   auto client = create_client();
-  auto res = client.Get((std::string(API_BASE_PATH) + "/apps/planner/is-located-on").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/apps/planner/is-located-on");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 200);
@@ -902,10 +927,51 @@ TEST_F(TestGatewayNode, test_app_is_located_on_endpoint) {
 TEST_F(TestGatewayNode, test_invalid_function_id_bad_request) {
   auto client = create_client();
 
-  auto res = client.Get((std::string(API_BASE_PATH) + "/functions/invalid@func#id").c_str());
+  auto res = client.Get(std::string(API_BASE_PATH) + "/functions/invalid@func#id");
 
   ASSERT_TRUE(res);
   EXPECT_EQ(res->status, 400);
+}
+
+// =============================================================================
+// Secure-profile fail-closed tests (issue #477): when auth/TLS is explicitly
+// enabled but its configuration is invalid, the node must refuse to start
+// rather than silently fall back to an unauthenticated / plaintext server.
+// =============================================================================
+
+TEST_F(TestGatewayNode, auth_enabled_with_empty_secret_fails_closed) {
+  // auth.enabled=true with an empty HS256 secret: the AuthConfigBuilder rejects
+  // it, and the node must propagate that as a fatal (throw) instead of disabling
+  // auth and serving unauthenticated.
+  node_.reset();
+  int free_port = reserve_free_port();
+  ASSERT_NE(free_port, 0);
+
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+      rclcpp::Parameter("server.port", free_port),
+      rclcpp::Parameter("auth.enabled", true),
+      rclcpp::Parameter("auth.jwt_secret", std::string("")),
+      rclcpp::Parameter("auth.jwt_algorithm", std::string("HS256")),
+  });
+  EXPECT_THROW(std::make_shared<ros2_medkit_gateway::GatewayNode>(options), std::exception);
+}
+
+TEST_F(TestGatewayNode, tls_enabled_with_missing_cert_fails_closed) {
+  // server.tls.enabled=true with no cert/key: the TlsConfigBuilder rejects it,
+  // and the node must refuse to start in plaintext.
+  node_.reset();
+  int free_port = reserve_free_port();
+  ASSERT_NE(free_port, 0);
+
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+      rclcpp::Parameter("server.port", free_port),
+      rclcpp::Parameter("server.tls.enabled", true),
+      rclcpp::Parameter("server.tls.cert_file", std::string("")),
+      rclcpp::Parameter("server.tls.key_file", std::string("")),
+  });
+  EXPECT_THROW(std::make_shared<ros2_medkit_gateway::GatewayNode>(options), std::exception);
 }
 
 // =============================================================================
@@ -968,24 +1034,28 @@ TEST(ExtractEntityTypePath, unknown_routes) {
 
 TEST(GatewayStartupSummary, CountPeerNodesExcludesOwnAndHidden) {
   const std::vector<std::pair<std::string, std::string>> nodes = {
-      {"ros2_medkit_gateway", "/"},                // the gateway's own node (self)
-      {"ros2_medkit_gateway_sub", "/"},            // own internal helper (FQN prefix)
-      {"ros2_medkit_gateway_fault_clients", "/"},  // own internal helper (FQN prefix)
-      {"_hidden_node", "/"},                       // hidden node
-      {"camera", "/sensors"},                      // peer (hidden node name check is on the name part)
-      {"robot_planner", "/"},                      // peer
-      {"ros2_medkit_gateway_monitor", "/"},        // peer that merely shares the gateway name prefix
+      {"ros2_medkit_gateway", "/"},                 // the gateway's own node (self)
+      {"_ros2_medkit_gateway_sub", "/"},            // own helper node (hidden)
+      {"_ros2_medkit_gateway_fault_clients", "/"},  // own helper node (hidden)
+      {"_hidden_node", "/"},                        // hidden node
+      {"camera", "/sensors"},                       // peer (hidden node name check is on the name part)
+      {"robot_planner", "/"},                       // peer
+      {"ros2_medkit_gateway_monitor", "/"},         // peer that merely shares the gateway name prefix
   };
   // Three genuine peers: /sensors/camera, /robot_planner and the prefix-sharing
-  // /ros2_medkit_gateway_monitor (only the exact self FQN and known helpers drop out).
+  // /ros2_medkit_gateway_monitor (only the exact self FQN and hidden nodes drop out).
   EXPECT_EQ(ros2_medkit_gateway::GatewayNode::count_peer_nodes(nodes, "/ros2_medkit_gateway"), 3u);
 }
 
 TEST(GatewayStartupSummary, CountPeerNodesZeroWhenOnlyOwnNodes) {
+  // The gateway node plus every helper it creates inside its own process. A
+  // gateway alone on the graph must report zero peers, so each of these has to
+  // be recognized as not-a-peer, the lifecycle reader included.
   const std::vector<std::pair<std::string, std::string>> nodes = {
       {"ros2_medkit_gateway", "/"},
-      {"ros2_medkit_gateway_sub", "/"},
-      {"ros2_medkit_gateway_fault_clients", "/"},
+      {"_ros2_medkit_gateway_sub", "/"},
+      {"_ros2_medkit_gateway_fault_clients", "/"},
+      {"_ros2_medkit_gateway_lifecycle_state_reader", "/"},
   };
   // Zero peers is the condition that triggers the empty-graph warning.
   EXPECT_EQ(ros2_medkit_gateway::GatewayNode::count_peer_nodes(nodes, "/ros2_medkit_gateway"), 0u);
