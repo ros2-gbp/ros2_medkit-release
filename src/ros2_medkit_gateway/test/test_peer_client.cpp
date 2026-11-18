@@ -15,17 +15,28 @@
 #include <gtest/gtest.h>
 #include <httplib.h>
 
+#include <algorithm>
+#include <chrono>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <string>
+#include <vector>
 
+#include "ros2_medkit_gateway/core/aggregation/entity_merger.hpp"
 #include "ros2_medkit_gateway/core/aggregation/peer_client.hpp"
+#include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
+#include "ros2_medkit_gateway/test_support/refused_port.hpp"
 
 using namespace ros2_medkit_gateway;
 
-// Use a port that nothing listens on for connection-refused tests
-constexpr int DEAD_PORT = 59999;
-static const std::string DEAD_URL = "http://127.0.0.1:" + std::to_string(DEAD_PORT);
+// URL of a port that refuses every connection. The port stays bound and never listens for the
+// life of this test binary.
+static const std::string & dead_url() {
+  static const test_support::RefusedPort port;
+  static const std::string url = port.http_url();
+  return url;
+}
 
 // =============================================================================
 // Construction and basic accessor tests
@@ -39,7 +50,7 @@ TEST(PeerClient, constructs_with_url_and_name) {
 }
 
 TEST(PeerClient, initially_not_healthy) {
-  PeerClient client(DEAD_URL, "dead_peer", 500);
+  PeerClient client(dead_url(), "dead_peer", 500);
 
   EXPECT_FALSE(client.is_healthy());
 }
@@ -49,7 +60,7 @@ TEST(PeerClient, initially_not_healthy) {
 // =============================================================================
 
 TEST(PeerClient, health_check_marks_unhealthy_on_connection_refused) {
-  PeerClient client(DEAD_URL, "dead_peer", 200);
+  PeerClient client(dead_url(), "dead_peer", 200);
 
   // Should not throw, just mark unhealthy
   client.check_health();
@@ -62,7 +73,7 @@ TEST(PeerClient, health_check_marks_unhealthy_on_connection_refused) {
 
 // @verifies REQ_INTEROP_003
 TEST(PeerClient, forward_sets_502_on_connection_error) {
-  PeerClient client(DEAD_URL, "dead_peer", 200);
+  PeerClient client(dead_url(), "dead_peer", 200);
 
   httplib::Request req;
   req.method = "GET";
@@ -81,17 +92,102 @@ TEST(PeerClient, forward_sets_502_on_connection_error) {
 }
 
 // =============================================================================
+// classify_peer_error - the rule that separates a slow peer from a dead one
+// =============================================================================
+
+// cpp-httplib reports both "the read budget ran out" and "the connection broke
+// mid-answer" as Error::Read, so the error alone cannot tell them apart. These
+// pin the discriminator: the elapsed time against the budget.
+
+TEST(ClassifyPeerError, a_read_that_consumed_its_budget_is_a_timeout) {
+  EXPECT_EQ(classify_peer_error(httplib::Error::Read, std::chrono::milliseconds(2000), std::chrono::milliseconds(2000),
+                                std::chrono::milliseconds(1)),
+            PeerFailureKind::kTimeout);
+}
+
+TEST(ClassifyPeerError, a_read_that_broke_early_is_not_a_timeout) {
+  // The peer died with the answer half sent. Telling an operator to wait for
+  // it, or to raise a budget, points at the wrong box.
+  EXPECT_EQ(classify_peer_error(httplib::Error::Read, std::chrono::milliseconds(120), std::chrono::milliseconds(2000),
+                                std::chrono::milliseconds(1)),
+            PeerFailureKind::kUnreachable);
+}
+
+TEST(ClassifyPeerError, a_write_is_measured_against_the_WRITE_budget) {
+  // The write budget is its own and smaller than the read budget by default
+  // (5000 against 15000). Measured against the read budget, a write that ran
+  // out at its own limit looks like a peer that died, and the key whose whole
+  // purpose is bounding a slow upload could never report its own expiry.
+  EXPECT_EQ(classify_peer_error(httplib::Error::Write, std::chrono::milliseconds(5000),
+                                /*read_budget=*/std::chrono::milliseconds(15000),
+                                /*write_budget=*/std::chrono::milliseconds(5000)),
+            PeerFailureKind::kTimeout);
+  // Below its own budget it is still a broken connection, not a timeout.
+  EXPECT_EQ(classify_peer_error(httplib::Error::Write, std::chrono::milliseconds(120), std::chrono::milliseconds(15000),
+                                std::chrono::milliseconds(5000)),
+            PeerFailureKind::kUnreachable);
+}
+
+TEST(PeerBudgetFor, each_timeout_names_the_budget_that_bounds_it) {
+  // A connect timeout is bounded by the connect budget, not by the read budget
+  // the call was hoping to spend. Naming the wrong one tells an operator to
+  // raise a value that would not have changed the outcome.
+  EXPECT_EQ(peer_budget_for(httplib::Error::ConnectionTimeout), PeerBudget::kConnect);
+  EXPECT_EQ(peer_budget_for(httplib::Error::Read), PeerBudget::kRead);
+  EXPECT_EQ(peer_budget_for(httplib::Error::Write), PeerBudget::kWrite);
+  EXPECT_EQ(peer_budget_for(httplib::Error::Connection), PeerBudget::kNone);
+}
+
+TEST(ClassifyPeerError, a_connect_timeout_is_a_timeout_whatever_the_clock_says) {
+  // The connect budget is its own, and it is not the budget passed here, so
+  // the elapsed comparison must not get a vote.
+  EXPECT_EQ(classify_peer_error(httplib::Error::ConnectionTimeout, std::chrono::milliseconds(1),
+                                std::chrono::milliseconds(60000), std::chrono::milliseconds(1)),
+            PeerFailureKind::kTimeout);
+}
+
+TEST(ClassifyPeerError, a_refused_connection_is_unreachable_however_long_it_took) {
+  EXPECT_EQ(classify_peer_error(httplib::Error::Connection, std::chrono::milliseconds(9999),
+                                std::chrono::milliseconds(1000), std::chrono::milliseconds(1)),
+            PeerFailureKind::kUnreachable);
+}
+
+TEST(ClassifyPeerError, a_call_this_gateway_stopped_is_neither) {
+  EXPECT_EQ(classify_peer_error(httplib::Error::Canceled, std::chrono::milliseconds(9999),
+                                std::chrono::milliseconds(1000), std::chrono::milliseconds(1)),
+            PeerFailureKind::kCanceled);
+}
+
+TEST(PeerFailureReason, every_kind_has_a_distinct_wire_token) {
+  // The tokens are documented in docs/api/rest.rst and read by clients. Two
+  // kinds sharing one token would put the defect back: a client could not tell
+  // those two events apart, which is the whole of what this carries.
+  const PeerFailureKind kinds[] = {PeerFailureKind::kNone,           PeerFailureKind::kTimeout,
+                                   PeerFailureKind::kUnreachable,    PeerFailureKind::kCanceled,
+                                   PeerFailureKind::kErrorStatus,    PeerFailureKind::kTooLarge,
+                                   PeerFailureKind::kInvalidResponse};
+  std::set<std::string> tokens;
+  for (auto kind : kinds) {
+    tokens.insert(peer_failure_reason(kind));
+  }
+  EXPECT_EQ(tokens.size(), sizeof(kinds) / sizeof(kinds[0]));
+}
+
+// =============================================================================
 // forward_and_get_json tests (connection failure path)
 // =============================================================================
 
 TEST(PeerClient, forward_and_get_json_returns_error_on_connection_refused) {
-  PeerClient client(DEAD_URL, "dead_peer", 200);
+  PeerClient client(dead_url(), "dead_peer", 200);
 
   auto result = client.forward_and_get_json("GET", "/api/v1/health");
 
   ASSERT_FALSE(result.has_value());
-  EXPECT_TRUE(result.error().find("dead_peer") != std::string::npos);
-  EXPECT_TRUE(result.error().find("Failed to connect") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("dead_peer") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("Failed to reach peer") != std::string::npos);
+  // A refused connection is not a budget that ran out. The two get different
+  // HTTP statuses one layer up, so the kind carries as much as the text.
+  EXPECT_EQ(result.error().kind, PeerFailureKind::kUnreachable);
 }
 
 // =============================================================================
@@ -100,7 +196,7 @@ TEST(PeerClient, forward_and_get_json_returns_error_on_connection_refused) {
 
 // @verifies REQ_INTEROP_003
 TEST(PeerClient, fetch_entities_returns_error_on_connection_refused) {
-  PeerClient client(DEAD_URL, "dead_peer", 200);
+  PeerClient client(dead_url(), "dead_peer", 200);
 
   auto result = client.fetch_entities();
 
@@ -146,6 +242,8 @@ TEST(PeerClientHappyPath, health_check_marks_healthy) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   EXPECT_FALSE(client.is_healthy());
@@ -168,6 +266,8 @@ TEST(PeerClientHappyPath, health_check_unhealthy_on_500) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   client.check_health();
@@ -186,6 +286,10 @@ TEST(PeerClientHappyPath, fetch_entities_parses_collections) {
   svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
     res.set_content(R"({"items":[{"id":"ecu_1","name":"ECU 1"}]})", "application/json");
   });
+  // A peer that names a Component in its list describes it on the detail route.
+  svr.Get(R"(/api/v1/components/ecu_1)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu_1","name":"ECU 1"})", "application/json");
+  });
   svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
     res.set_content(R"({"items":[{"id":"nav","name":"Navigation"}]})", "application/json");
   });
@@ -197,6 +301,8 @@ TEST(PeerClientHappyPath, fetch_entities_parses_collections) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   auto result = client.fetch_entities();
@@ -289,9 +395,16 @@ TEST(PeerClientHappyPath, fetch_entities_parses_relationship_fields) {
   svr.Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
     res.set_content(
         R"({"items":[
-          {"id":"autonomous-navigation","name":"Autonomous Navigation",
-           "x-medkit":{"hosts":["lidar-driver","path-planner"],"source":"manifest"}}
+          {"id":"autonomous-navigation","name":"Autonomous Navigation","x-medkit":{"source":"manifest"}}
         ]})",
+        "application/json");
+  });
+  // hosts are carried by the detail route only, which is where a real gateway
+  // puts them.
+  svr.Get(R"(/api/v1/functions/autonomous-navigation)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(
+        R"({"id":"autonomous-navigation","name":"Autonomous Navigation",
+            "x-medkit":{"hosts":["lidar-driver","path-planner"],"source":"manifest"}})",
         "application/json");
   });
 
@@ -299,6 +412,8 @@ TEST(PeerClientHappyPath, fetch_entities_parses_relationship_fields) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_ecu", 5000);
   auto result = client.fetch_entities();
@@ -380,6 +495,8 @@ TEST(PeerClientHappyPath, fetch_entities_parses_is_located_on_without_vendor_ext
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_sovd", 5000);
   auto result = client.fetch_entities();
@@ -438,6 +555,8 @@ TEST(PeerClientHappyPath, fetch_entities_rejects_malicious_component_id_in_locat
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_hostile", 5000);
   auto result = client.fetch_entities();
@@ -488,6 +607,8 @@ TEST(PeerClientHappyPath, fetch_entities_parses_vendor_only_component_id_fallbac
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_vendor", 5000);
   auto result = client.fetch_entities();
@@ -518,6 +639,8 @@ TEST(PeerClientHappyPath, forward_request_proxies_response_with_auth) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   // forward_auth=true: Authorization header should be forwarded
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000, true);
@@ -553,6 +676,8 @@ TEST(PeerClientHappyPath, forward_request_does_not_forward_auth_by_default) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   // forward_auth=false (default): Authorization header should NOT be forwarded
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
@@ -590,6 +715,8 @@ TEST(PeerClientHappyPath, forward_filters_response_headers) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
 
@@ -627,6 +754,8 @@ TEST(PeerClientHappyPath, forward_and_get_json_returns_parsed_json) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   auto result = client.forward_and_get_json("GET", "/api/v1/components/ecu/data");
@@ -654,6 +783,8 @@ TEST(PeerClientHappyPath, forward_and_get_json_with_auth_header_when_enabled) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   // forward_auth=true: auth header should be sent
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000, true);
@@ -679,6 +810,8 @@ TEST(PeerClientHappyPath, forward_and_get_json_does_not_forward_auth_by_default)
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   // forward_auth=false (default): auth header should NOT be sent
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
@@ -702,13 +835,16 @@ TEST(PeerClientHappyPath, forward_and_get_json_error_on_non_2xx) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
   auto result = client.forward_and_get_json("GET", "/api/v1/missing");
 
   ASSERT_FALSE(result.has_value());
-  EXPECT_TRUE(result.error().find("404") != std::string::npos);
-  EXPECT_TRUE(result.error().find("test_peer") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("404") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("test_peer") != std::string::npos);
+  EXPECT_EQ(result.error().kind, PeerFailureKind::kErrorStatus);
 
   svr.stop();
   t.join();
@@ -729,6 +865,8 @@ TEST(PeerClientHappyPath, forward_request_rejects_oversized_response) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "big_peer", 10000);
 
@@ -766,13 +904,16 @@ TEST(PeerClientHappyPath, forward_and_get_json_rejects_oversized_response) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "big_peer", 10000);
   auto result = client.forward_and_get_json("GET", "/api/v1/components/big/data");
 
   ASSERT_FALSE(result.has_value());
-  EXPECT_TRUE(result.error().find("size limit") != std::string::npos);
-  EXPECT_TRUE(result.error().find("big_peer") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("size limit") != std::string::npos);
+  EXPECT_TRUE(result.error().message.find("big_peer") != std::string::npos);
+  EXPECT_EQ(result.error().kind, PeerFailureKind::kTooLarge);
 
   svr.stop();
   t.join();
@@ -792,6 +933,8 @@ TEST(PeerClientHappyPath, forward_post_request) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "test_peer", 5000);
 
@@ -866,6 +1009,8 @@ TEST(PeerClientHappyPath, fetch_entities_skips_entities_with_invalid_ids) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "malicious_peer", 5000);
   auto result = client.fetch_entities();
@@ -904,6 +1049,8 @@ TEST(PeerClientHappyPath, fetch_entities_rejects_collection_exceeding_limit) {
   std::thread t([&]() {
     svr.listen_after_bind();
   });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
 
   PeerClient client("http://127.0.0.1:" + std::to_string(port), "oversized_peer", 5000);
   auto result = client.fetch_entities();
@@ -915,4 +1062,412 @@ TEST(PeerClientHappyPath, fetch_entities_rejects_collection_exceeding_limit) {
 
   svr.stop();
   t.join();
+}
+
+// Asset-identity survives a full peer round-trip: a Component with an identity
+// nameplate is serialized via Component::to_json (as a peer would emit it under
+// x-medkit.identity), parsed back by PeerClient::fetch_entities, then merged into a
+// local entity by EntityMerger. The remote nameplate must be preserved end-to-end.
+// Refs #482
+TEST(PeerClientHappyPath, asset_identity_survives_fetch_and_merge) {
+  // Build the remote Component with a populated identity and serialize it exactly the
+  // way the gateway emits component detail responses.
+  Component remote;
+  remote.id = "plc_1";
+  remote.name = "Line PLC";
+  remote.identity.manufacturer = "Siemens AG";
+  remote.identity.serial_number = "SN-42";
+  remote.identity.firmware_version = "2.9.4";
+  remote.identity.extra["slot"] = "3";
+  remote.identity.provenance["serial_number"] = "opcua";
+  const std::string remote_detail = remote.to_json().dump();
+
+  httplib::Server svr;
+  svr.Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/components", [&](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"plc_1","name":"Line PLC"}]})", "application/json");
+  });
+  svr.Get("/api/v1/components/plc_1", [&](const httplib::Request &, httplib::Response & res) {
+    res.set_content(remote_detail, "application/json");
+  });
+  svr.Get("/api/v1/components/plc_1/subcomponents", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  std::thread t([&]() {
+    svr.listen_after_bind();
+  });
+  // stop() only interrupts a server that is already listening.
+  svr.wait_until_ready();
+
+  PeerClient client("http://127.0.0.1:" + std::to_string(port), "peer_plc", 5000);
+  auto result = client.fetch_entities();
+  svr.stop();
+  t.join();
+
+  ASSERT_TRUE(result.has_value());
+  ASSERT_EQ(result->components.size(), 1u);
+  const auto & parsed = result->components[0].identity;
+
+  // parse_component must have read x-medkit.identity back into the model.
+  EXPECT_EQ(parsed.manufacturer, "Siemens AG");
+  EXPECT_EQ(parsed.serial_number, "SN-42");
+  EXPECT_EQ(parsed.firmware_version, "2.9.4");
+  EXPECT_EQ(parsed.extra.at("slot"), "3");
+  EXPECT_EQ(parsed.provenance.at("serial_number"), "opcua");
+
+  // Collision merge: a local component with the same id but no identity must inherit
+  // the remote nameplate (gap-fill), and a remote-only component carries it directly.
+  Component local;
+  local.id = "plc_1";
+  local.name = "Line PLC";
+  local.source = "manifest";
+
+  EntityMerger merger("peer_plc");
+  auto merged = merger.merge_components({local}, result->components);
+  ASSERT_EQ(merged.size(), 1u);
+  const auto & merged_id = merged[0].identity;
+  EXPECT_EQ(merged_id.manufacturer, "Siemens AG");
+  EXPECT_EQ(merged_id.serial_number, "SN-42");
+  EXPECT_EQ(merged_id.firmware_version, "2.9.4");
+  EXPECT_EQ(merged_id.extra.at("slot"), "3");
+}
+
+// =============================================================================
+// Availability read-back
+//
+// `x-medkit.available` is emitted only when false, so absence is the peer
+// saying the entity is reachable. Both directions are pinned here because the
+// two failures are opposite and equally silent: dropping the read reports every
+// unreachable entity of every peer as reachable, and defaulting to false
+// reports every healthy one as unreachable.
+// =============================================================================
+
+namespace {
+
+/// Serve the four collection roots a fetch always reads, so a test only has to
+/// describe the routes it is actually about. httplib answers with the first
+/// handler that matches, so this is installed AFTER the routes a test defines
+/// itself and only fills in the ones it left out.
+void install_empty_roots(httplib::Server & svr) {
+  svr.Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+}
+
+/// A SOVD error body carrying the ``not-responding`` code, which is what a
+/// gateway answers on every route of an entity whose contributor went quiet.
+std::string not_responding_body(const std::string & member_id) {
+  return nlohmann::json(
+             {{"error_code", ERR_NOT_RESPONDING}, {"message", "Member '" + member_id + "' is not available"}})
+      .dump();
+}
+
+/// Listen on a random port for the life of the scope. A failed ASSERT returns
+/// from the test body, so a hand-written stop/join at the end of it never runs
+/// and the listening thread outlives its server.
+class ScopedServer {
+ public:
+  explicit ScopedServer(httplib::Server & svr) : svr_(svr) {
+    port_ = svr_.bind_to_any_port("127.0.0.1");
+    thread_ = std::thread([this]() {
+      svr_.listen_after_bind();
+    });
+    // stop() only interrupts a server that is already listening.
+    svr_.wait_until_ready();
+  }
+
+  ~ScopedServer() {
+    svr_.stop();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  ScopedServer(const ScopedServer &) = delete;
+  ScopedServer & operator=(const ScopedServer &) = delete;
+  ScopedServer(ScopedServer &&) = delete;
+  ScopedServer & operator=(ScopedServer &&) = delete;
+
+  std::string url() const {
+    return "http://127.0.0.1:" + std::to_string(port_);
+  }
+
+ private:
+  httplib::Server & svr_;
+  std::thread thread_;
+  int port_{0};
+};
+
+}  // namespace
+
+TEST(PeerClientAvailability, a_peers_statement_that_an_entity_is_unreachable_is_carried) {
+  httplib::Server svr;
+
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"ecu-live","name":"ecu-live"},{"id":"ecu-quiet","name":"ecu-quiet"}]})",
+                    "application/json");
+  });
+  // A 200 detail that names the entity unreachable. This is the only account of
+  // the entity the aggregator gets, so the flag has to come off the body.
+  svr.Get("/api/v1/components/ecu-quiet", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu-quiet","name":"ecu-quiet","x-medkit":{"source":"manifest","available":false}})",
+                    "application/json");
+  });
+  svr.Get("/api/v1/components/ecu-live", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu-live","name":"ecu-live","x-medkit":{"source":"manifest"}})", "application/json");
+  });
+  svr.Get(R"(/api/v1/components/([^/]+)/subcomponents)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(
+        R"({"items":[
+          {"id":"app-live","name":"app-live","x-medkit":{"source":"manifest","is_online":true}},
+          {"id":"app-quiet","name":"app-quiet","x-medkit":{"source":"manifest","available":false}}
+        ]})",
+        "application/json");
+  });
+  svr.Get(R"(/api/v1/apps/([^/]+)/operations)", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << result.error();
+
+  ASSERT_EQ(result->components.size(), 2u);
+  EXPECT_EQ(result->components[0].id, "ecu-live");
+  EXPECT_TRUE(result->components[0].available) << "an entity the peer said nothing about was marked unreachable";
+  EXPECT_EQ(result->components[1].id, "ecu-quiet");
+  EXPECT_FALSE(result->components[1].available) << "the peer's statement that ecu-quiet is unreachable was dropped";
+
+  ASSERT_EQ(result->apps.size(), 2u);
+  EXPECT_EQ(result->apps[0].id, "app-live");
+  EXPECT_TRUE(result->apps[0].available) << "an app the peer said nothing about was marked unreachable";
+  EXPECT_EQ(result->apps[1].id, "app-quiet");
+  EXPECT_FALSE(result->apps[1].available) << "the peer's statement that app-quiet is unreachable was dropped";
+}
+
+TEST(PeerClientAvailability, a_nested_collection_that_says_not_responding_does_not_abort_the_fetch) {
+  httplib::Server svr;
+
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"ecu-quiet","name":"ecu-quiet"}]})", "application/json");
+  });
+  svr.Get("/api/v1/components/ecu-quiet", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu-quiet","name":"ecu-quiet","x-medkit":{"source":"manifest","available":false}})",
+                    "application/json");
+  });
+  // Every route of a retained member answers 504 not-responding, the nested
+  // collections included. Read as a failed request it would discard the peer's
+  // whole picture, including the entities that are perfectly reachable.
+  svr.Get("/api/v1/components/ecu-quiet/subcomponents", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(not_responding_body("ecu-quiet"), "application/json");
+  });
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"app-quiet","name":"app-quiet","x-medkit":{"available":false}}]})",
+                    "application/json");
+  });
+  svr.Get("/api/v1/apps/app-quiet/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(not_responding_body("app-quiet"), "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << "one unreachable member discarded the peer's whole picture: " << result.error();
+
+  ASSERT_EQ(result->components.size(), 1u);
+  EXPECT_FALSE(result->components[0].available);
+  ASSERT_EQ(result->apps.size(), 1u);
+  EXPECT_FALSE(result->apps[0].available);
+}
+
+TEST(PeerClientAvailability, a_504_that_is_not_a_statement_about_an_entity_still_fails_the_fetch) {
+  httplib::Server svr;
+
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"ecu-a","name":"ecu-a"}]})", "application/json");
+  });
+  svr.Get("/api/v1/components/ecu-a", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"id":"ecu-a","name":"ecu-a"})", "application/json");
+  });
+  // 504 without the not-responding code is an upstream proxy timing out, which
+  // says nothing about the entity and leaves a hole in the picture.
+  svr.Get("/api/v1/components/ecu-a/subcomponents", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(R"({"error_code":"vendor-error","message":"upstream timed out"})", "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  EXPECT_FALSE(result.has_value()) << "a gateway timeout was read as a statement that an entity is unreachable";
+}
+
+// =============================================================================
+// A peer's topics
+//
+// An App's topics are discovered from the ROS graph, never declared, so what the
+// peer reports on its own data route is the only record of them this gateway can
+// have. Without it nothing here maps a peer's topic to the member that owns it,
+// and the id a single-provider topic is listed under - the bare path - is
+// unroutable.
+// =============================================================================
+
+TEST(PeerClientTopics, a_peers_topics_are_read_into_the_merged_app) {
+  httplib::Server svr;
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"nav","name":"Navigation"}]})", "application/json");
+  });
+  svr.Get("/api/v1/apps/nav/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/apps/nav/data", [](const httplib::Request & req, httplib::Response & res) {
+    // The peer must not re-ask ITS peers, or a bidirectionally peered pair bounces.
+    EXPECT_EQ(req.get_header_value("X-Medkit-No-Fan-Out"), "1");
+    res.set_content(
+        R"({"items":[
+          {"id":"/nav/pose","name":"/nav/pose","x-medkit":{"ros2":{"topic":"/nav/pose","direction":"publish"}}},
+          {"id":"/nav/goal","name":"/nav/goal","x-medkit":{"ros2":{"topic":"/nav/goal","direction":"subscribe"}}},
+          {"id":"/nav/odom","name":"/nav/odom","x-medkit":{"ros2":{"topic":"/nav/odom","direction":"both"}}}
+        ]})",
+        "application/json");
+  });
+  svr.Get("/api/v1/areas", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/components", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  svr.Get("/api/v1/functions", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << result.error();
+
+  ASSERT_EQ(result->apps.size(), 1u);
+  const auto & app = result->apps[0];
+  EXPECT_EQ(app.topics.publishes, (std::vector<std::string>{"/nav/pose", "/nav/odom"}));
+  EXPECT_EQ(app.topics.subscribes, (std::vector<std::string>{"/nav/goal", "/nav/odom"}));
+}
+
+TEST(PeerClientTopics, an_item_that_does_not_describe_a_topic_is_not_recorded_as_one) {
+  httplib::Server svr;
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"plc","name":"PLC bridge"}]})", "application/json");
+  });
+  svr.Get("/api/v1/apps/plc/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[]})", "application/json");
+  });
+  // A plugin's data point carries no ROS metadata at all, and a topic with no
+  // direction says nothing about which side the App is on. Recorded anyway, each
+  // would attribute a topic to a member that may not have it, and a bare id
+  // built on that attribution is dispatched to the wrong gateway.
+  svr.Get("/api/v1/apps/plc/data", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(
+        R"({"items":[
+          {"id":"tank_level","name":"tank_level","category":"currentData"},
+          {"id":"valve","name":"valve","x-medkit":{"source":"opcua"}},
+          {"id":"pump","name":"pump","x-medkit":{"ros2":{"type":"std_msgs/msg/Float32"}}},
+          {"id":"/plc/raw","name":"/plc/raw","x-medkit":{"ros2":{"topic":"/plc/raw"}}},
+          {"id":"/plc/aux","name":"/plc/aux","x-medkit":{"ros2":{"topic":"/plc/aux","direction":"sideways"}}}
+        ]})",
+        "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << result.error();
+
+  ASSERT_EQ(result->apps.size(), 1u);
+  EXPECT_TRUE(result->apps[0].topics.publishes.empty())
+      << "an item that names no ROS topic was recorded as a published one";
+  EXPECT_TRUE(result->apps[0].topics.subscribes.empty())
+      << "an item that names no ROS topic was recorded as a subscribed one";
+}
+
+TEST(PeerClientTopics, a_peer_without_the_data_route_still_describes_its_apps) {
+  httplib::Server svr;
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"nav","name":"Navigation"}]})", "application/json");
+  });
+  // A gateway old enough not to serve the data route answers 404. Aggregation
+  // works across that version boundary: the App is described by everything else
+  // the peer does offer, and the missing route is reported rather than fatal.
+  svr.Get("/api/v1/apps/nav/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"name":"calibrate","x-medkit":{"ros2":{"service":"/nav/calibrate"}}}]})",
+                    "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << "an absent data route discarded the peer's picture: " << result.error();
+
+  ASSERT_EQ(result->apps.size(), 1u);
+  EXPECT_EQ(result->apps[0].services.size(), 1u) << "the operations route was skipped along with the data route";
+  EXPECT_TRUE(result->apps[0].topics.publishes.empty());
+  EXPECT_NE(std::find(result->absent_routes.begin(), result->absent_routes.end(), "/apps/{id}/data"),
+            result->absent_routes.end())
+      << "the missing route was not reported";
+}
+
+TEST(PeerClientTopics, a_data_route_that_says_not_responding_does_not_abort_the_fetch) {
+  httplib::Server svr;
+  svr.Get("/api/v1/apps", [](const httplib::Request &, httplib::Response & res) {
+    res.set_content(R"({"items":[{"id":"app-quiet","name":"app-quiet","x-medkit":{"available":false}}]})",
+                    "application/json");
+  });
+  svr.Get("/api/v1/apps/app-quiet/operations", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(not_responding_body("app-quiet"), "application/json");
+  });
+  // Every route of a retained member answers 504 not-responding, the data route
+  // included. Read as a failed request it would discard the peer's whole picture.
+  svr.Get("/api/v1/apps/app-quiet/data", [](const httplib::Request &, httplib::Response & res) {
+    res.status = 504;
+    res.set_content(not_responding_body("app-quiet"), "application/json");
+  });
+  install_empty_roots(svr);
+
+  ScopedServer running(svr);
+  PeerClient client(running.url(), "peer_b", 5000);
+  auto result = client.fetch_entities();
+  ASSERT_TRUE(result.has_value()) << "one unreachable member discarded the peer's whole picture: " << result.error();
+
+  ASSERT_EQ(result->apps.size(), 1u);
+  EXPECT_FALSE(result->apps[0].available);
+  EXPECT_TRUE(result->apps[0].topics.publishes.empty());
 }
