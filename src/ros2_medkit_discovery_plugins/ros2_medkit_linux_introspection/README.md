@@ -14,7 +14,11 @@ Maps ROS 2 nodes to OS processes and reports CPU, memory, systemd unit status, a
 ## Key Components
 
 - **ProcReader** - Parses procfs files for process metrics with configurable proc root
-- **CgroupReader** - Reads cgroup v2 hierarchy for container/service context
+- **CgroupReader** - Reads the unified (v2), legacy (v1) and hybrid cgroup hierarchies for
+  container/service context, under both cgroup namespace modes. Each limit is reported
+  together with the outcome of reading it, so "unlimited" and "could not be read" stay
+  distinguishable. A container whose ID the cgroup namespace hides is recognised from the
+  markers its runtime leaves behind
 - **SystemdUtils** - Queries systemd via D-Bus for service metadata
 - **PidCache** - TTL-based cache mapping ROS 2 node names to Linux PIDs
 
@@ -22,11 +26,17 @@ Maps ROS 2 nodes to OS processes and reports CPU, memory, systemd unit status, a
 
 Configure via `gateway_params.yaml` plugin parameters:
 
+Each plugin is configured on its own. `proc_root` is the prefix that contains `proc/` and
+`sys/`, so the default `/` is what a normal deployment wants; pointing it at `/proc` makes
+the plugin look for `/proc/proc/<pid>`.
+
 ```yaml
-plugins: ["linux_introspection"]
-plugins.linux_introspection.path: "/path/to/libros2_medkit_linux_introspection.so"
-plugins.linux_introspection.pid_cache_ttl_sec: 30
-plugins.linux_introspection.proc_root: "/proc"
+plugins: ["procfs", "systemd", "container"]
+plugins.procfs.path: "/path/to/libprocfs_introspection.so"
+plugins.systemd.path: "/path/to/libsystemd_introspection.so"
+plugins.container.path: "/path/to/libcontainer_introspection.so"
+plugins.container.pid_cache_ttl_seconds: 30
+plugins.container.proc_root: "/"
 ```
 
 ## Documentation
