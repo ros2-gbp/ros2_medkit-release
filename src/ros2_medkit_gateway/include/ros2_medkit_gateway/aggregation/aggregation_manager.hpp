@@ -16,10 +16,10 @@
 
 #include <httplib.h>
 
+#include <algorithm>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <optional>
-#include <rclcpp/logger.hpp>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -27,18 +27,90 @@
 
 #include "ros2_medkit_gateway/core/aggregation/classification.hpp"
 #include "ros2_medkit_gateway/core/aggregation/peer_client.hpp"
+#include "ros2_medkit_gateway/core/logging.hpp"
+#include "ros2_medkit_gateway/dto/aggregation.hpp"
 
 namespace ros2_medkit_gateway {
+
+/// Instance ids of the gateways a global `GET /faults` fan-out has already
+/// passed through, comma-separated. A gateway that finds its own id here has
+/// its faults in the answer already; one that does not answers for itself and
+/// for its own peers. See `plan_global_fault_fan_out`.
+inline constexpr const char * kFanOutVisitedHeader = "X-Medkit-Fan-Out-Visited";
+
+/// The ids on an `X-Medkit-Fan-Out-Visited` value, trimmed, empty entries dropped.
+inline std::vector<std::string> split_fan_out_visited(const std::string & value) {
+  std::vector<std::string> ids;
+  for (size_t start = 0; start <= value.size();) {
+    auto end = value.find(',', start);
+    if (end == std::string::npos) {
+      end = value.size();
+    }
+    std::string id = value.substr(start, end - start);
+    id.erase(0, id.find_first_not_of(" \t"));
+    id.erase(id.find_last_not_of(" \t") + 1);
+    if (!id.empty()) {
+      ids.push_back(std::move(id));
+    }
+    start = end + 1;
+  }
+  return ids;
+}
+
+/// A peer's name and where to reach it.
+struct PeerEndpoint {
+  std::string name;
+  std::string url;
+};
 
 /**
  * @brief Configuration for peer aggregation
  */
 struct AggregationConfig {
   bool enabled{false};
+
+  /// Connect budget for every peer call, and the read budget for the peer's
+  /// description of itself: discovery, health and collection fan-out.
   int timeout_ms{2000};
+
+  /// Read budget for a forwarded request. Sized above a peer gateway's own
+  /// `service_call_timeout_sec` default of 10 s, because what a
+  /// forward waits for is the peer doing that work.
+  int forward_timeout_ms{15000};
+
+  /// Write budget for every peer call.
+  int write_timeout_ms{5000};
+
+  /// The three budgets above in the shape PeerClient takes them.
+  ///
+  /// The connect budget is capped at kConnectCapMs rather than following
+  /// `timeout_ms`. A peer that cannot complete a TCP handshake in a second is
+  /// out of reach whatever the request wanted, and the cap also bounds how far
+  /// a `Read` failure can be misattributed: cpp-httplib reports one elapsed
+  /// time for connect plus read, so a handshake that ate most of a read budget
+  /// before the peer died would otherwise read as a timeout. With the cap that
+  /// window is a second instead of the whole metadata budget, and a handshake
+  /// slower than the cap fails as a connect timeout, which is named correctly.
+  PeerTimeouts peer_timeouts() const {
+    constexpr int kConnectCapMs = 1000;
+    return PeerTimeouts{std::min(timeout_ms, kConnectCapMs), timeout_ms, forward_timeout_ms, write_timeout_ms};
+  }
+
   bool announce{false};
   bool discover{false};
   std::string mdns_service{"_medkit._tcp.local"};
+
+  /// What this gateway presents as Authorization on connections it makes on
+  /// its OWN behalf, rather than on behalf of a request it is serving. Empty
+  /// for none.
+  ///
+  /// The fault-stream relay is the case that needs it: one connection per peer,
+  /// opened when the first local client attaches and shared by every one after
+  /// it. There is no single client whose token it could carry, and carrying the
+  /// opener's would serve everybody else events fetched with those credentials
+  /// and break when that one client's token expired. forward_auth is the wrong
+  /// lever for it - that forwards an end user's token per request.
+  std::string peer_auth_header;
 
   /// Forward the client's Authorization header to peer gateways.
   /// Default: false (safe default - prevents token leakage to untrusted peers).
@@ -97,9 +169,25 @@ class AggregationManager {
    * @brief Result of a fan-out GET across all healthy peers
    */
   struct FanOutResult {
-    nlohmann::json merged_items;            ///< Merged "items" array from all peers
+    nlohmann::json merged_items;  ///< Merged "items" array from all peers
+    /// Name of the peer that sent `merged_items[i]`, same order and length.
+    ///
+    /// A peer describes its own tree in its own names, and an id this gateway
+    /// renamed on collision means something else here, so an item can only be
+    /// re-addressed once the peer it came from is known. Merging the responses
+    /// into one array without this loses that, and the attribution cannot be
+    /// recovered afterwards from the item alone.
+    std::vector<std::string> item_peers;
     bool is_partial{false};                 ///< True if some peers failed
     std::vector<std::string> failed_peers;  ///< Names of peers that failed
+    /// Why each peer in `failed_peers` failed, same peers, one entry each.
+    ///
+    /// A name on its own says a peer contributed nothing and nothing more. A
+    /// peer that ran out of time, one that refused the connection, one that
+    /// answered 500, a body over the size limit and unparseable JSON produce
+    /// the same entry there, so a client cannot tell a busy subsystem from a
+    /// dead one - which is the whole of what a partial answer is asked.
+    std::vector<dto::PeerFailure> peer_failures;
   };
 
   /**
@@ -111,7 +199,7 @@ class AggregationManager {
    * @param config Aggregation configuration
    * @param logger Optional logger for TLS warnings (pass nullptr to suppress)
    */
-  explicit AggregationManager(const AggregationConfig & config, rclcpp::Logger * logger = nullptr);
+  explicit AggregationManager(const AggregationConfig & config, const log::Logger * logger = nullptr);
 
   /**
    * @brief Cancel every in-flight HTTP call to every peer.
@@ -129,6 +217,14 @@ class AggregationManager {
 
   /// Get the number of known peers (static + discovered)
   size_t peer_count() const;
+
+  /// Random id of this gateway process, put on `X-Medkit-Fan-Out-Visited`.
+  ///
+  /// Generated, not configured: peer names are what the aggregator calls a
+  /// peer, so a gateway cannot recognise itself by one.
+  const std::string & instance_id() const {
+    return instance_id_;
+  }
 
   /**
    * @brief Add a dynamically discovered peer
@@ -162,11 +258,19 @@ class AggregationManager {
    */
   size_t healthy_peer_count() const;
 
-  /**
-   * @brief Fetch entities from all healthy peers and merge them
-   * @return Merged PeerEntities from all reachable peers
-   */
-  PeerEntities fetch_all_peer_entities();
+  /// Name and base URL of every peer healthy at the last health check.
+  ///
+  /// `get_peer_status()` renders the same set as JSON for a client; this is the
+  /// form a caller that has to open a connection needs, and it excludes the
+  /// unhealthy peers that rendering deliberately includes.
+  std::vector<PeerEndpoint> healthy_peer_endpoints() const;
+
+  /// The Authorization value this gateway presents to peers on its own behalf.
+  /// Empty when none is configured, in which case a peer that requires
+  /// authentication refuses the relay.
+  const std::string & peer_auth_header() const {
+    return config_.peer_auth_header;
+  }
 
   /**
    * @brief Fetch entities from all healthy peers, merge with local entities, and build routing table
@@ -187,7 +291,7 @@ class AggregationManager {
   MergedPeerResult
   fetch_and_merge_peer_entities(const std::vector<Area> & local_areas, const std::vector<Component> & local_components,
                                 const std::vector<App> & local_apps, const std::vector<Function> & local_functions,
-                                size_t max_entities_per_peer = 10000, rclcpp::Logger * logger = nullptr);
+                                size_t max_entities_per_peer = 10000, const log::Logger * logger = nullptr);
 
   /**
    * @brief Update the routing table (entity_id -> peer_name)
@@ -216,6 +320,20 @@ class AggregationManager {
    * @return Peer name if entity is remote, std::nullopt if local or unknown
    */
   std::optional<std::string> find_peer_for_entity(const std::string & entity_id) const;
+
+  /**
+   * @brief The id this gateway uses for a member `peer_name` calls `member_id`.
+   *
+   * An App whose id collides with a local one is merged under `<peer>__<id>`,
+   * and the routing table is where that renaming is recorded. A peer knows
+   * nothing of it and keeps naming the member as it always did, so anything a
+   * peer says about its own members has to be read through this before it can
+   * be used to address something here - the unprefixed id names the LOCAL leaf.
+   *
+   * Returns `member_id` unchanged when nothing was renamed, which is the
+   * ordinary case. Thread-safe.
+   */
+  std::string local_member_id(const std::string & peer_name, const std::string & member_id) const;
 
   /**
    * @brief Replace the map of per-entity peer contributors.
@@ -274,6 +392,27 @@ class AggregationManager {
   void forward_request(const std::string & peer_name, const httplib::Request & req, httplib::Response & res);
 
   /**
+   * @brief Forward an HTTP request to a peer, addressing a path of the caller's
+   *        choosing instead of the one the client sent.
+   *
+   * A request addressed to an entity that draws its resources from members is
+   * not the request the owning gateway can answer: that gateway has no such
+   * entity, only the member. The target path names the member's own route
+   * there, so the peer answers a request about something it actually holds.
+   *
+   * `target_path` goes through the same SSRF guard and peer-prefix rewrite as
+   * the incoming path, because it is built from client-supplied ids. Query
+   * parameters and body come from `req` unchanged.
+   *
+   * @param peer_name Name of the target peer
+   * @param req Incoming HTTP request supplying method, headers, body and query
+   * @param res Outgoing HTTP response to populate
+   * @param target_path Absolute path to request on the peer, `/api/v1/...`
+   */
+  void forward_request(const std::string & peer_name, const httplib::Request & req, httplib::Response & res,
+                       const std::string & target_path);
+
+  /**
    * @brief Fan-out a GET request to healthy peers in parallel.
    *
    * Sends GET requests concurrently via std::async, merges the "items"
@@ -286,10 +425,18 @@ class AggregationManager {
    *        list means "no matching peers" and produces an empty result with
    *        no fan-out. When null (default), all healthy peers are queried,
    *        preserving the pre-filtering behavior for global endpoints.
+   * @param extra_headers Sent on every peer request next to
+   *        `X-Medkit-No-Fan-Out`. When they carry `X-Medkit-Fan-Out-Visited`,
+   *        a peer whose instance id is on that path is not asked at all: its
+   *        answer is already counted, and asking it would hold a worker on
+   *        both sides until it answered empty. A peer that reports itself
+   *        partial makes this result partial too, with its failed peers named
+   *        `<peer>/<its peer>`.
    * @return FanOutResult with merged items and failure info.
    */
   FanOutResult fan_out_get(const std::string & path, const std::string & auth_header,
-                           const std::vector<std::string> * target_peers = nullptr);
+                           const std::vector<std::string> * target_peers = nullptr,
+                           const httplib::Headers & extra_headers = {});
 
   /**
    * @brief Get peer status for /health endpoint
@@ -299,11 +446,48 @@ class AggregationManager {
 
  private:
   AggregationConfig config_;
-  rclcpp::Logger logger_;
-  size_t static_peer_count_{0};      ///< Number of statically configured peers (not subject to max_discovered_peers)
+  log::Logger logger_;
+  std::string instance_id_;
+  size_t static_peer_count_{0};  ///< Number of statically configured peers (not subject to max_discovered_peers)
+  /// Whether a peer whose picture could not be refreshed can still be reached.
+  ///
+  /// `available:false` is the answer to "can a request get there", so it is
+  /// earned by a failed health check alone. A refresh that came back
+  /// incomplete from a peer that is still answering says nothing about
+  /// reachability - it says this gateway could not read the whole picture.
+  enum class Reachability {
+    kReachable,
+    kUnreachable,
+  };
+
+  /// Record what `peer_name` declared, so it can be replayed while that peer
+  /// cannot be described. Stored as the peer reported it; the unavailable
+  /// marking belongs to the replay, which is where reachability is known.
+  ///
+  /// Only ever called for a fetch that described the whole peer: a partial
+  /// picture recorded here would overwrite the last complete one and outlive
+  /// the cycle that failed to read it.
+  void remember_declaration(const std::string & peer_name, const PeerEntities & entities);
+
+  /// The retained declaration for `peer_name`, empty if none was ever recorded.
+  /// Marked unavailable when `reachability` says the peer cannot be reached.
+  PeerEntities replay_declaration(const std::string & peer_name, Reachability reachability) const;
+
   mutable std::shared_mutex mutex_;  // Declared before data it protects (destruction order)
   std::vector<std::shared_ptr<PeerClient>> peers_;
   std::unordered_map<std::string, std::string> routing_table_;
+  /// Last known manifest-declared entities per peer name, replayed while that
+  /// peer is not answering.
+  ///
+  /// A tree that changes shape because a link went down cannot be reasoned
+  /// about: the same request gets a different answer depending on who happens
+  /// to be reachable. What a peer DECLARED is a property of its configuration
+  /// and does not stop being true when it stops replying, so it is retained -
+  /// marked unavailable while the peer cannot be reached, and exactly as last
+  /// read while it can. What a peer merely DISCOVERED at runtime is a property
+  /// of a live graph this gateway can no longer observe, so it is allowed to
+  /// disappear.
+  std::unordered_map<std::string, PeerEntities> retained_peer_entities_;
   std::unordered_map<std::string, std::vector<std::string>> peer_contributors_by_entity_;
   std::vector<LeafCollisionWarning> leaf_warnings_;
 
