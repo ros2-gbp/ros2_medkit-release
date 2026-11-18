@@ -33,7 +33,7 @@ All packages in the repository share the same version number.
 
 ### Version Stability [1.ii]
 
-The current version is **0.6.0**.
+The current version is **0.7.1**.
 The package follows semver; the pre-1.0 version reflects that the public API may still evolve
 based on early adopter feedback, not a lack of quality infrastructure.
 The 1.0.0 release is planned after the API has been validated through pilot deployments.
@@ -84,13 +84,31 @@ GitHub Copilot code review is used in addition to human review.
 
 ### Continuous Integration [2.iv]
 
-All pull requests must pass CI before merging:
+Every pull request runs the following, and a failure in any of them blocks
+review. In the CI and Quality workflows, a pull request that changes only
+documentation skips Build & Test, the PostgreSQL job, clang-tidy and Sanitizers.
+It still runs Quality, because some of its linter tests read the documentation.
+`scripts/ci_code_changed.sh` defines documentation: `.md` and `.rst` files, and
+images, stylesheets, fonts, `.txt` files, `conf.py` and `Doxyfile` under `docs/`.
 
-- **Build & Test job:** Full build + unit/integration tests on Ubuntu Noble / ROS 2 Jazzy, Ubuntu Jammy / ROS 2 Humble, and Ubuntu Resolute / ROS 2 Lyrical. Linter tests on Jazzy only
-- **Coverage job:** Debug build with coverage. Reports are generated for all PRs as artifacts and uploaded to [Codecov](https://codecov.io/gh/selfpatch/ros2_medkit) on pushes to `main`
-- Linting enforced: `clang-format`, `clang-tidy` via `ament_lint_auto`
+- **Build & Test:** build + unit/integration tests on Ubuntu Noble / ROS 2 Jazzy, Ubuntu Jammy / ROS 2 Humble, and Ubuntu Resolute / ROS 2 Lyrical. `ros2_medkit_opcua` is excluded here and covered by its own workflow instead
+- **Quality:** `clang-format` and the other ament linters, the static coverage-scope check, which fails if a package compiles production C++ without opting into coverage instrumentation, and two source gates (`check_no_naked_subscriptions.sh`, `check_handlers_typed_query.sh`). Jazzy only
+- **clang-tidy:** on a pull request this is incremental - it analyses the `.cpp` and `.hpp` files the branch changed, and does not run at all when the branch changes none. The full sweep over the compilation database runs on pushes to `main`
+- **Sanitizers:** the unit and integration suites again under ASan + UBSan and under TSan, on Jazzy. Only packages that include the shared sanitizer module are instrumented; `ros2_medkit_fault_detection`, `ros2_medkit_sovd_service_interface` and the integration-test fixture executables are not
+- **Documentation:** Sphinx build with `-W` plus linkcheck, on any pull request touching `docs/`, `src/` or `scripts/`
+- **OPC-UA plugin:** the OpenPLC-based integration suite, on any pull request touching the plugin, the gateway plugin/provider headers or `ros2_medkit_msgs`
 
-CI configuration: [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
+Reported on pushes to `main`, not run on pull requests:
+
+- **Coverage:** Debug build with coverage instrumentation. Reports are archived as artifacts and uploaded to [Codecov](https://codecov.io/gh/selfpatch/ros2_medkit)
+
+Merging additionally requires one approving review. Branch rules enforce the
+review requirement, a linear history, and two required status checks: `ci-ok`
+and `quality-ok`. They fail when a Build & Test, Quality or Sanitizers job
+failed or was cancelled. The PostgreSQL job, clang-tidy, Documentation and
+OPC-UA are not required.
+
+CI configuration: [`.github/workflows/ci.yml`](.github/workflows/ci.yml) and [`.github/workflows/quality.yml`](.github/workflows/quality.yml)
 
 ### Documentation Policy [2.v]
 
@@ -182,6 +200,8 @@ Linter tests are enforced in CI on every pull request.
 | `diagnostic_msgs` | Level 1 |
 | `rosbag2_cpp` | Level 3 |
 | `rosbag2_storage` | Level 3 |
+| `rosbag2_storage_mcap` | Level 3 |
+| `rosbag2_storage_default_plugins` | Level 3 |
 
 ### Optional Direct Runtime Non-ROS Dependencies [5.ii]
 
@@ -225,10 +245,10 @@ Security issues can be reported via GitHub Security Advisories on the
 
 | Requirement | Status | Notes |
 |---|---|---|
-| Version policy | Met | Semver, all packages at 0.6.0 |
+| Version policy | Met | Semver, all packages at 0.7.1 |
 | Stable version (>=1.0.0) | Caveat | Pre-1.0; API versioned, 1.0.0 planned post-pilot |
 | Change requests | Met | All changes via PR |
-| CI | Met | Build + test + coverage on every PR |
+| CI | Met | Build + test on every PR that changes code, coverage on pushes to main |
 | License | Met | Apache-2.0 |
 | Copyright | Met | All source files have headers |
 | Feature tests | Met | 65 tests across unit + integration |
@@ -237,6 +257,6 @@ Security issues can be reported via GitHub Security Advisories on the
 | Platform support | Met | Ubuntu Noble / ROS 2 Jazzy + Ubuntu Jammy / ROS 2 Humble + Ubuntu Resolute / ROS 2 Lyrical |
 | Security policy | Met | REP-2006 compliant |
 
-**Caveat:** Version is 0.6.0 (pre-1.0.0, requirement 1.ii). The REST API is versioned (`/api/v1/`)
+**Caveat:** Version is 0.7.1 (pre-1.0.0, requirement 1.ii). The REST API is versioned (`/api/v1/`)
 and the package meets all other Level 3 requirements. The 1.0.0 release is planned after
 API validation through pilot deployments.
