@@ -13,9 +13,11 @@
 // limitations under the License.
 
 #include "ros2_medkit_gateway/aggregation/aggregation_manager.hpp"
+#include "ros2_medkit_gateway/core/logging.hpp"
 
 #include <algorithm>
 #include <future>
+#include <random>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -24,14 +26,23 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
-#include <rclcpp/logging.hpp>
-
 #include "ros2_medkit_gateway/core/aggregation/entity_merger.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 
 namespace ros2_medkit_gateway {
 
 namespace {
+
+std::string make_instance_id() {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::random_device rd;
+  std::uniform_int_distribution<int> digit(0, 15);
+  std::string id(32, '0');
+  for (auto & c : id) {
+    c = kHex[digit(rd)];
+  }
+  return id;
+}
 
 /**
  * @brief Extract the host portion from a URL
@@ -189,8 +200,8 @@ bool is_valid_peer_url(const std::string & url) {
 
 }  // namespace
 
-AggregationManager::AggregationManager(const AggregationConfig & config, rclcpp::Logger * logger)
-  : config_(config), logger_(logger ? *logger : rclcpp::get_logger("aggregation_manager")) {
+AggregationManager::AggregationManager(const AggregationConfig & config, const log::Logger * logger)
+  : config_(config), logger_(logger ? *logger : log::Logger("aggregation_manager")), instance_id_(make_instance_id()) {
   for (const auto & peer_cfg : config_.peers) {
     // Validate scheme for static peers (http/https only).
     // Unlike mDNS peers, loopback addresses are valid for static config
@@ -204,19 +215,20 @@ AggregationManager::AggregationManager(const AggregationConfig & config, rclcpp:
     if (peer_cfg.url.rfind("http://", 0) == 0) {
       if (config_.require_tls) {
         if (logger) {
-          RCLCPP_ERROR(*logger, "Aggregation: skipping peer '%s' at %s - require_tls is enabled but URL uses http://",
-                       peer_cfg.name.c_str(), peer_cfg.url.c_str());
+          MEDKIT_LOG_ERROR(*logger,
+                           "Aggregation: skipping peer '%s' at %s - require_tls is enabled but URL uses http://",
+                           peer_cfg.name.c_str(), peer_cfg.url.c_str());
         }
         continue;
       }
       if (logger) {
-        RCLCPP_WARN(*logger, "Aggregation: peer '%s' at %s uses cleartext HTTP - consider using HTTPS",
-                    peer_cfg.name.c_str(), peer_cfg.url.c_str());
+        MEDKIT_LOG_WARN(*logger, "Aggregation: peer '%s' at %s uses cleartext HTTP - consider using HTTPS",
+                        peer_cfg.name.c_str(), peer_cfg.url.c_str());
       }
     }
 
-    peers_.push_back(
-        std::make_shared<PeerClient>(peer_cfg.url, peer_cfg.name, config_.timeout_ms, config_.forward_auth));
+    peers_.push_back(std::make_shared<PeerClient>(peer_cfg.url, peer_cfg.name, config_.peer_timeouts(),
+                                                  config_.forward_auth, config_.peer_auth_header));
   }
   static_peer_count_ = peers_.size();
 }
@@ -265,14 +277,20 @@ void AggregationManager::add_discovered_peer(const std::string & url, const std:
   // Enforce max_discovered_peers limit (static peers do not count)
   size_t discovered_count = peers_.size() - static_peer_count_;
   if (discovered_count >= config_.max_discovered_peers) {
-    RCLCPP_WARN(logger_,
-                "Aggregation: max_discovered_peers limit (%zu) reached, "
-                "rejecting peer '%s' at %s",
-                config_.max_discovered_peers, name.c_str(), url.c_str());
+    MEDKIT_LOG_WARN(logger_,
+                    "Aggregation: max_discovered_peers limit (%zu) reached, "
+                    "rejecting peer '%s' at %s",
+                    config_.max_discovered_peers, name.c_str(), url.c_str());
     return;
   }
 
-  peers_.push_back(std::make_shared<PeerClient>(url, name, config_.timeout_ms, config_.forward_auth));
+  // A DISCOVERED peer gets no credential. peer_auth_header is presented to
+  // peers the operator named in the configuration; a peer that announced
+  // itself over mDNS is not one of those, and handing it this gateway's
+  // credential is the leak forward_auth already refuses to risk. A discovered
+  // peer that requires authentication therefore stays unreachable, which is
+  // the safe way round.
+  peers_.push_back(std::make_shared<PeerClient>(url, name, config_.peer_timeouts(), config_.forward_auth, ""));
 }
 
 void AggregationManager::remove_discovered_peer(const std::string & name) {
@@ -326,39 +344,99 @@ size_t AggregationManager::healthy_peer_count() const {
   return count;
 }
 
-PeerEntities AggregationManager::fetch_all_peer_entities() {
-  // Snapshot healthy peers under lock, release before network I/O.
-  std::vector<std::shared_ptr<PeerClient>> snapshot;
+namespace {
+
+/// True for an entity a peer said it had DECLARED, rather than discovered from
+/// its live ROS graph. Only a declaration outlives the link that reported it:
+/// runtime discovery describes a graph this gateway can no longer observe once
+/// the peer stops answering, so it is not ours to keep asserting.
+template <class Entity>
+bool is_declared(const Entity & entity) {
+  return entity.declared_source == "manifest";
+}
+
+/// Availability belongs to an entity a request can be addressed to. A grouping
+/// entity has none of its own: it is a view over its members, and the members
+/// carry the flag, so retaining one says nothing about what can be reached.
+void mark_unreachable(Area & /*area*/) {
+}
+void mark_unreachable(Function & /*function*/) {
+}
+void mark_unreachable(App & app) {
+  app.available = false;
+  // A retained App is not observably running: the graph it was bound to is on
+  // the other side of a link that is down. `is_online` is the field every
+  // consumer already reads for that, so it carries the news rather than a
+  // second flag they would each have to learn.
+  app.is_online = false;
+}
+void mark_unreachable(Component & component) {
+  component.available = false;
+}
+
+/// The declared entities of `src`, as the peer reported them.
+template <class Entity>
+std::vector<Entity> declared_only(const std::vector<Entity> & src) {
+  std::vector<Entity> kept;
+  for (const auto & entity : src) {
+    if (is_declared(entity)) {
+      kept.push_back(entity);
+    }
+  }
+  return kept;
+}
+
+/// Mark every addressable entity of a replayed declaration unreachable.
+///
+/// The marking is one-way: it only ever sets the flag false, never back to
+/// true. So an entity a peer itself reported as unreachable keeps that from its
+/// own account, and where the marking does apply over a peer's `available` it
+/// is because the peer stopped answering - which is the stronger statement,
+/// since everything it holds sits behind the link that is down.
+template <class Entity>
+void mark_all_unreachable(std::vector<Entity> & entities) {
+  for (auto & entity : entities) {
+    mark_unreachable(entity);
+  }
+}
+
+}  // namespace
+
+void AggregationManager::remember_declaration(const std::string & peer_name, const PeerEntities & entities) {
+  PeerEntities declared;
+  declared.areas = declared_only(entities.areas);
+  declared.components = declared_only(entities.components);
+  declared.apps = declared_only(entities.apps);
+  declared.functions = declared_only(entities.functions);
+
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  retained_peer_entities_[peer_name] = std::move(declared);
+}
+
+PeerEntities AggregationManager::replay_declaration(const std::string & peer_name, Reachability reachability) const {
+  PeerEntities replayed;
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    for (const auto & peer : peers_) {
-      if (peer->is_healthy()) {
-        snapshot.push_back(peer);
-      }
+    auto it = retained_peer_entities_.find(peer_name);
+    if (it == retained_peer_entities_.end()) {
+      return replayed;
     }
+    replayed = it->second;
   }
 
-  PeerEntities merged;
-  for (auto & peer : snapshot) {
-    auto result = peer->fetch_entities();
-    if (!result.has_value()) {
-      continue;
-    }
-
-    const auto & entities = result.value();
-    merged.areas.insert(merged.areas.end(), entities.areas.begin(), entities.areas.end());
-    merged.components.insert(merged.components.end(), entities.components.begin(), entities.components.end());
-    merged.apps.insert(merged.apps.end(), entities.apps.begin(), entities.apps.end());
-    merged.functions.insert(merged.functions.end(), entities.functions.begin(), entities.functions.end());
+  if (reachability == Reachability::kUnreachable) {
+    mark_all_unreachable(replayed.areas);
+    mark_all_unreachable(replayed.components);
+    mark_all_unreachable(replayed.apps);
+    mark_all_unreachable(replayed.functions);
   }
-
-  return merged;
+  return replayed;
 }
 
 AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_entities(
     const std::vector<Area> & local_areas, const std::vector<Component> & local_components,
     const std::vector<App> & local_apps, const std::vector<Function> & local_functions, size_t max_entities_per_peer,
-    rclcpp::Logger * logger) {
+    const log::Logger * logger) {
   MergedPeerResult merged;
   merged.areas = local_areas;
   merged.components = local_components;
@@ -384,11 +462,21 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
   // shared_ptr copies keep PeerClients alive even if remove_discovered_peer()
   // erases them from peers_ concurrently.
   std::vector<std::shared_ptr<PeerClient>> snapshot;
+
+  // A peer this cycle could not describe, and whether it can still be reached.
+  struct UnreadPeer {
+    std::string name;
+    Reachability reachability{Reachability::kUnreachable};
+    std::string reason;
+  };
+  std::vector<UnreadPeer> unread_peers;
   {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     for (const auto & peer : peers_) {
       if (peer->is_healthy()) {
         snapshot.push_back(peer);
+      } else {
+        unread_peers.push_back({peer->name(), Reachability::kUnreachable, "not answering"});
       }
     }
   }
@@ -398,6 +486,10 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
     std::string peer_name;
     bool success{false};
     std::string error;
+    /// Reachability as of the health check taken after a failed fetch, which is
+    /// what separates a peer that died mid-refresh from one that is answering
+    /// but could not be read in full.
+    Reachability reachability{Reachability::kReachable};
     PeerEntities entities;
   };
 
@@ -410,19 +502,27 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
       PeerFetchResult pfr;
       pfr.peer_name = peer->name();
 
+      // Re-checking health only on the failure path answers the one question the
+      // caller needs and costs nothing on the path that succeeded: the flag from
+      // before the fetch cannot tell a peer that has since died from one that is
+      // still there and merely could not be read.
+      auto fetch_failed = [&pfr, &peer](std::string reason) {
+        pfr.success = false;
+        pfr.error = std::move(reason);
+        peer->check_health();
+        pfr.reachability = peer->is_healthy() ? Reachability::kReachable : Reachability::kUnreachable;
+        return pfr;
+      };
+
       auto result = peer->fetch_entities();
       if (!result.has_value()) {
-        pfr.success = false;
-        pfr.error = result.error();
-        return pfr;
+        return fetch_failed(result.error());
       }
 
       size_t total = result->areas.size() + result->components.size() + result->apps.size() + result->functions.size();
       if (total > max_entities_per_peer) {
-        pfr.success = false;
-        pfr.error = "returned " + std::to_string(total) + " entities (max " + std::to_string(max_entities_per_peer) +
-                    "), skipping";
-        return pfr;
+        return fetch_failed("returned " + std::to_string(total) + " entities (max " +
+                            std::to_string(max_entities_per_peer) + "), skipping");
       }
 
       pfr.success = true;
@@ -437,15 +537,62 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
   std::vector<PeerClaim> peer_component_claims;
 
   // Collect results and merge sequentially (merge order must be deterministic)
+  std::vector<PeerFetchResult> to_merge;
+  to_merge.reserve(futures.size() + unread_peers.size());
   for (auto & f : futures) {
     auto pfr = f.get();
     if (!pfr.success) {
+      // The last complete declaration is not replaced by a picture with holes
+      // in it: `remember_declaration` overwrites, so recording a partial fetch
+      // would outlive the cycle that failed and be replayed as the peer's own
+      // account of itself.
       if (logger) {
-        RCLCPP_WARN(*logger, "Failed to fetch entities from peer '%s': %s", pfr.peer_name.c_str(), pfr.error.c_str());
+        MEDKIT_LOG_WARN(*logger, "Failed to fetch entities from peer '%s': %s", pfr.peer_name.c_str(),
+                        pfr.error.c_str());
       }
+      unread_peers.push_back({pfr.peer_name, pfr.reachability,
+                              pfr.reachability == Reachability::kReachable ? "refresh incomplete" : "not answering"});
       continue;
     }
+    if (logger && !pfr.entities.absent_routes.empty()) {
+      std::string routes;
+      for (const auto & route : pfr.entities.absent_routes) {
+        routes += routes.empty() ? route : ", " + route;
+      }
+      MEDKIT_LOG_WARN(*logger, "Peer '%s' does not expose %s; aggregating without the members those routes carry",
+                      pfr.peer_name.c_str(), routes.c_str());
+    }
+    remember_declaration(pfr.peer_name, pfr.entities);
+    to_merge.push_back(std::move(pfr));
+  }
 
+  // A peer this cycle could not describe still contributes what it declared.
+  // Merged after the peers that did answer, so a live declaration always wins
+  // over a retained one carrying the same id.
+  for (const auto & peer : unread_peers) {
+    auto retained = replay_declaration(peer.name, peer.reachability);
+    if (retained.areas.empty() && retained.components.empty() && retained.apps.empty() && retained.functions.empty()) {
+      continue;
+    }
+    if (logger) {
+      const size_t count =
+          retained.areas.size() + retained.components.size() + retained.apps.size() + retained.functions.size();
+      if (peer.reachability == Reachability::kUnreachable) {
+        MEDKIT_LOG_INFO(*logger, "Peer '%s' %s; retaining %zu declared entities as unavailable", peer.name.c_str(),
+                        peer.reason.c_str(), count);
+      } else {
+        MEDKIT_LOG_WARN(*logger, "Peer '%s' %s; it is still reachable, so its %zu declared entities stand as last read",
+                        peer.name.c_str(), peer.reason.c_str(), count);
+      }
+    }
+    PeerFetchResult replayed;
+    replayed.peer_name = peer.name;
+    replayed.success = true;
+    replayed.entities = std::move(retained);
+    to_merge.push_back(std::move(replayed));
+  }
+
+  for (auto & pfr : to_merge) {
     PeerClaim claim;
     claim.peer_name = pfr.peer_name;
     for (const auto & c : pfr.entities.components) {
@@ -492,7 +639,7 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
       // Log collision-prefixed entities to help operators diagnose naming conflicts
       if (id.find(EntityMerger::SEPARATOR) != std::string::npos) {
         if (logger) {
-          RCLCPP_WARN(*logger, "Entity ID collision: '%s' prefixed for peer '%s'", id.c_str(), name.c_str());
+          MEDKIT_LOG_WARN(*logger, "Entity ID collision: '%s' prefixed for peer '%s'", id.c_str(), name.c_str());
         }
       }
     }
@@ -523,7 +670,7 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
 
   if (logger) {
     for (const auto & msg : classified.malformed_parent_warnings) {
-      RCLCPP_WARN(*logger, "Aggregation: %s", msg.c_str());
+      MEDKIT_LOG_WARN(*logger, "Aggregation: %s", msg.c_str());
     }
     for (const auto & w : merged.leaf_warnings) {
       std::string peers_str;
@@ -533,8 +680,8 @@ AggregationManager::MergedPeerResult AggregationManager::fetch_and_merge_peer_en
         }
         peers_str += w.peer_names[i];
       }
-      RCLCPP_WARN(*logger, "Leaf Component '%s' announced by multiple peers: %s. Routing uses last-writer-wins.",
-                  w.entity_id.c_str(), peers_str.c_str());
+      MEDKIT_LOG_WARN(*logger, "Leaf Component '%s' announced by multiple peers: %s. Routing uses last-writer-wins.",
+                      w.entity_id.c_str(), peers_str.c_str());
     }
   }
 
@@ -563,6 +710,19 @@ std::optional<std::string> AggregationManager::find_peer_for_entity(const std::s
     return it->second;
   }
   return std::nullopt;
+}
+
+std::string AggregationManager::local_member_id(const std::string & peer_name, const std::string & member_id) const {
+  if (peer_name.empty() || member_id.empty()) {
+    return member_id;
+  }
+  const std::string prefixed = peer_name + EntityMerger::SEPARATOR + member_id;
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  auto it = routing_table_.find(prefixed);
+  // The routing entry has to belong to THIS peer. Another peer can own an
+  // entity whose id happens to read like this peer's prefix, and answering with
+  // it would re-address the item to a gateway that never sent it.
+  return (it != routing_table_.end() && it->second == peer_name) ? prefixed : member_id;
 }
 
 void AggregationManager::update_peer_contributors(
@@ -621,6 +781,11 @@ std::string AggregationManager::get_peer_url(const std::string & peer_name) cons
 
 void AggregationManager::forward_request(const std::string & peer_name, const httplib::Request & req,
                                          httplib::Response & res) {
+  forward_request(peer_name, req, res, req.path);
+}
+
+void AggregationManager::forward_request(const std::string & peer_name, const httplib::Request & req,
+                                         httplib::Response & res, const std::string & target_path) {
   // Find peer under lock, take shared_ptr copy for lifetime safety, then release
   // before network I/O. The shared_ptr keeps the PeerClient alive even if
   // remove_discovered_peer() erases it from peers_ concurrently.
@@ -641,8 +806,10 @@ void AggregationManager::forward_request(const std::string & peer_name, const ht
   }
 
   // Validate forwarded path - only allow SOVD API paths to prevent SSRF
-  // to internal peer endpoints (e.g., /metrics, /debug, /admin).
-  if (req.path.rfind("/api/v1/", 0) != 0) {
+  // to internal peer endpoints (e.g., /metrics, /debug, /admin). The path is
+  // checked whether it came from the client or was built by a caller from
+  // client-supplied ids; both are equally untrusted.
+  if (target_path.rfind("/api/v1/", 0) != 0) {
     res.status = 400;
     nlohmann::json error_body;
     error_body["error_code"] = ERR_INVALID_REQUEST;
@@ -657,7 +824,7 @@ void AggregationManager::forward_request(const std::string & peer_name, const ht
   // the prefix before forwarding.
   // Anchor to path segment boundary: the prefix must appear right after '/' to avoid
   // false matches inside other path segments (e.g., "v1" matching "/api/v1/").
-  std::string forwarded_path = req.path;
+  std::string forwarded_path = target_path;
   std::string prefix = peer_name + EntityMerger::SEPARATOR;
   auto prefix_pos = forwarded_path.find(prefix);
   if (prefix_pos != std::string::npos && prefix_pos > 0 && forwarded_path[prefix_pos - 1] == '/') {
@@ -672,12 +839,19 @@ void AggregationManager::forward_request(const std::string & peer_name, const ht
 
 AggregationManager::FanOutResult AggregationManager::fan_out_get(const std::string & path,
                                                                  const std::string & auth_header,
-                                                                 const std::vector<std::string> * target_peers) {
+                                                                 const std::vector<std::string> * target_peers,
+                                                                 const httplib::Headers & extra_headers) {
   // Per-peer result collected by each async task
   struct PeerResult {
     std::string peer_name;
     bool success{false};
+    /// Wire token for why this peer failed, from `peer_failure_reason`. Empty
+    /// on success. Built here rather than discarded, which is what left every
+    /// fan-out failure indistinguishable on the wire.
+    std::string failure_reason;
     nlohmann::json items = nlohmann::json::array();
+    /// What the peer itself could not reach, when it fanned out further.
+    std::vector<dto::PeerFailure> nested_failures;
   };
 
   // A non-null, empty target list means "no peers match" - skip fan-out
@@ -688,6 +862,11 @@ AggregationManager::FanOutResult AggregationManager::fan_out_get(const std::stri
     FanOutResult empty_result;
     empty_result.merged_items = nlohmann::json::array();
     return empty_result;
+  }
+
+  std::vector<std::string> visited;
+  if (auto it = extra_headers.find(kFanOutVisitedHeader); it != extra_headers.end()) {
+    visited = split_fan_out_visited(it->second);
   }
 
   // Snapshot healthy peers under lock, release before network I/O.
@@ -703,22 +882,34 @@ AggregationManager::FanOutResult AggregationManager::fan_out_get(const std::stri
           std::find(target_peers->begin(), target_peers->end(), peer->name()) == target_peers->end()) {
         continue;
       }
+      // Already answered for this request. Asked anyway it would answer empty,
+      // but only once one of its workers is free, and every worker it has may
+      // be waiting on this gateway.
+      if (!visited.empty()) {
+        const auto peer_id = peer->instance_id();
+        if (!peer_id.empty() && std::find(visited.begin(), visited.end(), peer_id) != visited.end()) {
+          continue;
+        }
+      }
       snapshot.push_back(peer);
     }
   }
 
   // Fan out GET requests in parallel via std::async to reduce worst-case
   // latency from N * timeout_ms (sequential) to just timeout_ms (parallel).
+  httplib::Headers headers{{"X-Medkit-No-Fan-Out", "1"}};
+  headers.insert(extra_headers.begin(), extra_headers.end());
   std::vector<std::future<PeerResult>> futures;
   futures.reserve(snapshot.size());
   for (auto & peer : snapshot) {
-    futures.push_back(std::async(std::launch::async, [peer, path, auth_header]() {
+    futures.push_back(std::async(std::launch::async, [peer, path, auth_header, headers]() {
       PeerResult pr;
       pr.peer_name = peer->name();
 
-      auto result = peer->forward_and_get_json("GET", path, auth_header, {{"X-Medkit-No-Fan-Out", "1"}});
+      auto result = peer->forward_and_get_json("GET", path, auth_header, headers);
       if (!result.has_value()) {
         pr.success = false;
+        pr.failure_reason = peer_failure_reason(result.error().kind);
         return pr;
       }
 
@@ -726,6 +917,47 @@ AggregationManager::FanOutResult AggregationManager::fan_out_get(const std::stri
       const auto & response_json = result.value();
       if (response_json.contains("items") && response_json["items"].is_array()) {
         pr.items = response_json["items"];
+      }
+      // A peer that fanned out further and could not reach everything says so.
+      // Dropping that would report this answer complete without those items.
+      const auto x_medkit = response_json.find("x-medkit");
+      const bool peer_partial = x_medkit != response_json.end() && x_medkit->is_object() &&
+                                x_medkit->contains("partial") && (*x_medkit)["partial"].is_boolean() &&
+                                (*x_medkit)["partial"].get<bool>();
+      if (peer_partial) {
+        std::vector<std::string> nested_names;
+        if (auto names = x_medkit->find("failed_peers"); names != x_medkit->end() && names->is_array()) {
+          for (const auto & name : *names) {
+            if (name.is_string()) {
+              nested_names.push_back(name.get<std::string>());
+            }
+          }
+        }
+        for (const auto & name : nested_names) {
+          // A peer that predates peer_failures names no reason. Its partial
+          // flag meant a peer call that failed, which is what unreachable says.
+          std::string reason = "unreachable";
+          if (auto failures = x_medkit->find("peer_failures"); failures != x_medkit->end() && failures->is_array()) {
+            for (const auto & failure : *failures) {
+              if (!failure.is_object()) {
+                continue;
+              }
+              const auto named = failure.find("peer");
+              const auto why = failure.find("reason");
+              if (named != failure.end() && named->is_string() && named->get<std::string>() == name) {
+                if (why != failure.end() && why->is_string()) {
+                  reason = why->get<std::string>();
+                }
+                break;
+              }
+            }
+          }
+          pr.nested_failures.push_back(dto::PeerFailure{pr.peer_name + "/" + name, std::move(reason)});
+        }
+        // Partial with nobody named breaks the contract this route promises.
+        if (pr.nested_failures.empty()) {
+          pr.nested_failures.push_back(dto::PeerFailure{pr.peer_name, "invalid-response"});
+        }
       }
       return pr;
     }));
@@ -738,11 +970,18 @@ AggregationManager::FanOutResult AggregationManager::fan_out_get(const std::stri
     auto pr = f.get();
     if (!pr.success) {
       fan_out_result.is_partial = true;
+      fan_out_result.peer_failures.push_back(dto::PeerFailure{pr.peer_name, std::move(pr.failure_reason)});
       fan_out_result.failed_peers.push_back(std::move(pr.peer_name));
       continue;
     }
     for (auto & item : pr.items) {
       fan_out_result.merged_items.push_back(std::move(item));
+      fan_out_result.item_peers.push_back(pr.peer_name);
+    }
+    for (auto & failure : pr.nested_failures) {
+      fan_out_result.is_partial = true;
+      fan_out_result.failed_peers.push_back(failure.peer);
+      fan_out_result.peer_failures.push_back(std::move(failure));
     }
   }
 
@@ -761,6 +1000,17 @@ nlohmann::json AggregationManager::get_peer_status() const {
     status_array.push_back(peer_obj);
   }
   return status_array;
+}
+
+std::vector<PeerEndpoint> AggregationManager::healthy_peer_endpoints() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  std::vector<PeerEndpoint> endpoints;
+  for (const auto & peer : peers_) {
+    if (peer->is_healthy()) {
+      endpoints.push_back(PeerEndpoint{peer->name(), peer->url()});
+    }
+  }
+  return endpoints;
 }
 
 PeerClient * AggregationManager::find_peer(const std::string & name) const {

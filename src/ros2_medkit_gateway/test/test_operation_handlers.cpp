@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -38,8 +39,12 @@
 #include <variant>
 #include <vector>
 
+#include "null_gateway_services.hpp"
+#include "ros2_medkit_gateway/core/discovery/models/area.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/handlers/operation_handlers.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
+#include "ros2_medkit_gateway/core/providers/operation_provider.hpp"
 #include "ros2_medkit_gateway/dto/json_writer.hpp"
 #include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/typed_router.hpp"
@@ -48,6 +53,7 @@ using json = nlohmann::json;
 using ros2_medkit_gateway::ActionGoalInfo;
 using ros2_medkit_gateway::ActionGoalStatus;
 using ros2_medkit_gateway::ActionInfo;
+using ros2_medkit_gateway::Area;
 using ros2_medkit_gateway::AuthConfig;
 using ros2_medkit_gateway::Component;
 using ros2_medkit_gateway::CorsConfig;
@@ -207,7 +213,7 @@ class OperationHandlersValidationTest : public ::testing::Test {
   CorsConfig cors_{};
   AuthConfig auth_{};
   TlsConfig tls_{};
-  HandlerContext ctx_{nullptr, cors_, auth_, tls_, nullptr};
+  HandlerContext ctx_{ros2_medkit_gateway::test_support::null_services(), cors_, auth_, tls_, nullptr};
   OperationHandlers handlers_{ctx_};
 };
 
@@ -233,6 +239,45 @@ TEST_F(OperationHandlersValidationTest, ListOperationsInvalidEntityReturns400) {
   EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_INVALID_PARAMETER);
 }
 
+// A plugin owning one entity and one operation. An operation a plugin serves is
+// synchronous - execute_operation returns the result - so the entity has an
+// executions collection that is empty, and an id the plugin does not know is
+// still a miss. Nothing else in this workspace pairs an OperationProvider with
+// a live GatewayNode, so without this the plugin branch could not be driven.
+class MockOperationPlugin : public ros2_medkit_gateway::GatewayPlugin, public ros2_medkit_gateway::OperationProvider {
+ public:
+  static constexpr const char * kName = "mock_operation_plugin";
+  static constexpr const char * kEntityId = "plugin_ecu";
+  static constexpr const char * kOperationId = "plugin_op";
+
+  std::string name() const override {
+    return kName;
+  }
+  void configure(const json & /*config*/) override {
+  }
+  void shutdown() override {
+  }
+
+  tl::expected<ros2_medkit_gateway::dto::Collection<ros2_medkit_gateway::dto::OperationItem>,
+               ros2_medkit_gateway::OperationProviderErrorInfo>
+  list_operations(const std::string & entity_id) override {
+    ros2_medkit_gateway::dto::Collection<ros2_medkit_gateway::dto::OperationItem> coll;
+    ros2_medkit_gateway::dto::OperationItem item;
+    item.id = kOperationId;
+    item.name = kOperationId;
+    ros2_medkit_gateway::dto::XMedkitOperationItem xm;
+    xm.entity_id = entity_id;
+    item.x_medkit = xm;
+    coll.items.push_back(std::move(item));
+    return coll;
+  }
+
+  tl::expected<ros2_medkit_gateway::dto::OperationExecutionResult, ros2_medkit_gateway::OperationProviderErrorInfo>
+  execute_operation(const std::string & /*entity_id*/, const std::string & op, const json & /*params*/) override {
+    return ros2_medkit_gateway::dto::OperationExecutionResult{json{{"executed", op}}};
+  }
+};
+
 // =============================================================================
 // Fixture-based tests against a live GatewayNode + ROS 2 graph.
 // =============================================================================
@@ -245,14 +290,15 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     suite_server_port_ = reserve_local_port();
     ASSERT_NE(suite_server_port_, 0);
 
-    std::vector<std::string> args = {"test_operation_handlers",
-                                     "--ros-args",
-                                     "-p",
-                                     "server.port:=" + std::to_string(suite_server_port_),
-                                     "-p",
-                                     "refresh_interval_ms:=60000",
-                                     "-p",
-                                     "service_call_timeout_sec:=1"};
+    std::vector<std::string> args = {"test_operation_handlers", "--ros-args", "-p",
+                                     "server.port:=" + std::to_string(suite_server_port_), "-p",
+                                     "refresh_interval_ms:=60000", "-p",
+                                     // Pin the graph-event refresh debounce at its 60s maximum so the
+                                     // single startup refresh_cache() that reconciles the test nodes is
+                                     // the only one for the test's lifetime. Without this, a refresh
+                                     // fired by the goal's client/subscription graph churn could wipe the
+                                     // manually seeded component between the seed and list_executions.
+                                     "discovery.refresh_debounce_ms:=60000", "-p", "service_call_timeout_sec:=1"};
 
     std::vector<char *> argv;
     argv.reserve(args.size());
@@ -273,6 +319,12 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     gateway_node_ = std::make_shared<GatewayNode>();
     ASSERT_NE(gateway_node_, nullptr);
 
+    // Cache generation right after construction: only the gateway's own graph is
+    // discovered at this point. The first graph-event-driven refresh_cache()
+    // after the test nodes join advances it, which is the signal we wait on
+    // before seeding.
+    const uint64_t base_generation = gateway_node_->get_thread_safe_cache().generation();
+
     service_node_ = std::make_shared<rclcpp::Node>("test_calibrate_service", "/powertrain/engine");
     trigger_service_ = service_node_->create_service<std_srvs::srv::Trigger>(
         "calibrate", [](const std::shared_ptr<std_srvs::srv::Trigger::Request> & /*request*/,
@@ -283,6 +335,12 @@ class OperationHandlersFixtureTest : public ::testing::Test {
 
     action_server_node_ = std::make_shared<TestLongCalibrationActionServer>();
 
+    // Before the executor spins. `PluginManager::add_plugin` writes `plugins_`
+    // without taking the lock its readers hold, because it is documented as
+    // init-only - and once a thread is spinning, the log-observer read of that
+    // same vector races the write.
+    seed_plugin_entity();
+
     executor_ = std::make_unique<rclcpp::executors::MultiThreadedExecutor>();
     executor_->add_node(gateway_node_);
     executor_->add_node(service_node_);
@@ -290,23 +348,28 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     spin_thread_ = std::thread([this]() {
       executor_->spin();
     });
+    // A cancel() that lands before spin() starts is lost, and join() would block.
+    while (!executor_->is_spinning()) {
+      std::this_thread::yield();
+    }
 
-    ctx_ = std::make_unique<HandlerContext>(gateway_node_.get(), cors_, auth_, tls_, nullptr);
+    ctx_ = std::make_unique<HandlerContext>(*gateway_node_, cors_, auth_, tls_, nullptr);
     handlers_ = std::make_unique<OperationHandlers>(*ctx_);
 
-    // Wait for DDS discovery to complete: the executor must discover
-    // the action server, trigger service, and all internal action services
-    // (_cancel_goal, _get_result, _status). On slow CI runners under
-    // parallel load, 200ms was insufficient.
-    std::this_thread::sleep_for(1s);
-
-    // Seed the component cache AFTER discovery has settled. The gateway's
-    // graph-event-driven `refresh_cache()` fires whenever the executor
-    // observes a graph change (adding service_node_ / action_server_node_
-    // produces several such events), and each refresh pass calls
-    // `cache.update_all(...)` from the gateway's own discovery view -
-    // which would otherwise wipe a pre-spin seed. Seeding here guarantees
-    // the test's manually-injected entities are the latest write.
+    // Deterministic readiness, replacing a fixed discovery sleep. Two signals
+    // must hold before we seed and drive operations:
+    //   1. The action's send_goal service and the trigger service are visible
+    //      on the gateway participant, so create_execution's send_goal
+    //      (wait_for_service) resolves instead of racing DDS discovery.
+    //   2. The cache generation advanced past construction, proving the single
+    //      graph-event-driven refresh_cache() that reconciles these nodes has
+    //      already run. With discovery.refresh_debounce_ms pinned at 60s, that
+    //      first refresh is the only one for the test's lifetime, so seeding
+    //      afterwards is the final cache write and cannot be clobbered by a
+    //      concurrent refresh mid-test (the race that made ListExecutions flake
+    //      under load).
+    ASSERT_TRUE(wait_for_discovery_settled(base_generation))
+        << "action/service discovery did not settle before seeding";
     seed_component_cache();
   }
 
@@ -334,6 +397,33 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     gateway_node_.reset();
   }
 
+  /// Block until DDS discovery has surfaced the action's send_goal service and
+  /// the trigger service on the gateway participant AND the gateway has run its
+  /// first post-startup refresh_cache() (cache generation advanced past
+  /// `base_generation`). Returns false if either signal is missing at the
+  /// deadline. This is a real readiness gate, not a fixed sleep.
+  bool wait_for_discovery_settled(uint64_t base_generation, std::chrono::seconds timeout = std::chrono::seconds(15)) {
+    const std::string send_goal_srv = "/powertrain/engine/long_calibration/_action/send_goal";
+    const std::string calibrate_srv = "/powertrain/engine/calibrate";
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    bool graph_ready = false;
+    bool refresh_ran = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+      if (!graph_ready) {
+        const auto services = gateway_node_->get_service_names_and_types();
+        graph_ready = services.count(send_goal_srv) > 0 && services.count(calibrate_srv) > 0;
+      }
+      if (!refresh_ran) {
+        refresh_ran = gateway_node_->get_thread_safe_cache().generation() > base_generation;
+      }
+      if (graph_ready && refresh_ran) {
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+  }
+
   void seed_component_cache() {
     Component component;
     component.id = "engine";
@@ -347,8 +437,68 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     component.actions = {ActionInfo{"long_calibration", "/powertrain/engine/long_calibration",
                                     "example_interfaces/action/Fibonacci", std::nullopt}};
 
+    // A second member of the same area exposing `calibrate` at a different ROS
+    // path. Deduplication keys on the full path, so both survive the area-level
+    // walk and the short name - which is the wire id - stops naming one of
+    // them. That is the ambiguity the qualified form exists for, and it needs
+    // two members to exist at all.
+    Component gearbox;
+    gearbox.id = "gearbox";
+    gearbox.name = "Gearbox";
+    gearbox.namespace_path = "/powertrain/gearbox";
+    gearbox.fqn = "/powertrain/gearbox";
+    gearbox.area = "powertrain";
+    gearbox.source = "manifest";
+    gearbox.services = {
+        ServiceInfo{"calibrate", "/powertrain/gearbox/calibrate", "std_srvs/srv/Trigger", std::nullopt}};
+
+    // The area the component sits in. The operation routes are registered for
+    // all four entity types and create_execution rejects a collection /
+    // entity-type mismatch, so exercising a non-component collection needs a
+    // real entity of that type; an area aggregates its components' operations.
+    Area area;
+    area.id = "powertrain";
+    area.name = "Powertrain";
+    area.namespace_path = "/powertrain";
+    area.source = "manifest";
+
+    // A second aggregate that does NOT contain `engine`, and that has an
+    // operation of its own so `resolve_entity_operations` succeeds for it. An
+    // empty area would 404 for want of operations and would prove nothing
+    // about who may address whose execution.
+    Component brakes;
+    brakes.id = "brakes";
+    brakes.name = "Brakes";
+    brakes.namespace_path = "/chassis/brakes";
+    brakes.fqn = "/chassis/brakes";
+    brakes.area = "chassis";
+    brakes.source = "manifest";
+    brakes.actions = {ActionInfo{"long_calibration", "/chassis/brakes/long_calibration",
+                                 "example_interfaces/action/Fibonacci", std::nullopt}};
+
+    Area chassis;
+    chassis.id = "chassis";
+    chassis.name = "Chassis";
+    chassis.namespace_path = "/chassis";
+    chassis.source = "manifest";
+
+    Component plugin_ecu;
+    plugin_ecu.id = MockOperationPlugin::kEntityId;
+    plugin_ecu.name = "Plugin ECU";
+    plugin_ecu.namespace_path = "/external";
+    plugin_ecu.fqn = "/external";
+    plugin_ecu.source = "plugin";
+
     auto & cache = const_cast<ThreadSafeEntityCache &>(gateway_node_->get_thread_safe_cache());
-    cache.update_all({}, {component}, {}, {});
+    cache.update_all({area, chassis}, {component, gearbox, brakes, plugin_ecu}, {}, {});
+  }
+
+  /// Give the plugin ECU an owner, so the handlers route it to the provider.
+  void seed_plugin_entity() {
+    auto * pmgr = gateway_node_->get_plugin_manager();
+    ASSERT_NE(pmgr, nullptr);
+    pmgr->add_plugin(std::make_unique<MockOperationPlugin>());
+    pmgr->register_entity_ownership(MockOperationPlugin::kName, {MockOperationPlugin::kEntityId});
   }
 
   /// Drive `create_execution` and assert the typed response carries the async
@@ -373,15 +523,20 @@ class OperationHandlersFixtureTest : public ::testing::Test {
     }
     EXPECT_FALSE(async_ptr->id.empty());
 
-    // Re-seed cache after the goal subscription perturbs discovery.
-    seed_component_cache();
+    // No re-seed needed: with the refresh debounce pinned at 60s, the goal's
+    // client/subscription graph churn cannot trigger a refresh that wipes the
+    // seed within the test's lifetime.
     return async_ptr->id;
   }
 
-  ActionGoalInfo get_tracked_goal_or_fail(const std::string & execution_id) {
+  // Returns the optional, so a missing goal reaches the caller as an empty
+  // value and the caller's ASSERT stops the test with a message. A non-fatal
+  // expectation followed by an unconditional `*goal_info` here would be
+  // undefined behaviour.
+  std::optional<ActionGoalInfo> get_tracked_goal_or_fail(const std::string & execution_id) {
     auto goal_info = gateway_node_->get_operation_manager()->get_tracked_goal(execution_id);
     EXPECT_TRUE(goal_info.has_value());
-    return *goal_info;
+    return goal_info;
   }
 
   CorsConfig cors_{};
@@ -484,6 +639,199 @@ TEST_F(OperationHandlersFixtureTest, ListExecutionsReturnsTrackedActionGoal) {
   EXPECT_EQ(collection.items[0].id, execution_id);
 }
 
+// The executions of an operation are addressed by the id that addresses the
+// operation, so a member half has to select among same-named copies here just
+// as it does on the execution itself.
+TEST_F(OperationHandlersFixtureTest, ListExecutionsResolvesAQualifiedIdToItsMember) {
+  const auto execution_id = create_action_execution();
+  ASSERT_FALSE(execution_id.empty());
+
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/engine:long_calibration/executions",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->list_executions(typed);
+  ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
+  ASSERT_EQ(result->items.size(), 1u);
+  EXPECT_EQ(result->items[0].id, execution_id);
+}
+
+// A collection that hands out an id its own item routes reject is worse than
+// one that hides the execution: the client did everything right and still gets
+// "not found". Reading the collection and following what it returned is the
+// only way to catch that, so this asserts on the id the previous case listed
+// rather than on one the test built itself.
+// Parsing a member half proves only that the ADDRESSED entity aggregates. It
+// does not prove the member named is one of ITS members, and an execution is
+// not a global handle: reachable through the entity that started it, and
+// through an aggregate that actually contains that entity, and nowhere else.
+// Without the membership gate any aggregate could name someone else's owner
+// and read, stop or cancel their execution from an unrelated URI.
+TEST_F(OperationHandlersFixtureTest, AnUnrelatedAggregateCannotReachAnExecutionByNamingItsOwner) {
+  const auto execution_id = create_action_execution();
+  ASSERT_FALSE(execution_id.empty());
+
+  // `chassis` aggregates `brakes`, never `engine`, but it does aggregate - so
+  // the member half parses and only membership can refuse this.
+  const std::string intruder = "/api/v1/areas/chassis/operations/engine:long_calibration/executions/" + execution_id;
+  const char * pattern = R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions/([^/]+))";
+
+  auto get_req = make_request_with_match(intruder, pattern);
+  http::TypedRequest get_typed(get_req);
+  auto fetched = handlers_->get_execution(get_typed);
+  ASSERT_FALSE(fetched.has_value()) << "an unrelated aggregate read someone else's execution";
+  EXPECT_EQ(fetched.error().http_status, 404);
+
+  auto del_req = make_request_with_match(intruder, pattern);
+  http::TypedRequest del_typed(del_req);
+  auto cancelled = handlers_->cancel_execution(del_typed);
+  ASSERT_FALSE(cancelled.has_value()) << "an unrelated aggregate cancelled someone else's execution";
+  EXPECT_EQ(cancelled.error().http_status, 404);
+
+  // And the execution is untouched: the refusal must not be a side effect of
+  // having already killed it.
+  auto owner_req =
+      make_request_with_match("/api/v1/components/engine/operations/long_calibration/executions/" + execution_id,
+                              R"(/api/v1/components/([^/]+)/operations/([^/]+)/executions/([^/]+))");
+  http::TypedRequest owner_typed(owner_req);
+  EXPECT_TRUE(handlers_->get_execution(owner_typed).has_value()) << "the owner lost its own execution";
+}
+
+TEST_F(OperationHandlersFixtureTest, AQualifiedIdListedByTheCollectionAlsoResolvesOnTheItemRoutes) {
+  const auto execution_id = create_action_execution();
+  ASSERT_FALSE(execution_id.empty());
+
+  auto list_req = make_request_with_match("/api/v1/areas/powertrain/operations/engine:long_calibration/executions",
+                                          R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest list_typed(list_req);
+  auto listed = handlers_->list_executions(list_typed);
+  ASSERT_TRUE(listed.has_value()) << listed.error().code << ": " << listed.error().message;
+  ASSERT_EQ(listed->items.size(), 1u);
+  const std::string advertised_id = listed->items[0].id;
+
+  auto item_req =
+      make_request_with_match("/api/v1/areas/powertrain/operations/engine:long_calibration/executions/" + advertised_id,
+                              R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions/([^/]+))");
+  http::TypedRequest item_typed(item_req);
+
+  auto fetched = handlers_->get_execution(item_typed);
+  ASSERT_TRUE(fetched.has_value()) << "the collection advertised " << advertised_id << " but GET answered "
+                                   << fetched.error().code << ": " << fetched.error().message;
+  // `id` is only populated by the PUT response; the identity a GET carries is
+  // the tracked goal, so that is what has to be the execution we followed.
+  ASSERT_TRUE(fetched->x_medkit.has_value());
+  EXPECT_EQ(fetched->x_medkit->goal_id, advertised_id);
+}
+
+// A service answers inside its own call, so it never leaves an execution
+// behind. The collection is present and empty, which is the answer an id
+// naming no operation must NOT get.
+TEST_F(OperationHandlersFixtureTest, ListExecutionsOfAServiceIsAnEmptyCollection) {
+  auto raw_req = make_request_with_match("/api/v1/components/engine/operations/calibrate/executions",
+                                         R"(/api/v1/components/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->list_executions(typed);
+  ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
+  EXPECT_TRUE(result->items.empty());
+}
+
+TEST_F(OperationHandlersFixtureTest, ListExecutionsUnknownOperationIsOperationNotFound) {
+  auto raw_req = make_request_with_match("/api/v1/components/engine/operations/does_not_exist/executions",
+                                         R"(/api/v1/components/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->list_executions(typed);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 404);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_OPERATION_NOT_FOUND);
+}
+
+TEST_F(OperationHandlersFixtureTest, ListExecutionsUnknownEntityIsEntityNotFound) {
+  auto raw_req = make_request_with_match("/api/v1/components/no_such_entity/operations/calibrate/executions",
+                                         R"(/api/v1/components/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->list_executions(typed);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 404);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_ENTITY_NOT_FOUND);
+}
+
+// The bare id names two operations, so it names neither collection of goals.
+TEST_F(OperationHandlersFixtureTest, ListExecutionsRefusesAnAmbiguousBareId) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/calibrate/executions",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->list_executions(typed);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 400);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_INVALID_REQUEST);
+  ASSERT_TRUE(result.error().params.contains("operation_ids"));
+}
+
+// A read that resolved this id would describe one of two operations and never
+// say which, while running the same id is a 400. One id, one answer.
+TEST_F(OperationHandlersFixtureTest, GetOperationRefusesAnAmbiguousBareId) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/calibrate",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+))");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->get_operation(typed);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 400);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_INVALID_REQUEST);
+  ASSERT_TRUE(result.error().params.contains("operation_ids"));
+  std::set<std::string> offered;
+  for (const auto & id : result.error().params["operation_ids"]) {
+    offered.insert(id.get<std::string>());
+  }
+  EXPECT_EQ(offered, (std::set<std::string>{"engine:calibrate", "gearbox:calibrate"}));
+}
+
+// The other half of the same rule, and the one every existing client depends
+// on: an id its own provider carries once still reads.
+TEST_F(OperationHandlersFixtureTest, GetOperationStillResolvesAnUnambiguousBareId) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/long_calibration",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+))");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->get_operation(typed);
+
+  ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
+  EXPECT_EQ(result->item.id, "long_calibration");
+  ASSERT_TRUE(result->item.x_medkit.has_value());
+  ASSERT_TRUE(result->item.x_medkit->ros2.has_value());
+  EXPECT_EQ(result->item.x_medkit->ros2->action, "/powertrain/engine/long_calibration");
+}
+
+TEST_F(OperationHandlersFixtureTest, ListExecutionsOnAPluginEntityIsAnEmptyCollection) {
+  auto raw_req = make_request_with_match(std::string("/api/v1/components/") + MockOperationPlugin::kEntityId +
+                                             "/operations/" + MockOperationPlugin::kOperationId + "/executions",
+                                         R"(/api/v1/components/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->list_executions(typed);
+  ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
+  EXPECT_TRUE(result->items.empty());
+}
+
+TEST_F(OperationHandlersFixtureTest, ListExecutionsOnAPluginEntityRefusesAnUnknownOperation) {
+  auto raw_req = make_request_with_match(std::string("/api/v1/components/") + MockOperationPlugin::kEntityId +
+                                             "/operations/does_not_exist/executions",
+                                         R"(/api/v1/components/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->list_executions(typed);
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 404);
+  // The plugin decided this, and the same code the plugin read route answers
+  // with, so a caller cannot tell the two routes apart by the error alone.
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_PLUGIN_ERROR);
+}
+
 TEST_F(OperationHandlersFixtureTest, GetExecutionContainsStatusFields) {
   const auto execution_id = create_action_execution();
   ASSERT_FALSE(execution_id.empty());
@@ -520,8 +868,134 @@ TEST_F(OperationHandlersFixtureTest, CancelExecutionUnknownIdReturns404) {
   EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_RESOURCE_NOT_FOUND);
 }
 
+// The POST executions route is registered for apps, components, areas and
+// functions alike (rest_server.cpp entity-type loop), so a Location built
+// from a hardcoded apps/components pair sends an areas or functions client
+// into the components collection - and bypasses api_path() while doing it.
+// Driven through the areas collection: create_execution validates that the
+// route's entity type matches the resolved entity, so the request has to
+// target a genuine non-component entity that owns the action.
+// The created execution is a sub-resource of whatever collection the client
+// POSTed to, so the Location must extend the request path.
+TEST_F(OperationHandlersFixtureTest, CreateExecutionLocationExtendsTheRequestedCollectionPath) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/long_calibration/executions",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+  const std::string & requested_path = typed.path();
+  dto::ExecutionCreateRequest body;
+  body.parameters = json{{"order", 6}};
+
+  auto result = handlers_->create_execution(typed, body);
+
+  ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
+  const auto * async_ptr = std::get_if<dto::ExecutionCreateAsync>(&result.value().first);
+  ASSERT_NE(async_ptr, nullptr);
+
+  const auto & headers = result.value().second.headers;
+  auto location = std::find_if(headers.begin(), headers.end(), [](const auto & kv) {
+    return kv.first == "Location";
+  });
+  ASSERT_NE(location, headers.end()) << "202 must carry a Location header";
+  EXPECT_EQ(location->second, requested_path + "/" + async_ptr->id);
+}
+
+// Qualification follows ambiguity, so one collection must show both halves at
+// once: the id two members share is qualified, the id only one member has is
+// not. Asserting only the qualified half would pass a rule that renamed
+// everything, which is what breaks every client sending the bare short name.
+TEST_F(OperationHandlersFixtureTest, OnlyAnAmbiguousOperationIdIsQualified) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations", R"(/api/v1/areas/([^/]+)/operations)");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->list_operations(typed);
+  ASSERT_TRUE(result.has_value());
+
+  std::multiset<std::string> ids;
+  for (const auto & item : result->items) {
+    ids.insert(item.id);
+  }
+  EXPECT_EQ(ids.count("engine:calibrate"), 1u);
+  EXPECT_EQ(ids.count("gearbox:calibrate"), 1u);
+  EXPECT_EQ(ids.count("calibrate"), 0u) << "a bare id survived alongside the qualified ones";
+  EXPECT_EQ(ids.count("long_calibration"), 1u) << "a single-provider id was qualified";
+  EXPECT_EQ(ids.count("engine:long_calibration"), 0u);
+}
+
+// The bare id names two operations, so executing it would run whichever member
+// was walked first and never say which.
+TEST_F(OperationHandlersFixtureTest, CreateExecutionRefusesAnAmbiguousBareId) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/calibrate/executions",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+  dto::ExecutionCreateRequest body;
+  body.parameters = json::object();
+
+  auto result = handlers_->create_execution(typed, body);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 400);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_INVALID_REQUEST);
+  EXPECT_NE(result.error().message.find("member"), std::string::npos);
+  ASSERT_TRUE(result.error().params.contains("member_ids"));
+  EXPECT_EQ(result.error().params["member_ids"].size(), 2u);
+}
+
+// An id that names nothing is a miss, not an invitation to qualify a typo.
+TEST_F(OperationHandlersFixtureTest, CreateExecutionUnknownBareIdIsNotFound) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/does_not_exist/executions",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+)/executions)");
+  http::TypedRequest typed(raw_req);
+  dto::ExecutionCreateRequest body;
+  body.parameters = json::object();
+
+  auto result = handlers_->create_execution(typed, body);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 404);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_OPERATION_NOT_FOUND);
+}
+
+// The member half has to name a member of THIS entity; a leaf that exists
+// elsewhere in the tree is a miss, not a fallback to the first match.
+TEST_F(OperationHandlersFixtureTest, GetOperationRejectsAnIdNamingAForeignMember) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/chassis:calibrate",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+))");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->get_operation(typed);
+
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().http_status, 404);
+  EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_RESOURCE_NOT_FOUND);
+}
+
+// A qualified id selects among the same-named copies, and the response echoes
+// the id that was asked for so a caller can keep using it.
+TEST_F(OperationHandlersFixtureTest, GetOperationResolvesAQualifiedIdToItsMember) {
+  auto raw_req = make_request_with_match("/api/v1/areas/powertrain/operations/gearbox:calibrate",
+                                         R"(/api/v1/areas/([^/]+)/operations/([^/]+))");
+  http::TypedRequest typed(raw_req);
+
+  auto result = handlers_->get_operation(typed);
+
+  ASSERT_TRUE(result.has_value()) << result.error().code << ": " << result.error().message;
+  EXPECT_EQ(result->item.id, "gearbox:calibrate");
+  EXPECT_EQ(result->item.name, "calibrate");
+  ASSERT_TRUE(result->item.x_medkit.has_value());
+  ASSERT_TRUE(result->item.x_medkit->ros2.has_value());
+  EXPECT_EQ(result->item.x_medkit->ros2->service, "/powertrain/gearbox/calibrate");
+}
+
 TEST_F(OperationHandlersFixtureTest, UpdateExecutionStopReturnsAcceptedAndLocation) {
-  const auto execution_id = create_action_execution(20);
+  // The fixture server pushes one sequence element per 100 ms tick and succeeds
+  // at the requested length, so the order sets how long the goal stays
+  // cancellable: 20 finishes on its own in under two seconds, which a loaded or
+  // instrumented runner can spend on the create plus the cancel round trip, and
+  // the goal is then SUCCEEDED with nothing left to stop. 50 is the largest
+  // order handle_goal accepts and buys about five seconds, which is the whole
+  // point of asking for it - the assertions below are about an accepted stop,
+  // not about how fast the machine is.
+  const auto execution_id = create_action_execution(50);
   ASSERT_FALSE(execution_id.empty());
 
   auto raw_req =
@@ -532,13 +1006,16 @@ TEST_F(OperationHandlersFixtureTest, UpdateExecutionStopReturnsAcceptedAndLocati
   body.capability = "stop";
 
   auto result = handlers_->update_execution(typed, body);
-  auto goal_info = get_tracked_goal_or_fail(execution_id);
+  auto tracked = get_tracked_goal_or_fail(execution_id);
+  ASSERT_TRUE(tracked.has_value());
+  const auto & goal_info = *tracked;
 
   if (result.has_value()) {
-    const auto & exec = result.value().first;
+    const auto & exec = result.value().first.value;
     const auto & att = result.value().second;
-    ASSERT_TRUE(att.status_override.has_value());
-    EXPECT_EQ(*att.status_override, 202);
+    // 202 is declared by the Accepted<> return type, not by a runtime override.
+    EXPECT_EQ(http::dto_alternate_status<decltype(result.value().first)>::value, 202);
+    EXPECT_FALSE(att.status_override.has_value());
     bool has_location = false;
     for (const auto & [k, v] : att.headers) {
       if (k == "Location") {
@@ -549,12 +1026,35 @@ TEST_F(OperationHandlersFixtureTest, UpdateExecutionStopReturnsAcceptedAndLocati
     EXPECT_TRUE(has_location);
     ASSERT_TRUE(exec.id.has_value());
     EXPECT_EQ(*exec.id, execution_id);
-    EXPECT_EQ(exec.status, "running");
-    EXPECT_EQ(goal_info.status, ActionGoalStatus::CANCELING);
+
+    // An accepted stop promises the goal is on its way out: CANCELING while
+    // the server winds down, CANCELED once it has. It never promises which of
+    // the two the caller observes, and a server that cancels within the
+    // round trip lands on CANCELED directly. What it does rule out is a goal
+    // that is still running (ACCEPTED, EXECUTING) or one that completed
+    // anyway (SUCCEEDED): those mean the stop did not take.
+    EXPECT_TRUE(goal_info.status == ActionGoalStatus::CANCELING || goal_info.status == ActionGoalStatus::CANCELED)
+        << "tracked status after an accepted stop: " << ros2_medkit_gateway::action_status_to_string(goal_info.status);
+
+    // The body renders the status the handler read, which is at or before the
+    // one read above - a goal only moves CANCELING -> CANCELED, never back. So
+    // a goal still CANCELING here cannot have been CANCELED when the handler
+    // looked, which pins the body exactly; a goal already CANCELED admits
+    // either rendering.
+    if (goal_info.status == ActionGoalStatus::CANCELING) {
+      EXPECT_EQ(exec.status, "running");
+    } else {
+      EXPECT_TRUE(exec.status == "running" || exec.status == "failed") << "execution status in body: " << exec.status;
+    }
   } else {
-    EXPECT_EQ(result.error().http_status, 400);
-    EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_VENDOR_ERROR);
-    EXPECT_TRUE(goal_info.status == ActionGoalStatus::CANCELING || goal_info.status == ActionGoalStatus::CANCELED);
+    // The fixture's action server always ACCEPTS cancels, so the only
+    // realistic failure here is a lost/late CancelGoal response whose
+    // timeout could not be reconciled against the status stream: 504 +
+    // standard `not-responding` (issue #576). The old expectation asserted
+    // ERR_VENDOR_ERROR, which the handler never produced - that constant
+    // only ever existed on the wire after the renderer's remap.
+    EXPECT_EQ(result.error().http_status, 504);
+    EXPECT_EQ(result.error().code, ros2_medkit_gateway::ERR_NOT_RESPONDING);
   }
 }
 

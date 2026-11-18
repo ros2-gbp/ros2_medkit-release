@@ -22,6 +22,13 @@
 
 # The fault_code to get rosbag for.
 string fault_code
+
+# Address one specific recording instead. Tried before fault_code, and when it
+# names no recording the request falls back to fault_code - so a caller holding a
+# single identifier that may be either (a URL segment, say) can set both to it.
+# fault_code alone keeps its historical meaning, "the newest recording of this
+# fault".
+string recording_id
 ---
 # Response fields
 
@@ -32,13 +39,24 @@ bool success
 # Empty if success is false.
 string file_path
 
+# Identity of the recording that was served (its bag directory basename). Use this
+# as the bulk-data id.
+string recording_id
+
+# Every fault this recording covers - a burst of correlated faults shares one bag.
+# Callers authorize a download against this set, not against a single code.
+string[] fault_codes
+
 # Storage format: "sqlite3" or "mcap"
 string format
 
 # Total duration of recording in seconds.
 float64 duration_sec
 
-# File size in bytes.
+# Sum of the storage files the bag's metadata.yaml names: the one file the
+# download serves, or every file of a split recording. Otherwise the bag
+# directory total: missing or unreadable metadata, or a named file that is
+# absent or not a regular file inside the bag.
 uint64 size_bytes
 
 # Error message if success is false.
