@@ -13,12 +13,14 @@
 // limitations under the License.
 
 #include "ros2_medkit_fault_manager/snapshot_capture.hpp"
+#include <atomic>
 
 #include <rclcpp/generic_subscription.hpp>
 #include <rclcpp/serialization.hpp>
 #include <rclcpp/serialized_message.hpp>
 #include <set>
 #include <thread>
+#include <utility>
 
 #include "ros2_medkit_fault_manager/time_utils.hpp"
 #include "ros2_medkit_serialization/json_serializer.hpp"
@@ -83,6 +85,11 @@ SnapshotCapture::SnapshotCapture(rclcpp::Node * node, FaultStorage * storage, co
     throw std::invalid_argument("SnapshotCapture requires a valid storage pointer");
   }
 
+  // Continue the sequence the store already holds; see capture_seq_.
+  if (!seed_capture_seq()) {
+    RCLCPP_WARN(node_->get_logger(), "Fault storage unavailable: snapshot capture ids are seeded on the first capture");
+  }
+
   // Compile regex patterns for performance
   size_t failed_patterns = 0;
   for (const auto & [pattern, topics] : config_.patterns) {
@@ -112,8 +119,31 @@ SnapshotCapture::SnapshotCapture(rclcpp::Node * node, FaultStorage * storage, co
 }
 
 SnapshotCapture::~SnapshotCapture() {
-  // Subscriptions are automatically cleaned up by shared_ptr
+  // The watcher goes first: a hand-over after the subscriptions are gone would
+  // create one again on a capture that is being destroyed. It takes
+  // node_ops_mutex_ itself, so it has to be gone before the lock below.
+  background_topic_watcher_.reset();
+  // Destroying a subscription mutates the node as creating one does (see
+  // LockedSubscriptionGuard), so it is serialised the same way.
+  std::lock_guard<std::mutex> lock(node_ops_mutex_);
   background_subscriptions_.clear();
+}
+
+bool SnapshotCapture::seed_capture_seq() {
+  if (capture_seq_seeded_.load()) {
+    return true;
+  }
+  std::lock_guard<std::mutex> lock(capture_seq_seed_mutex_);
+  if (capture_seq_seeded_.load()) {
+    return true;
+  }
+  try {
+    capture_seq_.store(storage_->get_max_capture_id());
+  } catch (const FaultStorage::IgnorableConnectionException &) {
+    return false;
+  }
+  capture_seq_seeded_.store(true);
+  return true;
 }
 
 void SnapshotCapture::capture(const std::string & fault_code) {
@@ -122,22 +152,50 @@ void SnapshotCapture::capture(const std::string & fault_code) {
     return;
   }
 
-  auto topics = resolve_topics(fault_code);
+  bool explicit_match = false;
+  auto topics = resolve_topics(fault_code, explicit_match);
+  // Zero-config fallback: nothing in the explicit config even mentioned this
+  // code. A present-but-empty fault_specific/pattern entry is an explicit
+  // per-fault opt-out (explicit_match == true) and must NOT fall through here.
+  bool entity_scoped = false;
+  if (topics.empty() && !explicit_match && config_.entity_default) {
+    topics = resolve_entity_topics(fault_code);
+    entity_scoped = !topics.empty();
+  }
   if (topics.empty()) {
+    // Unconfigured fault code: resolve_topics() yielded nothing, so capture returns early.
+    // No freeze_frames row is written (we never persist an empty {} row) and no
+    // subscriptions are created. A freeze-frame lookup for such a fault returns not-found
+    // (get_freeze_frame() == nullopt); absence of a row means "no capture configured".
     RCLCPP_DEBUG(node_->get_logger(), "No topics configured for fault '%s'", fault_code.c_str());
     return;
   }
 
-  RCLCPP_INFO(node_->get_logger(), "Capturing snapshots for fault '%s' (%zu topics)", fault_code.c_str(),
-              topics.size());
+  if (!seed_capture_seq()) {
+    RCLCPP_WARN(node_->get_logger(), "Skipping snapshot capture for fault '%s': fault storage unavailable",
+                fault_code.c_str());
+    return;
+  }
 
+  RCLCPP_INFO(node_->get_logger(), "Capturing snapshots for fault '%s' (%zu topics%s)", fault_code.c_str(),
+              topics.size(), entity_scoped ? ", entity-default" : "");
+
+  // Accumulate a compact dict of captured topic values alongside the per-topic snapshots.
+  nlohmann::json freeze_frame = nlohmann::json::object();
+  // One id for the whole capture, minted here so every row of this confirmation
+  // shares it. Monotonic rather than a clock read: the rows are written seconds
+  // apart under load and a wall clock is not guaranteed to move forward.
+  const int64_t capture_id = ++capture_seq_;
+  std::vector<SnapshotData> rows;
   size_t captured_count = 0;
   for (const auto & topic : topics) {
     bool success = false;
-    if (config_.background_capture) {
-      success = capture_topic_from_cache(fault_code, topic);
+    // Entity-default topics are not known at construction, so the background
+    // cache never holds them - always sample those on demand.
+    if (config_.background_capture && !entity_scoped) {
+      success = capture_topic_from_cache(fault_code, topic, freeze_frame, rows);
     } else {
-      success = capture_topic_on_demand(fault_code, topic);
+      success = capture_topic_on_demand(fault_code, topic, freeze_frame, rows);
     }
 
     if (success) {
@@ -147,9 +205,63 @@ void SnapshotCapture::capture(const std::string & fault_code) {
 
   RCLCPP_INFO(node_->get_logger(), "Captured %zu/%zu snapshots for fault '%s'", captured_count, topics.size(),
               fault_code.c_str());
+
+  // One write for the whole capture. Storing topic by topic let the per-fault cap
+  // reject the tail of a capture, leaving a freeze frame with holes and nothing
+  // saying which values were dropped.
+  for (auto & row : rows) {
+    row.capture_id = capture_id;
+  }
+
+  // capture() runs on a pool worker while clear_fault runs on the service thread,
+  // and capture_topic_on_demand waits per silent topic, so an acknowledgement can
+  // land mid-capture. Row-by-row writes used to be swept by that clear; one batch
+  // written afterwards is not, and would resurrect readings the acknowledgement
+  // had just promised were gone - on SQLite, across restarts. Where the operator
+  // asked to retain snapshots there is no such promise, so the batch stands.
+  // Absent is not cleared: a caller driving the capture directly still stores.
+  // Mirrors rosbag_capture's wants_a_row.
+  const auto fault = storage_->get_fault(fault_code);
+  const bool acknowledged_mid_capture = fault.has_value() && fault->status == fd::fault_status::kCleared;
+  if (acknowledged_mid_capture && !storage_->retains_snapshots_on_clear()) {
+    RCLCPP_DEBUG(node_->get_logger(), "Dropping capture for '%s' - acknowledged while it ran", fault_code.c_str());
+  } else {
+    storage_->store_snapshots(rows);
+  }
+
+  // Persist the compact freeze-frame keyed by fault_code (retained across clear_fault).
+  // Only reached for faults with a configured capture set (unconfigured codes returned
+  // early above and get no row). If nothing was publishing at confirmation time the row
+  // holds an empty object, recording that a configured capture ran but sampled nothing.
+  // An empty capture must never clobber an existing non-empty frame: a re-confirm while
+  // the source publishers are down would otherwise replace the retained record with {}.
+  if (captured_count == 0) {
+    // Entity-default runs are best-effort: an empty one must not create a row
+    // (absence still means "nothing configured captured anything") nor clobber
+    // a retained frame from an earlier explicit-config capture.
+    if (entity_scoped) {
+      RCLCPP_DEBUG(node_->get_logger(), "Entity-default capture for fault '%s' sampled nothing; no row written",
+                   fault_code.c_str());
+      return;
+    }
+    auto existing = storage_->get_freeze_frame(fault_code);
+    if (existing.has_value() && existing->data != "{}") {
+      RCLCPP_WARN(node_->get_logger(), "Nothing captured for fault '%s'; keeping previously retained freeze-frame",
+                  fault_code.c_str());
+      return;
+    }
+  }
+
+  FreezeFrameData frame;
+  frame.fault_code = fault_code;
+  frame.data = freeze_frame.dump();
+  frame.captured_at_ns = get_wall_clock_ns();
+  storage_->store_freeze_frame(frame);
 }
 
-std::vector<std::string> SnapshotCapture::resolve_topics(const std::string & fault_code) const {
+std::vector<std::string> SnapshotCapture::resolve_topics(const std::string & fault_code, bool & explicit_match) const {
+  explicit_match = true;
+
   // Priority 1: Exact match in fault_specific
   auto it = config_.fault_specific.find(fault_code);
   if (it != config_.fault_specific.end()) {
@@ -165,16 +277,94 @@ std::vector<std::string> SnapshotCapture::resolve_topics(const std::string & fau
     }
   }
 
-  // Priority 3: Default topics
+  // Priority 3: Default topics (empty means "not configured", not an opt-out)
   if (!config_.default_topics.empty()) {
     RCLCPP_DEBUG(node_->get_logger(), "Using default_topics for '%s'", fault_code.c_str());
     return config_.default_topics;
   }
 
+  explicit_match = false;
   return {};
 }
 
-bool SnapshotCapture::capture_topic_on_demand(const std::string & fault_code, const std::string & topic) {
+std::vector<std::string> SnapshotCapture::resolve_entity_topics(const std::string & fault_code) const {
+  // Bound the on-demand sweep: each silent-but-published topic costs up to
+  // timeout_sec, so a node with many declared topics must not stall a capture
+  // pool worker indefinitely.
+  static constexpr size_t kMaxEntityTopics = 16;
+
+  std::set<std::string> topics;
+  // Guarded like RosbagCapture::resolve_entity_topics: this runs on a capture
+  // pool worker with no outer catch, and storage_->get_fault() can throw on
+  // the sqlite backend. Any failure degrades to "no entity-default capture".
+  try {
+    auto fault = storage_->get_fault(fault_code);
+    if (!fault || fault->reporting_sources.empty()) {
+      return {};
+    }
+
+    // Only ROS node FQNs (e.g. "/ns/planner_server") participate. Plugin
+    // entities report under bare SOVD ids (e.g. "tank_process"); treating one
+    // as (name, ns="/") could match an unrelated root-namespace node of the
+    // same name and freeze-frame its topics. Their zero-config frames come
+    // from the gateway's EntityFreezeFrameCapture instead.
+    std::set<std::pair<std::string, std::string>> wanted;
+    for (const auto & source : fault->reporting_sources) {
+      if (source.size() < 2 || source.front() != '/') {
+        continue;
+      }
+      const auto slash = source.rfind('/');
+      const std::string name = source.substr(slash + 1);
+      const std::string ns = (slash == 0) ? "/" : source.substr(0, slash);
+      if (!name.empty()) {
+        wanted.emplace(name, ns);
+      }
+    }
+    if (wanted.empty()) {
+      return {};
+    }
+
+    // The entity's "own data" = topics it publishes. Every node publishes
+    // /rosout and /parameter_events; those say nothing about the entity.
+    static const std::set<std::string> kExcluded = {"/rosout", "/parameter_events"};
+
+    auto published_by_wanted = [&wanted](const std::vector<rclcpp::TopicEndpointInfo> & eps) {
+      for (const auto & ep : eps) {
+        if (wanted.count({ep.node_name(), ep.node_namespace()})) {
+          return true;
+        }
+      }
+      return false;
+    };
+    for (const auto & [topic, types] : node_->get_topic_names_and_types()) {
+      if (kExcluded.count(topic)) {
+        continue;
+      }
+      if (published_by_wanted(node_->get_publishers_info_by_topic(topic))) {
+        topics.insert(topic);
+        if (topics.size() >= kMaxEntityTopics) {
+          RCLCPP_WARN(node_->get_logger(),
+                      "Entity-default capture for fault '%s' capped at %zu topics; remaining topics skipped",
+                      fault_code.c_str(), kMaxEntityTopics);
+          break;
+        }
+      }
+    }
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(node_->get_logger(), "Entity-default topic resolution failed for fault '%s': %s", fault_code.c_str(),
+                e.what());
+    return {};
+  }
+
+  if (!topics.empty()) {
+    RCLCPP_INFO(node_->get_logger(), "Entity-default capture for fault '%s': %zu topic(s) from the reporting node(s)",
+                fault_code.c_str(), topics.size());
+  }
+  return {topics.begin(), topics.end()};
+}
+
+bool SnapshotCapture::capture_topic_on_demand(const std::string & fault_code, const std::string & topic,
+                                              nlohmann::json & freeze_frame, std::vector<SnapshotData> & rows) {
   // Get topic type
   std::string msg_type = get_topic_type(topic);
   if (msg_type.empty()) {
@@ -284,7 +474,10 @@ bool SnapshotCapture::capture_topic_on_demand(const std::string & fault_code, co
     snapshot.data = json_data.dump();
     snapshot.captured_at_ns = get_wall_clock_ns();
 
-    storage_->store_snapshot(snapshot);
+    rows.push_back(std::move(snapshot));
+
+    // Record the value into the compact freeze-frame dict under the topic key.
+    freeze_frame[topic] = std::move(json_data);
 
     RCLCPP_DEBUG(node_->get_logger(), "Captured snapshot from '%s' for fault '%s'", topic.c_str(), fault_code.c_str());
     return true;
@@ -300,7 +493,8 @@ bool SnapshotCapture::capture_topic_on_demand(const std::string & fault_code, co
   return false;
 }
 
-bool SnapshotCapture::capture_topic_from_cache(const std::string & fault_code, const std::string & topic) {
+bool SnapshotCapture::capture_topic_from_cache(const std::string & fault_code, const std::string & topic,
+                                               nlohmann::json & freeze_frame, std::vector<SnapshotData> & rows) {
   std::lock_guard<std::mutex> lock(cache_mutex_);
 
   auto it = message_cache_.find(topic);
@@ -319,7 +513,16 @@ bool SnapshotCapture::capture_topic_from_cache(const std::string & fault_code, c
   snapshot.data = cached.data;
   snapshot.captured_at_ns = cached.timestamp_ns;
 
-  storage_->store_snapshot(snapshot);
+  rows.push_back(std::move(snapshot));
+
+  // Record the cached value into the compact freeze-frame dict. The cache holds a serialized
+  // JSON string; parse it back so the frame nests structured values (fall back to the raw
+  // string only if it somehow fails to parse).
+  try {
+    freeze_frame[topic] = nlohmann::json::parse(cached.data);
+  } catch (const nlohmann::json::parse_error &) {
+    freeze_frame[topic] = cached.data;
+  }
 
   RCLCPP_DEBUG(node_->get_logger(), "Captured snapshot from cache for '%s' (fault '%s')", topic.c_str(),
                fault_code.c_str());
@@ -335,50 +538,81 @@ void SnapshotCapture::init_background_subscriptions() {
 
   RCLCPP_INFO(node_->get_logger(), "Initializing %zu background subscriptions for snapshot capture", topics.size());
 
+  std::vector<std::string> pending;
   for (const auto & topic : topics) {
-    std::string msg_type = get_topic_type(topic);
+    const std::string msg_type = get_topic_type(topic);
     if (msg_type.empty()) {
-      RCLCPP_WARN(node_->get_logger(), "Cannot determine type for topic '%s', skipping background subscription",
+      RCLCPP_WARN(node_->get_logger(),
+                  "Cannot determine type for topic '%s' yet; its background subscription is created once the topic "
+                  "appears",
                   topic.c_str());
+      pending.push_back(topic);
       continue;
     }
+    subscribe_background(topic, msg_type);
+  }
 
-    try {
-      rclcpp::QoS qos = rclcpp::SensorDataQoS();
+  if (pending.empty()) {
+    return;
+  }
 
-      // NOLINTNEXTLINE(performance-unnecessary-value-param)
-      auto callback = [this, topic, msg_type](std::shared_ptr<const rclcpp::SerializedMessage> msg) {
-        try {
-          // Check message size
-          if (msg->size() > config_.max_message_size) {
-            return;  // Skip oversized messages silently
-          }
+  // No retry budget, unlike RosbagCapture's fixed-mode 10 s: when the publisher
+  // comes up is decided by the rest of the robot (a stack launched minutes
+  // later, a node respawned after a crash), and a cap only moves the moment the
+  // topic is lost for good. While something is pending the cost is one read of
+  // the local graph per period; once nothing is, the watcher's timer stops.
+  static constexpr std::chrono::seconds kBackgroundRetryPeriod{1};
+  background_topic_watcher_ = std::make_unique<PendingTopicWatcher>(
+      node_, node_ops_mutex_, std::move(pending), kBackgroundRetryPeriod,
+      [this](const std::string & topic, const std::string & msg_type) {
+        // Logged before the attempt, so a creation failure is the last word.
+        RCLCPP_INFO(node_->get_logger(), "Background snapshot topic '%s' appeared on the graph", topic.c_str());
+        subscribe_background(topic, msg_type);
+      });
+}
 
-          ros2_medkit_serialization::JsonSerializer ser;
-          auto json_data = ser.deserialize(msg_type, *msg);
+void SnapshotCapture::subscribe_background(const std::string & topic, const std::string & msg_type) {
+  try {
+    rclcpp::QoS qos = rclcpp::SensorDataQoS();
 
-          std::lock_guard<std::mutex> lock(cache_mutex_);
-          auto & cached = message_cache_[topic];
-          cached.topic = topic;
-          cached.message_type = msg_type;
-          cached.data = json_data.dump();
-          // Use wall clock time, not sim time, for proper timestamps
-          cached.timestamp_ns = get_wall_clock_ns();
-
-        } catch (const std::exception & e) {
-          RCLCPP_DEBUG(node_->get_logger(), "Failed to cache message from '%s': %s", topic.c_str(), e.what());
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    auto callback = [this, topic, msg_type](std::shared_ptr<const rclcpp::SerializedMessage> msg) {
+      try {
+        // Check message size
+        if (msg->size() > config_.max_message_size) {
+          return;  // Skip oversized messages silently
         }
-      };
 
-      auto subscription = node_->create_generic_subscription(topic, msg_type, qos, callback);
-      background_subscriptions_.push_back(subscription);
+        ros2_medkit_serialization::JsonSerializer ser;
+        auto json_data = ser.deserialize(msg_type, *msg);
 
-      RCLCPP_DEBUG(node_->get_logger(), "Created background subscription for '%s'", topic.c_str());
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        auto & cached = message_cache_[topic];
+        cached.topic = topic;
+        cached.message_type = msg_type;
+        cached.data = json_data.dump();
+        // Use wall clock time, not sim time, for proper timestamps
+        cached.timestamp_ns = get_wall_clock_ns();
 
-    } catch (const std::exception & e) {
-      RCLCPP_WARN(node_->get_logger(), "Failed to create background subscription for '%s': %s", topic.c_str(),
-                  e.what());
+      } catch (const std::exception & e) {
+        RCLCPP_DEBUG(node_->get_logger(), "Failed to cache message from '%s': %s", topic.c_str(), e.what());
+      }
+    };
+
+    // Taken even from the constructor, where nothing else runs yet: the watcher
+    // reaches this from the executor thread while capture pool workers create
+    // and destroy their on-demand subscriptions on the same node.
+    rclcpp::GenericSubscription::SharedPtr subscription;
+    {
+      std::lock_guard<std::mutex> lock(node_ops_mutex_);
+      subscription = node_->create_generic_subscription(topic, msg_type, qos, callback);
     }
+    background_subscriptions_.push_back(subscription);
+
+    RCLCPP_DEBUG(node_->get_logger(), "Created background subscription for '%s'", topic.c_str());
+
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(node_->get_logger(), "Failed to create background subscription for '%s': %s", topic.c_str(), e.what());
   }
 }
 
