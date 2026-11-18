@@ -37,10 +37,15 @@ string message_type
 
 # --- Rosbag fields (empty for freeze_frame type) ---
 
-# Identifier for bulk-data download (set to fault_code)
+# Identifier for bulk-data download. For a rosbag this is the RECORDING id (the
+# bag directory basename), not the fault code: one fault can hold several
+# recordings and each needs its own address.
 string bulk_data_id
 
-# File size in bytes
+# Sum of the storage files the bag's metadata.yaml names: the one file the
+# download serves, or every file of a split recording. Otherwise the bag
+# directory total: missing or unreadable metadata, or a named file that is
+# absent or not a regular file inside the bag.
 uint64 size_bytes
 
 # Recording duration in seconds

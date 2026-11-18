@@ -16,6 +16,10 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+
+#include "ros2_medkit_gateway/test_support/refused_port.hpp"
+
 namespace ros2_medkit_gateway {
 
 // These tests verify OpcuaClient behavior without a running OPC-UA server.
@@ -33,7 +37,8 @@ TEST(OpcuaClientTest, DefaultState) {
 TEST(OpcuaClientTest, ConnectFailsWithoutServer) {
   OpcuaClient client;
   OpcuaClientConfig config;
-  config.endpoint_url = "opc.tcp://localhost:49999";  // No server here
+  const test_support::RefusedPort no_server;
+  config.endpoint_url = "opc.tcp://127.0.0.1:" + std::to_string(no_server.port());
   config.connect_timeout = std::chrono::milliseconds(500);
 
   EXPECT_FALSE(client.connect(config));
@@ -59,9 +64,22 @@ TEST(OpcuaClientTest, ReadWhenDisconnected) {
   EXPECT_FALSE(result.good);
 }
 
-TEST(OpcuaClientTest, WriteWhenDisconnected) {
+// Issue #389 (read-based active-condition replay): browsing for conditions on a
+// disconnected client returns nothing rather than throwing.
+TEST(OpcuaClientTest, ReadSourceConditionsWhenDisconnected) {
   OpcuaClient client;
-  EXPECT_FALSE(client.write_value({1, "SomeNode"}, 42.0));
+  auto conds = client.read_source_conditions(opcua::NodeId(0, UA_NS0ID_SERVER));
+  EXPECT_TRUE(conds.empty());
+}
+
+// Issue #479: a disconnected scan must report scan_ok=false so the poller does
+// NOT treat the empty result as "no active conditions" and falsely clear faults.
+TEST(OpcuaClientTest, ReadSourceConditionsReportsScanFailureWhenDisconnected) {
+  OpcuaClient client;
+  bool scan_ok = true;  // must be flipped to false
+  auto conds = client.read_source_conditions(opcua::NodeId(0, UA_NS0ID_SERVER), &scan_ok);
+  EXPECT_TRUE(conds.empty());
+  EXPECT_FALSE(scan_ok);
 }
 
 TEST(OpcuaClientTest, CreateSubscriptionWhenDisconnected) {
@@ -74,6 +92,16 @@ TEST(OpcuaClientTest, RemoveSubscriptionsWhenEmpty) {
   OpcuaClient client;
   // Should not crash
   client.remove_subscriptions();
+}
+
+#if !MEDKIT_OPCUA_READ_ONLY
+// OpcuaClient::write_value exists only in a write-capable build
+// (-DMEDKIT_OPCUA_READ_ONLY=OFF). A read-only build has no declaration for
+// these three to call, which is the source-level half of the property
+// test_opcua_build_variant asserts on the built object.
+TEST(OpcuaClientTest, WriteWhenDisconnected) {
+  OpcuaClient client;
+  EXPECT_FALSE(client.write_value({1, "SomeNode"}, 42.0));
 }
 
 TEST(OpcuaClientTest, WriteValueReturnsNotConnected) {
@@ -90,6 +118,145 @@ TEST(OpcuaClientTest, WriteValueWithTypeHintDisconnected) {
   auto result = client.write_value(opcua::NodeId(2, 1), OpcuaValue{75.0}, "float");
   EXPECT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, OpcuaClient::WriteError::NotConnected);
+}
+#endif  // !MEDKIT_OPCUA_READ_ONLY
+
+// ---------------------------------------------------------------------------
+// Issue #389: OPC-UA client security config parsing (pure helpers, no server).
+// ---------------------------------------------------------------------------
+
+TEST(OpcuaClientSecurity, ParseSecurityPolicy) {
+  bool ok = false;
+  EXPECT_EQ(OpcuaClient::parse_security_policy("None", &ok), SecurityPolicy::None);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(OpcuaClient::parse_security_policy("", &ok), SecurityPolicy::None);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(OpcuaClient::parse_security_policy("basic256sha256"), SecurityPolicy::Basic256Sha256);
+  EXPECT_EQ(OpcuaClient::parse_security_policy("Basic256Sha256"), SecurityPolicy::Basic256Sha256);
+  EXPECT_EQ(OpcuaClient::parse_security_policy("Aes128Sha256RsaOaep"), SecurityPolicy::Aes128Sha256RsaOaep);
+  EXPECT_EQ(OpcuaClient::parse_security_policy("Aes256_Sha256_RsaPss"), SecurityPolicy::Aes256Sha256RsaPss);
+  // Unknown -> safe default + ok=false.
+  EXPECT_EQ(OpcuaClient::parse_security_policy("Bogus", &ok), SecurityPolicy::None);
+  EXPECT_FALSE(ok);
+}
+
+TEST(OpcuaClientSecurity, SecurityPolicyUri) {
+  EXPECT_EQ(OpcuaClient::security_policy_uri(SecurityPolicy::None), "http://opcfoundation.org/UA/SecurityPolicy#None");
+  EXPECT_EQ(OpcuaClient::security_policy_uri(SecurityPolicy::Basic256Sha256),
+            "http://opcfoundation.org/UA/SecurityPolicy#Basic256Sha256");
+  EXPECT_EQ(OpcuaClient::security_policy_uri(SecurityPolicy::Aes128Sha256RsaOaep),
+            "http://opcfoundation.org/UA/SecurityPolicy#Aes128_Sha256_RsaOaep");
+  EXPECT_EQ(OpcuaClient::security_policy_uri(SecurityPolicy::Aes256Sha256RsaPss),
+            "http://opcfoundation.org/UA/SecurityPolicy#Aes256_Sha256_RsaPss");
+}
+
+TEST(OpcuaClientSecurity, ParseSecurityMode) {
+  bool ok = false;
+  EXPECT_EQ(OpcuaClient::parse_security_mode("none", &ok), SecurityMode::None);
+  EXPECT_TRUE(ok);
+  EXPECT_EQ(OpcuaClient::parse_security_mode("Sign"), SecurityMode::Sign);
+  EXPECT_EQ(OpcuaClient::parse_security_mode("SignAndEncrypt"), SecurityMode::SignAndEncrypt);
+  EXPECT_EQ(OpcuaClient::parse_security_mode("sign_and_encrypt"), SecurityMode::SignAndEncrypt);
+  EXPECT_EQ(OpcuaClient::parse_security_mode("bogus", &ok), SecurityMode::None);
+  EXPECT_FALSE(ok);
+}
+
+TEST(OpcuaClientSecurity, ParseUserAuthMode) {
+  EXPECT_EQ(OpcuaClient::parse_user_auth_mode("anonymous"), UserAuthMode::Anonymous);
+  EXPECT_EQ(OpcuaClient::parse_user_auth_mode(""), UserAuthMode::Anonymous);
+  EXPECT_EQ(OpcuaClient::parse_user_auth_mode("username"), UserAuthMode::UsernamePassword);
+  EXPECT_EQ(OpcuaClient::parse_user_auth_mode("UsernamePassword"), UserAuthMode::UsernamePassword);
+  EXPECT_EQ(OpcuaClient::parse_user_auth_mode("x509"), UserAuthMode::X509);
+  EXPECT_EQ(OpcuaClient::parse_user_auth_mode("certificate"), UserAuthMode::X509);
+}
+
+TEST(OpcuaClientSecurity, RequiresSecureChannel) {
+  OpcuaClientConfig cfg;
+  EXPECT_FALSE(OpcuaClient::requires_secure_channel(cfg));  // defaults: None/None
+  cfg.user_auth_mode = UserAuthMode::UsernamePassword;
+  // Username/password alone does NOT imply an encrypted channel.
+  EXPECT_FALSE(OpcuaClient::requires_secure_channel(cfg));
+  cfg.security_mode = SecurityMode::Sign;
+  EXPECT_TRUE(OpcuaClient::requires_secure_channel(cfg));
+  cfg.security_mode = SecurityMode::None;
+  cfg.security_policy = SecurityPolicy::Basic256Sha256;
+  EXPECT_TRUE(OpcuaClient::requires_secure_channel(cfg));
+}
+
+// Issue #478: non-anonymous credentials on an unencrypted channel must be
+// flagged as cleartext so the plugin can warn loudly.
+TEST(OpcuaClientSecurity, CredentialsSentInClear) {
+  OpcuaClientConfig cfg;
+  // Anonymous on a plain channel: nothing to leak.
+  EXPECT_FALSE(OpcuaClient::credentials_sent_in_clear(cfg));
+
+  // Username/password with no secured channel: credentials travel in clear.
+  cfg.user_auth_mode = UserAuthMode::UsernamePassword;
+  EXPECT_TRUE(OpcuaClient::credentials_sent_in_clear(cfg));
+
+  // X.509 identity with no secured channel: still cleartext.
+  cfg.user_auth_mode = UserAuthMode::X509;
+  EXPECT_TRUE(OpcuaClient::credentials_sent_in_clear(cfg));
+
+  // Once the channel is signed, credentials are protected.
+  cfg.security_mode = SecurityMode::Sign;
+  EXPECT_FALSE(OpcuaClient::credentials_sent_in_clear(cfg));
+
+  // Encryption via the policy alone (mode None) also protects them.
+  cfg.security_mode = SecurityMode::None;
+  cfg.security_policy = SecurityPolicy::Basic256Sha256;
+  EXPECT_FALSE(OpcuaClient::credentials_sent_in_clear(cfg));
+
+  // Anonymous is never cleartext regardless of channel.
+  cfg.user_auth_mode = UserAuthMode::Anonymous;
+  cfg.security_policy = SecurityPolicy::None;
+  EXPECT_FALSE(OpcuaClient::credentials_sent_in_clear(cfg));
+}
+
+TEST(OpcuaClientSecurity, SecurityConfigConflict) {
+  OpcuaClientConfig cfg;
+  // Both None (default): consistent, no conflict.
+  EXPECT_FALSE(OpcuaClient::security_config_conflict(cfg));
+
+  // Mode set but policy None: the policy URI would be left unpinned - conflict.
+  cfg.security_mode = SecurityMode::Sign;
+  EXPECT_TRUE(OpcuaClient::security_config_conflict(cfg));
+  cfg.security_mode = SecurityMode::SignAndEncrypt;
+  EXPECT_TRUE(OpcuaClient::security_config_conflict(cfg));
+
+  // Both set: consistent.
+  cfg.security_policy = SecurityPolicy::Basic256Sha256;
+  EXPECT_FALSE(OpcuaClient::security_config_conflict(cfg));
+
+  // Policy set but mode None: equally malformed - conflict.
+  cfg.security_mode = SecurityMode::None;
+  EXPECT_TRUE(OpcuaClient::security_config_conflict(cfg));
+}
+
+TEST(OpcuaClientSecurity, ConnectRejectsContradictorySecurityConfig) {
+  // security_mode=Sign with security_policy=None must fail before touching the
+  // network (would otherwise silently run an unpinned-policy channel).
+  OpcuaClient client;
+  OpcuaClientConfig cfg;
+  cfg.endpoint_url = "opc.tcp://localhost:49997";
+  cfg.connect_timeout = std::chrono::milliseconds(500);
+  cfg.security_mode = SecurityMode::Sign;
+  cfg.security_policy = SecurityPolicy::None;
+  EXPECT_FALSE(client.connect(cfg));
+  EXPECT_FALSE(client.is_connected());
+}
+
+TEST(OpcuaClientSecurity, ConnectSecureWithoutCertFailsFast) {
+  // A secured profile with no client cert/key must fail config-time, before
+  // touching the network, and leave the client disconnected.
+  OpcuaClient client;
+  OpcuaClientConfig cfg;
+  cfg.endpoint_url = "opc.tcp://localhost:49998";
+  cfg.connect_timeout = std::chrono::milliseconds(500);
+  cfg.security_policy = SecurityPolicy::Basic256Sha256;
+  cfg.security_mode = SecurityMode::SignAndEncrypt;
+  EXPECT_FALSE(client.connect(cfg));
+  EXPECT_FALSE(client.is_connected());
 }
 
 TEST(OpcuaClientTest, CurrentConfigPersistence) {
@@ -144,12 +311,29 @@ TEST(OpcuaClientTest, RemoveEventMonitoredItemUnknownIdDoesNotBumpGeneration) {
   EXPECT_EQ(client.current_generation(), before);
 }
 
+// call_method itself is in both builds: ConditionRefresh rides on it and asks
+// the server to replay conditions rather than changing any.
 TEST(OpcuaClientTest, CallMethodWhenDisconnected) {
   OpcuaClient client;
   auto result = client.call_method(opcua::NodeId(0, UA_NS0ID_SERVER), opcua::NodeId(0, 11489), {});
   ASSERT_FALSE(result.has_value());
   EXPECT_EQ(result.error().code, OpcuaClient::MethodError::NotConnected);
 }
+
+#if !MEDKIT_OPCUA_READ_ONLY
+// Acknowledge / Confirm change condition state on the controller, so the entry
+// point that issues them exists only in a write-capable build - the same rule
+// write_value follows, and what test_opcua_build_variant checks on the object.
+TEST(OpcuaClientTest, CallConditionMethodWhenDisconnected) {
+  OpcuaClient client;
+  constexpr uint32_t kAcknowledgeMethodId = 9111;
+  auto result =
+      client.call_condition_method(opcua::NodeId(2, "Alarms.Overpressure"), opcua::NodeId(0, kAcknowledgeMethodId),
+                                   opcua::ByteString("event-id"), "comment");
+  ASSERT_FALSE(result.has_value());
+  EXPECT_EQ(result.error().code, OpcuaClient::MethodError::NotConnected);
+}
+#endif  // !MEDKIT_OPCUA_READ_ONLY
 
 TEST(OpcuaClientTest, GenerationBumpsOnDisconnect) {
   OpcuaClient client;

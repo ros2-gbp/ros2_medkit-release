@@ -41,7 +41,10 @@ import launch_testing
 import launch_testing.actions
 import requests
 
-from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES
+from ros2_medkit_test_utils.constants import (
+    ALLOWED_EXIT_CODES,
+    PARAM_SERVICE_TIMEOUT,
+)
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
 from ros2_medkit_test_utils.launch_helpers import create_demo_nodes, create_gateway_node
 
@@ -159,10 +162,21 @@ class TestScenarioDiscoveryManifest(GatewayTestCase):
     def test_05_area_components(self):
         """GET /areas/{id}/components returns components in area.
 
+        The area's `capabilities` array must advertise the same route. Areas were
+        the one entity type whose relationship endpoint was served and named in
+        `AreaDetail.components` but missing from the capability array, so a
+        client reading only that array could not find it.
+
         @verifies REQ_INTEROP_006
         """
         data = self.get_json('/areas/engine/components')
         self.assertIn('items', data)
+
+        area = self.get_json('/areas/engine')
+        advertised = {c['name']: c['href'] for c in area['capabilities']}
+        self.assertIn('components', advertised)
+        self.assertEqual(
+            advertised['components'], '/api/v1/areas/engine/components')
 
     # =========================================================================
     # Components
@@ -283,11 +297,17 @@ class TestScenarioDiscoveryManifest(GatewayTestCase):
         """GET /apps/{id}/configurations returns parameters when node is running.
 
         App is defined in manifest with bound_fqn. Configurations are retrieved
-        from the ROS 2 parameter service on the node.
+        from the ROS 2 parameter service on the node, which may not be ready the
+        instant the app is discovered - the endpoint returns 503 until it is.
+        Poll until it responds rather than asserting on a single early GET.
 
         @verifies REQ_INTEROP_003
         """
-        data = self.get_json('/apps/lidar-sensor/configurations')
+        data = self.poll_endpoint_until(
+            '/apps/lidar-sensor/configurations',
+            lambda d: d if 'items' in d else None,
+            timeout=PARAM_SERVICE_TIMEOUT,
+        )
         self.assertIn('items', data)
         self.assertIn('x-medkit', data)
 
