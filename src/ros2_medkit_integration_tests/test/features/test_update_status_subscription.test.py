@@ -28,7 +28,6 @@ import unittest
 
 from launch import LaunchDescription
 from launch.actions import TimerAction
-import launch_ros.actions
 import launch_testing
 import launch_testing.actions
 import requests
@@ -39,7 +38,7 @@ from ros2_medkit_test_utils.constants import (
     get_test_port,
 )
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
-from ros2_medkit_test_utils.launch_helpers import get_coverage_env
+from ros2_medkit_test_utils.launch_helpers import create_demo_nodes, create_gateway_node
 
 
 PORT = get_test_port(0)
@@ -57,42 +56,29 @@ def _get_test_plugin_path():
 
 def generate_test_description():
     """Launch gateway with update plugin and a demo node."""
-    coverage_env = get_coverage_env()
     plugin_path = _get_test_plugin_path()
 
-    gateway = launch_ros.actions.Node(
-        package='ros2_medkit_gateway',
-        executable='gateway_node',
+    gateway = create_gateway_node(
         name='gateway_update_sub',
-        output='screen',
-        parameters=[{
+        port=PORT,
+        extra_params={
             'server.host': '127.0.0.1',
-            'server.port': PORT,
-            'refresh_interval_ms': 1000,
             'updates.enabled': True,
             'plugins': ['test_update_backend'],
             'plugins.test_update_backend.path': plugin_path,
             'sse.max_clients': 10,
             'sse.max_subscriptions': 50,
-        }],
-        additional_env=coverage_env,
+        },
     )
 
     # Need at least one demo node so we have an entity for subscriptions
-    demo_node = launch_ros.actions.Node(
-        package='ros2_medkit_integration_tests',
-        executable='demo_engine_temp_sensor',
-        name='temp_sensor',
-        namespace='/powertrain/engine',
-        output='screen',
-        additional_env=coverage_env,
-    )
+    demo_nodes = create_demo_nodes(['temp_sensor'], lidar_faulty=False)
 
     return LaunchDescription([
         gateway,
         TimerAction(
             period=2.0,
-            actions=[demo_node],
+            actions=demo_nodes,
         ),
         launch_testing.actions.ReadyToTest(),
     ])
@@ -209,6 +195,51 @@ class TestUpdateStatusSubscription(GatewayTestCase):
         sub_ids = [s['id'] for s in items]
         self.assertIn(sub_id, sub_ids)
 
+    def _create_update_subscription(self, update_id_segment):
+        return requests.post(
+            f'{self.BASE_URL}/apps/{self.app_id}/cyclic-subscriptions',
+            json={
+                'resource': f'/api/v1/updates/{update_id_segment}/status',
+                'interval': 'fast',
+                'duration': 60,
+            },
+            timeout=5,
+        )
+
+    def test_02b_encoded_update_id_matches_get(self):
+        """A percent-encoded update id delivers the status GET returns."""
+        self._register_package('sub-enc-pkg')
+        encoded = '%73ub-enc-pkg'
+        r = self._create_update_subscription(encoded)
+        self.assertEqual(r.status_code, 201, f'Create failed: {r.text}')
+        body = r.json()
+        self.addCleanup(self._cleanup_subscription, body['id'])
+        self.assertEqual(
+            body['observed_resource'], f'/api/v1/updates/{encoded}/status')
+
+        event = None
+        with requests.get(f'http://127.0.0.1:{PORT}{body["event_source"]}',
+                          stream=True, timeout=15) as stream:
+            for line in stream.iter_lines(decode_unicode=True):
+                if line and line.startswith('data:'):
+                    event = json.loads(line[len('data:'):].strip())
+                    break
+        self.assertIsNotNone(event, 'SSE stream ended without an event')
+        self.assertNotIn('error', event, f'Sample failed: {event}')
+
+        get = requests.get(
+            f'{self.BASE_URL}/updates/{encoded}/status', timeout=5)
+        self.assertEqual(get.status_code, 200, get.text)
+        self.assertEqual(event['payload'], get.json())
+
+    def test_02c_update_id_refused_by_get_is_refused(self):
+        """An id GET refuses (here '..' hidden as %2E%2E) is refused at create."""
+        get = requests.get(
+            f'{self.BASE_URL}/updates/%2E%2E/status', timeout=5)
+        self.assertEqual(get.status_code, 400, get.text)
+        r = self._create_update_subscription('%2E%2E')
+        self.assertEqual(r.status_code, 400, r.text)
+
     def test_03_sse_stream_delivers_update_progress(self):
         """SSE stream delivers status snapshots during update prepare."""
         self._register_package('sub-sse-pkg')
@@ -236,6 +267,7 @@ class TestUpdateStatusSubscription(GatewayTestCase):
         # Collect SSE events in background
         events = []
         stop_event = threading.Event()
+        connected_event = threading.Event()
 
         def collect_sse():
             try:
@@ -245,6 +277,7 @@ class TestUpdateStatusSubscription(GatewayTestCase):
                     timeout=30,
                     headers={'Accept': 'text/event-stream'},
                 ) as resp:
+                    connected_event.set()
                     for line in resp.iter_lines(decode_unicode=True):
                         if stop_event.is_set():
                             break
@@ -260,8 +293,10 @@ class TestUpdateStatusSubscription(GatewayTestCase):
         sse_thread = threading.Thread(target=collect_sse, daemon=True)
         sse_thread.start()
 
-        # Give SSE connection time to establish
-        time.sleep(1.0)
+        # Wait until the reader thread has opened the SSE stream, so we do not
+        # trigger the event source before the client is listening.
+        self.assertTrue(connected_event.wait(timeout=10.0),
+                        'SSE stream did not connect')
 
         # Trigger update prepare to generate status changes
         requests.put(

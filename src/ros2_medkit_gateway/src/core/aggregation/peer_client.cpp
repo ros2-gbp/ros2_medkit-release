@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <iterator>
 #include <set>
 #include <string>
@@ -181,6 +182,17 @@ Component parse_component(const nlohmann::json & j) {
     if (xm.contains("dependsOn") && xm["dependsOn"].is_array()) {
       comp.depends_on = xm["dependsOn"].get<std::vector<std::string>>();
     }
+    // Asset-identity nameplate (with per-field provenance). Emitted by peers under
+    // x-medkit.identity only when populated; parse it back so identity survives
+    // aggregation instead of being silently dropped.
+    if (xm.contains("identity") && xm["identity"].is_object()) {
+      comp.identity = AssetIdentity::from_json(xm["identity"]);
+    }
+    // A peer emits `available` only to say false, so absence is the peer
+    // stating the entity is reachable and the default has to be true. A
+    // Component carries no second signal - an App has `is_online` - so this is
+    // the only way an unreachable one stays unreachable past another hop.
+    comp.available = xm.value("available", true);
   }
   if (j.contains("translationId")) {
     comp.translation_id = j["translationId"].get<std::string>();
@@ -217,6 +229,98 @@ std::string component_id_from_located_on(const std::string & uri) {
   auto id_end = uri.find_first_of("/?#", id_start);
   auto candidate = uri.substr(id_start, id_end - id_start);
   return is_valid_entity_id(candidate) ? candidate : std::string{};
+}
+
+/**
+ * @brief Read a peer's `/operations` collection into an App's service/action lists.
+ *
+ * The wire id is not used as the name: on the peer it is already qualified when
+ * that peer saw a collision among its own members, and the qualifier is the
+ * peer's business, not ours. `name` is always the bare short name, which is what
+ * ambiguity is keyed on, and the full ROS path comes from x-medkit.ros2 so two
+ * same-named operations stay distinguishable.
+ */
+void parse_operations_into(const nlohmann::json & j, App & app) {
+  if (!j.contains("items") || !j["items"].is_array()) {
+    return;
+  }
+  for (const auto & item : j["items"]) {
+    if (!item.is_object()) {
+      continue;
+    }
+    const std::string name = item.value("name", "");
+    if (name.empty()) {
+      continue;
+    }
+    std::string full_path;
+    std::string type;
+    bool is_action = item.value("asynchronous_execution", false);
+    if (item.contains("x-medkit") && item["x-medkit"].is_object()) {
+      const auto & xm = item["x-medkit"];
+      if (xm.contains("ros2") && xm["ros2"].is_object()) {
+        const auto & ros2 = xm["ros2"];
+        type = ros2.value("type", "");
+        full_path = ros2.value("service", "");
+        if (full_path.empty()) {
+          full_path = ros2.value("action", "");
+          is_action = is_action || !full_path.empty();
+        }
+        const std::string kind = ros2.value("kind", "");
+        if (!kind.empty()) {
+          is_action = kind == "action";
+        }
+      }
+    }
+    if (full_path.empty()) {
+      continue;
+    }
+    if (is_action) {
+      app.actions.push_back(ActionInfo{name, full_path, type, std::nullopt});
+    } else {
+      app.services.push_back(ServiceInfo{name, full_path, type, std::nullopt});
+    }
+  }
+}
+
+/**
+ * @brief Read a peer's data collection into the App's topics.
+ *
+ * A data item names its ROS topic by full path in ``x-medkit.ros2.topic``. An
+ * item without one describes something that is not a topic - a plugin's data
+ * point, for instance - and carries nothing this gateway can address as one, so
+ * it is skipped rather than recorded under its wire id.
+ *
+ * ``direction`` decides which side of the topic the App is on, and only the
+ * three values a gateway emits are accepted. An item that says anything else
+ * leaves the App unattributed for that topic instead of being recorded as a
+ * publisher it may not be: the ownership built out of these lists is what a
+ * bare item id is dispatched by, and a guess there sends a read to a gateway
+ * that does not have the topic.
+ */
+void parse_data_items_into(const nlohmann::json & j, App & app) {
+  if (!j.contains("items") || !j["items"].is_array()) {
+    return;
+  }
+  for (const auto & item : j["items"]) {
+    if (!item.is_object() || !item.contains("x-medkit") || !item["x-medkit"].is_object()) {
+      continue;
+    }
+    const auto & xm = item["x-medkit"];
+    if (!xm.contains("ros2") || !xm["ros2"].is_object()) {
+      continue;
+    }
+    const std::string topic = xm["ros2"].value("topic", "");
+    const std::string direction = xm["ros2"].value("direction", "");
+    if (topic.empty()) {
+      continue;
+    }
+    if (direction == "publish" || direction == "both") {
+      app.topics.publishes.push_back(topic);
+    }
+    if (direction == "subscribe" || direction == "both") {
+      app.topics.subscribes.push_back(topic);
+    }
+  }
 }
 
 /**
@@ -264,6 +368,11 @@ App parse_app(const nlohmann::json & j) {
     }
     app.source = xm.value("source", "");
     app.is_online = xm.value("is_online", false);
+    // Emitted only to say false, so absence means reachable. Read back for the
+    // same reason `is_online` is: a leaf that went quiet several hops away is
+    // described by the gateway that still holds its declaration, and that
+    // description is the only account of it this gateway can get.
+    app.available = xm.value("available", true);
     if (app.description.empty()) {
       app.description = xm.value("description", "");
     }
@@ -301,10 +410,242 @@ Function parse_function(const nlohmann::json & j) {
   return func;
 }
 
+/**
+ * @brief What a non-200 on a sub-request means, which depends on the route.
+ */
+enum class RouteKind {
+  /// A top-level collection: ``/areas``, ``/components``, ``/apps``,
+  /// ``/functions``. Every peer serves these, so nothing but 200 describes one.
+  kCollection,
+  /// A nested collection: ``/areas/{id}/subareas``, ``/components/{id}/subcomponents``,
+  /// ``/apps/{id}/operations``. A gateway old enough not to have the route answers
+  /// 404, and aggregation has to keep working across that version boundary, so a
+  /// 404 here means "not offered" rather than "could not be read".
+  ///
+  /// It also carries ``504 not-responding``, and for the same reason the detail
+  /// of an addressable entity does: the route hangs off an entity, and a peer
+  /// holding a declaration for a gateway that went quiet answers 504 on every
+  /// route of that entity, this one included. Read as a hole in the picture it
+  /// would abort the whole fetch, and one unreachable member anywhere behind a
+  /// peer would freeze this gateway's view of everything that peer holds.
+  kNestedCollection,
+  /// The detail of an entity that carries availability of its own (a Component).
+  /// ``504 not-responding`` is the peer describing that entity as unreachable -
+  /// a statement about the entity, which an aggregating peer makes whenever it
+  /// is itself holding a declaration for a gateway that went quiet. It is
+  /// carried, not read as a hole in the picture.
+  kAddressableDetail,
+  /// The detail of a grouping entity (a Function). It has no availability of its
+  /// own to carry, and its members are named nowhere else, so nothing but 200
+  /// describes it.
+  kGroupingDetail,
+};
+
+/**
+ * @brief What one sub-request issued while describing a peer produced.
+ */
+struct SubResponse {
+  enum class Kind {
+    kBody,               ///< `body` holds the parsed response
+    kRouteAbsent,        ///< the peer does not offer this route; carry on without it
+    kEntityUnreachable,  ///< the peer named this entity and says it cannot be reached
+    kIncomplete,         ///< part of the picture could not be read; `error` says why
+  };
+
+  Kind kind{Kind::kIncomplete};
+  nlohmann::json body;
+  std::string error;
+};
+
+/**
+ * @brief True for a SOVD error body carrying the ``not-responding`` code.
+ */
+bool says_not_responding(const std::string & body) {
+  if (body.size() > MAX_PEER_RESPONSE_SIZE) {
+    return false;
+  }
+  auto parsed = nlohmann::json::parse(body, nullptr, false);
+  return !parsed.is_discarded() && parsed.is_object() && parsed.value("error_code", "") == ERR_NOT_RESPONDING;
+}
+
+/**
+ * @brief Classify one sub-request of a peer fetch.
+ *
+ * @param result httplib result for the call
+ * @param peer_name Peer the call was made against, for the error text
+ * @param path Route that was called, for the error text
+ * @param kind What a non-200 means on this route
+ */
+SubResponse read_sub_response(const httplib::Result & result, const std::string & peer_name, const std::string & path,
+                              RouteKind kind) {
+  SubResponse out;
+  if (!result) {
+    out.error = "Failed to connect to peer '" + peer_name + "' for " + path;
+    return out;
+  }
+  if (result->status == 404 && kind == RouteKind::kNestedCollection) {
+    out.kind = SubResponse::Kind::kRouteAbsent;
+    return out;
+  }
+  if (result->status == 504 && says_not_responding(result->body) &&
+      (kind == RouteKind::kAddressableDetail || kind == RouteKind::kNestedCollection)) {
+    out.kind = SubResponse::Kind::kEntityUnreachable;
+    return out;
+  }
+  if (result->status != 200) {
+    out.error = "Peer '" + peer_name + "' returned status " + std::to_string(result->status) + " for " + path;
+    return out;
+  }
+  if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
+    out.error = "Response from peer '" + peer_name + "' for " + path + " exceeds size limit";
+    return out;
+  }
+  auto parsed = nlohmann::json::parse(result->body, nullptr, false);
+  if (parsed.is_discarded()) {
+    out.error = "Invalid JSON from peer '" + peer_name + "' for " + path;
+    return out;
+  }
+  out.kind = SubResponse::Kind::kBody;
+  out.body = std::move(parsed);
+  return out;
+}
+
 }  // namespace
 
-PeerClient::PeerClient(const std::string & url, const std::string & name, int timeout_ms, bool forward_auth)
-  : url_(url), name_(name), timeout_ms_(timeout_ms), forward_auth_(forward_auth) {
+namespace {
+
+/// Name and value of the budget an error was measured against, for a message a
+/// client can act on. The READ budget differs by call: a forward spends
+/// `aggregation.forward_timeout_ms`, a fan-out spends `aggregation.timeout_ms`,
+/// so the caller names its own rather than have this guess.
+std::string describe_budget(PeerBudget budget, const PeerTimeouts & timeouts, const char * read_key, int read_ms) {
+  switch (budget) {
+    case PeerBudget::kConnect:
+      return "aggregation.timeout_ms (" + std::to_string(timeouts.connect_ms) + "ms, connect)";
+    case PeerBudget::kRead:
+      return std::string(read_key) + " (" + std::to_string(read_ms) + "ms, read)";
+    case PeerBudget::kWrite:
+      return "aggregation.write_timeout_ms (" + std::to_string(timeouts.write_ms) + "ms, write)";
+    case PeerBudget::kNone:
+      break;
+  }
+  return "its budget";
+}
+
+}  // namespace
+
+PeerBudget peer_budget_for(httplib::Error error) {
+  switch (error) {
+    case httplib::Error::ConnectionTimeout:
+      return PeerBudget::kConnect;
+    case httplib::Error::Read:
+      return PeerBudget::kRead;
+    case httplib::Error::Write:
+      return PeerBudget::kWrite;
+    case httplib::Error::Success:
+    case httplib::Error::Unknown:
+    case httplib::Error::Connection:
+    case httplib::Error::BindIPAddress:
+    case httplib::Error::ExceedRedirectCount:
+    case httplib::Error::Canceled:
+    case httplib::Error::SSLConnection:
+    case httplib::Error::SSLLoadingCerts:
+    case httplib::Error::SSLServerVerification:
+    case httplib::Error::UnsupportedMultipartBoundaryChars:
+    case httplib::Error::Compression:
+    case httplib::Error::ProxyConnection:
+    case httplib::Error::SSLPeerCouldBeClosed_:
+      return PeerBudget::kNone;
+  }
+  return PeerBudget::kNone;
+}
+
+PeerFailureKind classify_peer_error(httplib::Error error, std::chrono::milliseconds elapsed,
+                                    std::chrono::milliseconds read_budget, std::chrono::milliseconds write_budget) {
+  // Every enumerator listed rather than a default, because -Wswitch-enum is an
+  // error here: a cpp-httplib upgrade that adds a failure mode has to be
+  // classified deliberately instead of falling into "unreachable" unnoticed.
+  switch (error) {
+    case httplib::Error::ConnectionTimeout:
+      return PeerFailureKind::kTimeout;
+    case httplib::Error::Canceled:
+      return PeerFailureKind::kCanceled;
+    case httplib::Error::Read:
+      // The budget is always set on these clients, so a call that consumed it
+      // ran out of time. One that came back sooner broke for another reason -
+      // most often the peer process dying with the answer half sent - and
+      // reporting that as a timeout would tell an operator to wait for a peer
+      // that is gone.
+      //
+      // `elapsed` covers connect plus read, because cpp-httplib reports no
+      // separate connect-completion time and its socket-options hook runs
+      // BEFORE the connect. A slow handshake therefore counts towards the read
+      // budget. The connect budget is capped well below the read budgets (see
+      // AggregationConfig::peer_timeouts) so that window is bounded by the cap
+      // rather than by the whole metadata budget, and a handshake slower than
+      // the cap fails as ConnectionTimeout instead, which is attributed
+      // correctly. Removing the window entirely needs the vendored client to
+      // expose a post-connect callback.
+      return elapsed >= read_budget ? PeerFailureKind::kTimeout : PeerFailureKind::kUnreachable;
+    case httplib::Error::Write:
+      // Against the WRITE budget, which is its own and smaller than the read
+      // budget by default. Measured against the read budget, a write that ran
+      // out at 5 s inside a 15 s forward budget looks like a peer that died,
+      // and the one key whose whole purpose is bounding a slow upload could
+      // never report its own expiry.
+      return elapsed >= write_budget ? PeerFailureKind::kTimeout : PeerFailureKind::kUnreachable;
+    case httplib::Error::Success:
+      // Not reachable through the callers, which classify only a null result,
+      // but the enumerator exists and "no failure" is the only honest answer.
+      return PeerFailureKind::kNone;
+    case httplib::Error::Unknown:
+    case httplib::Error::Connection:
+    case httplib::Error::BindIPAddress:
+    case httplib::Error::ExceedRedirectCount:
+    case httplib::Error::SSLConnection:
+    case httplib::Error::SSLLoadingCerts:
+    case httplib::Error::SSLServerVerification:
+    case httplib::Error::UnsupportedMultipartBoundaryChars:
+    case httplib::Error::Compression:
+    case httplib::Error::ProxyConnection:
+    case httplib::Error::SSLPeerCouldBeClosed_:
+      return PeerFailureKind::kUnreachable;
+  }
+  return PeerFailureKind::kUnreachable;
+}
+
+const char * peer_failure_reason(PeerFailureKind kind) {
+  switch (kind) {
+    case PeerFailureKind::kNone:
+      return "none";
+    case PeerFailureKind::kTimeout:
+      return "timeout";
+    case PeerFailureKind::kUnreachable:
+      return "unreachable";
+    case PeerFailureKind::kCanceled:
+      return "canceled";
+    case PeerFailureKind::kErrorStatus:
+      return "error-status";
+    case PeerFailureKind::kTooLarge:
+      return "too-large";
+    case PeerFailureKind::kInvalidResponse:
+      return "invalid-response";
+  }
+  return "unreachable";
+}
+
+PeerClient::PeerClient(const std::string & url, const std::string & name, PeerTimeouts timeouts, bool forward_auth,
+                       std::string peer_auth_header)
+  : url_(url)
+  , name_(name)
+  , timeouts_(timeouts)
+  , forward_auth_(forward_auth)
+  , peer_auth_header_(std::move(peer_auth_header)) {
+}
+
+PeerClient::PeerClient(const std::string & url, const std::string & name, int timeout_ms, bool forward_auth,
+                       std::string peer_auth_header)
+  : PeerClient(url, name, PeerTimeouts::uniform(timeout_ms), forward_auth, std::move(peer_auth_header)) {
 }
 
 const std::string & PeerClient::url() const {
@@ -339,9 +680,11 @@ void PeerClient::ensure_client() {
     //     bounds shutdown delay to ~5s under TSan, well within the 15s
     //     grace window, without affecting forward semantics (which still
     //     use the configured timeout via ScopedClient).
-    int health_timeout_ms = std::min(timeout_ms_, 1000);
-    client_->set_connection_timeout(health_timeout_ms / 1000, (health_timeout_ms % 1000) * 1000);
+    int health_timeout_ms = std::min(timeouts_.metadata_read_ms, 1000);
+    client_->set_connection_timeout(std::min(timeouts_.connect_ms, health_timeout_ms) / 1000,
+                                    (std::min(timeouts_.connect_ms, health_timeout_ms) % 1000) * 1000);
     client_->set_read_timeout(health_timeout_ms / 1000, (health_timeout_ms % 1000) * 1000);
+    client_->set_write_timeout(timeouts_.write_ms / 1000, (timeouts_.write_ms % 1000) * 1000);
     // Note: cpp-httplib Client does not expose set_payload_max_length (server-only).
     // Response size is enforced post-download in forward_request() and
     // forward_and_get_json() via MAX_PEER_RESPONSE_SIZE body length checks.
@@ -352,8 +695,34 @@ void PeerClient::ensure_client() {
 void PeerClient::check_health() {
   std::lock_guard<std::mutex> lock(client_mutex_);
   ensure_client();
-  auto result = client_->Get(std::string(API_PREFIX) + "/health");
-  healthy_.store(result && result->status == 200);
+  // The health check is this gateway asking on its own behalf, so it carries
+  // the gateway's own credential. Without it a peer that requires auth on
+  // reads answers 401, is recorded as unhealthy, and then appears in no
+  // fan-out and no relay - the peer is reachable and correctly configured, and
+  // the aggregator reports it as down.
+  httplib::Headers headers;
+  if (!peer_auth_header_.empty()) {
+    headers.emplace("Authorization", peer_auth_header_);
+  }
+  auto result = client_->Get(std::string(API_PREFIX) + "/health", headers);
+  const bool healthy = result && result->status == 200;
+  std::string instance_id;
+  if (healthy) {
+    auto body = nlohmann::json::parse(result->body, nullptr, false);
+    if (body.is_object() && body.contains("x-medkit-instance-id") && body["x-medkit-instance-id"].is_string()) {
+      instance_id = body["x-medkit-instance-id"].get<std::string>();
+    }
+  }
+  {
+    std::lock_guard<std::mutex> id_lock(instance_id_mutex_);
+    instance_id_ = std::move(instance_id);
+  }
+  healthy_.store(healthy);
+}
+
+std::string PeerClient::instance_id() const {
+  std::lock_guard<std::mutex> lock(instance_id_mutex_);
+  return instance_id_;
 }
 
 tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
@@ -364,30 +733,38 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
   // requests, up to 8s with 2s timeout) to avoid blocking health checks and
   // forwarding on the shared client_mutex_. ScopedClient registers with the
   // active-client registry so shutdown() can stop() the in-flight call.
-  ScopedClient scoped(*this, url_, timeout_ms_);
+  ScopedClient scoped(*this, url_, timeouts_.metadata_read_ms);
   auto & cli = *scoped;
+  // Fetching the peer's entities is this gateway asking on its own behalf, so
+  // it carries the gateway's own credential. Set once on the client rather
+  // than on each of the requests below - that is also what stops the next
+  // route added here from silently going out unauthenticated and reducing the
+  // peer to "offers no such route".
+  if (!peer_auth_header_.empty()) {
+    cli.set_default_headers({{"Authorization", peer_auth_header_}});
+  }
 
   PeerEntities entities;
   const std::string peer_source = "peer:" + name_;
 
+  // A route the peer does not offer is a property of the peer, not of the
+  // entity that happened to hit it first, so it is recorded once however many
+  // entities ask for it.
+  auto note_absent_route = [&entities](const std::string & route) {
+    if (std::find(entities.absent_routes.begin(), entities.absent_routes.end(), route) ==
+        entities.absent_routes.end()) {
+      entities.absent_routes.push_back(route);
+    }
+  };
+
   // Fetch areas
   {
-    auto result = cli.Get(std::string(API_PREFIX) + "/areas");
-    if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
+    auto response =
+        read_sub_response(cli.Get(std::string(API_PREFIX) + "/areas"), name_, "/areas", RouteKind::kCollection);
+    if (response.kind != SubResponse::Kind::kBody) {
+      return tl::unexpected<std::string>(response.error);
     }
-    if (result->status != 200) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for /areas");
-    }
-    if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' for /areas exceeds size limit");
-    }
-    auto response_json = nlohmann::json::parse(result->body, nullptr, false);
-    if (response_json.is_discarded()) {
-      return tl::unexpected<std::string>("Invalid JSON from peer '" + name_ + "' for /areas");
-    }
-    entities.areas = parse_collection<Area>(response_json, parse_area);
+    entities.areas = parse_collection<Area>(response.body, parse_area);
     // Validate entity IDs and enforce per-collection limit
     entities.areas.erase(std::remove_if(entities.areas.begin(), entities.areas.end(),
                                         [](const Area & a) {
@@ -399,6 +776,7 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
                                          " areas (max " + std::to_string(MAX_ENTITIES_PER_COLLECTION) + ")");
     }
     for (auto & area : entities.areas) {
+      area.declared_source = area.source;
       area.source = peer_source;
     }
 
@@ -407,19 +785,30 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
     // (which can invalidate references if the vector reallocates).
     std::vector<Area> all_subareas;
     for (const auto & area : entities.areas) {
-      auto sub_result = cli.Get(std::string(API_PREFIX) + "/areas/" + area.id + "/subareas");
-      if (sub_result && sub_result->status == 200 && sub_result->body.size() <= MAX_PEER_RESPONSE_SIZE) {
-        auto sub_json = nlohmann::json::parse(sub_result->body, nullptr, false);
-        if (!sub_json.is_discarded()) {
-          auto subareas = parse_collection<Area>(sub_json, parse_area);
-          for (auto & sub : subareas) {
-            if (!is_valid_entity_id(sub.id)) {
-              continue;
-            }
-            sub.source = peer_source;
-            all_subareas.push_back(std::move(sub));
-          }
+      const std::string route = "/areas/" + area.id + "/subareas";
+      auto sub =
+          read_sub_response(cli.Get(std::string(API_PREFIX) + route), name_, route, RouteKind::kNestedCollection);
+      if (sub.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(sub.error);
+      }
+      if (sub.kind == SubResponse::Kind::kRouteAbsent) {
+        note_absent_route("/areas/{id}/subareas");
+        continue;
+      }
+      if (sub.kind == SubResponse::Kind::kEntityUnreachable) {
+        // The peer holds this Area's id but the gateway contributing it is
+        // silent, so its members are out of reach. That is one Area's worth of
+        // detail missing, not a failed read of the peer.
+        continue;
+      }
+      auto subareas = parse_collection<Area>(sub.body, parse_area);
+      for (auto & subarea : subareas) {
+        if (!is_valid_entity_id(subarea.id)) {
+          continue;
         }
+        subarea.declared_source = subarea.source;
+        subarea.source = peer_source;
+        all_subareas.push_back(std::move(subarea));
       }
     }
     entities.areas.insert(entities.areas.end(), std::make_move_iterator(all_subareas.begin()),
@@ -428,23 +817,13 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
 
   // Fetch components (list then detail per entity for full relationship data)
   {
-    auto result = cli.Get(std::string(API_PREFIX) + "/components");
-    if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
-    }
-    if (result->status != 200) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for /components");
-    }
-    if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' for /components exceeds size limit");
-    }
-    auto response_json = nlohmann::json::parse(result->body, nullptr, false);
-    if (response_json.is_discarded()) {
-      return tl::unexpected<std::string>("Invalid JSON from peer '" + name_ + "' for /components");
+    auto response = read_sub_response(cli.Get(std::string(API_PREFIX) + "/components"), name_, "/components",
+                                      RouteKind::kCollection);
+    if (response.kind != SubResponse::Kind::kBody) {
+      return tl::unexpected<std::string>(response.error);
     }
     // Parse IDs from list, then fetch detail per entity for relationships
-    auto comp_list = parse_collection<Component>(response_json, parse_component);
+    auto comp_list = parse_collection<Component>(response.body, parse_component);
     // Validate entity IDs and enforce per-collection limit
     comp_list.erase(std::remove_if(comp_list.begin(), comp_list.end(),
                                    [](const Component & c) {
@@ -455,14 +834,25 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
       return tl::unexpected<std::string>("Peer '" + name_ + "' returned " + std::to_string(comp_list.size()) +
                                          " components (max " + std::to_string(MAX_ENTITIES_PER_COLLECTION) + ")");
     }
+    // The detail response carries the relationships (parent, dependencies,
+    // identity) the list omits, so a Component built from the list alone is a
+    // Component asserted to have none.
     for (auto & comp : comp_list) {
-      auto detail = cli.Get(std::string(API_PREFIX) + "/components/" + comp.id);
-      if (detail && detail->status == 200) {
-        auto detail_json = nlohmann::json::parse(detail->body, nullptr, false);
-        if (!detail_json.is_discarded()) {
-          comp = parse_component(detail_json);
-        }
+      const std::string route = "/components/" + comp.id;
+      auto detail =
+          read_sub_response(cli.Get(std::string(API_PREFIX) + route), name_, route, RouteKind::kAddressableDetail);
+      if (detail.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(detail.error);
       }
+      if (detail.kind == SubResponse::Kind::kBody) {
+        comp = parse_component(detail.body);
+      } else {
+        // The peer holds this Component's id but cannot describe it: whoever
+        // contributes it has gone quiet. What the list gave is everything the
+        // peer can still say, and the availability is what it is saying.
+        comp.available = false;
+      }
+      comp.declared_source = comp.source;
       comp.source = peer_source;
     }
     // Fetch subcomponents for each top-level component (list endpoint filters them out).
@@ -470,27 +860,45 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
     // (which can invalidate references if the vector reallocates).
     std::vector<Component> all_subcomps;
     for (const auto & comp : comp_list) {
-      auto sub_result = cli.Get(std::string(API_PREFIX) + "/components/" + comp.id + "/subcomponents");
-      if (sub_result && sub_result->status == 200 && sub_result->body.size() <= MAX_PEER_RESPONSE_SIZE) {
-        auto sub_json = nlohmann::json::parse(sub_result->body, nullptr, false);
-        if (!sub_json.is_discarded()) {
-          auto subcomps = parse_collection<Component>(sub_json, parse_component);
-          for (auto & sub : subcomps) {
-            if (!is_valid_entity_id(sub.id)) {
-              continue;
-            }
-            // Fetch detail for each subcomponent to get full relationships
-            auto detail = cli.Get(std::string(API_PREFIX) + "/components/" + sub.id);
-            if (detail && detail->status == 200) {
-              auto detail_json = nlohmann::json::parse(detail->body, nullptr, false);
-              if (!detail_json.is_discarded()) {
-                sub = parse_component(detail_json);
-              }
-            }
-            sub.source = peer_source;
-            all_subcomps.push_back(std::move(sub));
-          }
+      const std::string route = "/components/" + comp.id + "/subcomponents";
+      auto sub =
+          read_sub_response(cli.Get(std::string(API_PREFIX) + route), name_, route, RouteKind::kNestedCollection);
+      if (sub.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(sub.error);
+      }
+      if (sub.kind == SubResponse::Kind::kRouteAbsent) {
+        note_absent_route("/components/{id}/subcomponents");
+        continue;
+      }
+      if (sub.kind == SubResponse::Kind::kEntityUnreachable) {
+        // Same as for subareas: the parent is retained and unreachable, so what
+        // it contains cannot be read. The parent itself already carries that.
+        continue;
+      }
+      auto subcomps = parse_collection<Component>(sub.body, parse_component);
+      for (auto & subcomp : subcomps) {
+        if (!is_valid_entity_id(subcomp.id)) {
+          continue;
         }
+        // Fetch detail for each subcomponent to get full relationships
+        const std::string detail_route = "/components/" + subcomp.id;
+        auto detail = read_sub_response(cli.Get(std::string(API_PREFIX) + detail_route), name_, detail_route,
+                                        RouteKind::kAddressableDetail);
+        if (detail.kind == SubResponse::Kind::kIncomplete) {
+          return tl::unexpected<std::string>(detail.error);
+        }
+        if (detail.kind == SubResponse::Kind::kBody) {
+          subcomp = parse_component(detail.body);
+        } else {
+          subcomp.available = false;
+          // The route this id came from is itself the statement that `comp` is
+          // its parent, so the tree keeps its shape even though the entity's
+          // own description is out of reach.
+          subcomp.parent_component_id = comp.id;
+        }
+        subcomp.declared_source = subcomp.source;
+        subcomp.source = peer_source;
+        all_subcomps.push_back(std::move(subcomp));
       }
     }
     comp_list.insert(comp_list.end(), std::make_move_iterator(all_subcomps.begin()),
@@ -501,22 +909,12 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
 
   // Fetch apps
   {
-    auto result = cli.Get(std::string(API_PREFIX) + "/apps");
-    if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
+    auto response =
+        read_sub_response(cli.Get(std::string(API_PREFIX) + "/apps"), name_, "/apps", RouteKind::kCollection);
+    if (response.kind != SubResponse::Kind::kBody) {
+      return tl::unexpected<std::string>(response.error);
     }
-    if (result->status != 200) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for /apps");
-    }
-    if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' for /apps exceeds size limit");
-    }
-    auto response_json = nlohmann::json::parse(result->body, nullptr, false);
-    if (response_json.is_discarded()) {
-      return tl::unexpected<std::string>("Invalid JSON from peer '" + name_ + "' for /apps");
-    }
-    entities.apps = parse_collection<App>(response_json, parse_app);
+    entities.apps = parse_collection<App>(response.body, parse_app);
     // Validate entity IDs and enforce per-collection limit
     entities.apps.erase(std::remove_if(entities.apps.begin(), entities.apps.end(),
                                        [](const App & a) {
@@ -528,37 +926,70 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
                                          " apps (max " + std::to_string(MAX_ENTITIES_PER_COLLECTION) + ")");
     }
     for (auto & app : entities.apps) {
+      app.declared_source = app.source;
       app.source = peer_source;
     }
-    // Filter ROS 2 internal nodes (underscore prefix convention) at source.
-    // These are noise nodes like _param_client_node that should never appear
-    // as SOVD entities.
-    entities.apps.erase(std::remove_if(entities.apps.begin(), entities.apps.end(),
-                                       [](const App & app) {
-                                         return !app.id.empty() && app.id[0] == '_';
-                                       }),
-                        entities.apps.end());
+    // No internal-node filter here: the peer applied its own, and an id that
+    // starts with '_' can name a visible node whose name collided.
+
+    // Fetch each app's operations and data. Neither is ever declared in a
+    // manifest - both are discovered from the ROS graph - so the only record of
+    // what a peer's app exposes is what the peer reports. Without the
+    // operations the aggregator cannot tell that two members share an operation
+    // short name except by asking at request time, and an answer that depends
+    // on who is reachable is not an answer a client can rely on. Without the
+    // topics it holds no record of which member owns one, so an item id that
+    // names no member - the form a topic with a single provider is listed under
+    // - cannot be routed to the gateway that has the topic.
+    //
+    // `X-Medkit-No-Fan-Out` keeps the peer from re-asking ITS peers: each
+    // gateway reports what it holds, and the hop that owns the entity is the
+    // hop that answers for it. It is also what makes this terminate.
+    //
+    // A route that is absent or answers for an unreachable entity is skipped on
+    // its own, never for the app: the two collections are read independently
+    // and one missing must not cost the other.
+    for (auto & app : entities.apps) {
+      const httplib::Headers no_fan_out{{"X-Medkit-No-Fan-Out", "1"}};
+
+      const std::string ops_route = "/apps/" + app.id + "/operations";
+      auto ops = read_sub_response(cli.Get(std::string(API_PREFIX) + ops_route, no_fan_out), name_, ops_route,
+                                   RouteKind::kNestedCollection);
+      if (ops.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(ops.error);
+      }
+      if (ops.kind == SubResponse::Kind::kRouteAbsent) {
+        note_absent_route("/apps/{id}/operations");
+      } else if (ops.kind == SubResponse::Kind::kBody) {
+        parse_operations_into(ops.body, app);
+      }
+      // kEntityUnreachable: the App is retained and its gateway is silent, so
+      // the peer answers for it rather than proxying. It keeps what the peer
+      // already reported; there is nothing further to read.
+
+      const std::string data_route = "/apps/" + app.id + "/data";
+      auto data = read_sub_response(cli.Get(std::string(API_PREFIX) + data_route, no_fan_out), name_, data_route,
+                                    RouteKind::kNestedCollection);
+      if (data.kind == SubResponse::Kind::kIncomplete) {
+        return tl::unexpected<std::string>(data.error);
+      }
+      if (data.kind == SubResponse::Kind::kRouteAbsent) {
+        note_absent_route("/apps/{id}/data");
+      } else if (data.kind == SubResponse::Kind::kBody) {
+        parse_data_items_into(data.body, app);
+      }
+    }
   }
 
   // Fetch functions (list then detail per entity for hosts data)
   {
-    auto result = cli.Get(std::string(API_PREFIX) + "/functions");
-    if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
-    }
-    if (result->status != 200) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for /functions");
-    }
-    if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' for /functions exceeds size limit");
-    }
-    auto response_json = nlohmann::json::parse(result->body, nullptr, false);
-    if (response_json.is_discarded()) {
-      return tl::unexpected<std::string>("Invalid JSON from peer '" + name_ + "' for /functions");
+    auto response =
+        read_sub_response(cli.Get(std::string(API_PREFIX) + "/functions"), name_, "/functions", RouteKind::kCollection);
+    if (response.kind != SubResponse::Kind::kBody) {
+      return tl::unexpected<std::string>(response.error);
     }
     // Parse IDs from list, then fetch detail per entity for hosts
-    auto func_list = parse_collection<Function>(response_json, parse_function);
+    auto func_list = parse_collection<Function>(response.body, parse_function);
     // Validate entity IDs and enforce per-collection limit
     func_list.erase(std::remove_if(func_list.begin(), func_list.end(),
                                    [](const Function & f) {
@@ -569,14 +1000,18 @@ tl::expected<PeerEntities, std::string> PeerClient::fetch_entities() {
       return tl::unexpected<std::string>("Peer '" + name_ + "' returned " + std::to_string(func_list.size()) +
                                          " functions (max " + std::to_string(MAX_ENTITIES_PER_COLLECTION) + ")");
     }
+    // A Function's hosts live only in its detail response: the list carries
+    // none. A Function built from the list alone is a Function asserted to
+    // group nothing, which is a statement the peer never made.
     for (auto & func : func_list) {
-      auto detail = cli.Get(std::string(API_PREFIX) + "/functions/" + func.id);
-      if (detail && detail->status == 200) {
-        auto detail_json = nlohmann::json::parse(detail->body, nullptr, false);
-        if (!detail_json.is_discarded()) {
-          func = parse_function(detail_json);
-        }
+      const std::string route = "/functions/" + func.id;
+      auto detail =
+          read_sub_response(cli.Get(std::string(API_PREFIX) + route), name_, route, RouteKind::kGroupingDetail);
+      if (detail.kind != SubResponse::Kind::kBody) {
+        return tl::unexpected<std::string>(detail.error);
       }
+      func = parse_function(detail.body);
+      func.declared_source = func.source;
       func.source = peer_source;
     }
     entities.functions = std::move(func_list);
@@ -597,7 +1032,11 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   // during potentially long I/O operations. The shared client_ is reserved for
   // short health checks only. ScopedClient registers with the active-client
   // registry so shutdown() can stop() the in-flight call.
-  ScopedClient scoped(*this, url_, timeout_ms_);
+  //
+  // The forward budget, not the metadata one: what comes back is whatever the
+  // peer had to do to answer, which for a synchronous operation is that
+  // gateway's own service budget and for a large resource is the transfer.
+  ScopedClient scoped(*this, url_, timeouts_.forward_read_ms);
   auto & cli = *scoped;
 
   httplib::Headers headers;
@@ -605,16 +1044,32 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   // Default is off to prevent token leakage to untrusted/mDNS-discovered peers.
   if (forward_auth_ && req.has_header("Authorization")) {
     headers.emplace("Authorization", req.get_header_value("Authorization"));
+  } else if (!peer_auth_header_.empty()) {
+    // The gateway's own credential, used when there is no client credential to
+    // pass on. A client's own token wins where forwarding is enabled, so
+    // forward_auth keeps naming the end user to the peer.
+    headers.emplace("Authorization", peer_auth_header_);
   }
   // Propagate fan-out suppression header to prevent recursive loops when
   // a forwarded request bounces back to the origin via bidirectional peering.
   if (req.has_header("X-Medkit-No-Fan-Out")) {
     headers.emplace("X-Medkit-No-Fan-Out", "1");
   }
+  // The client's identity, which is what a lock is held against. The peer owns
+  // the entity, so the peer holds the lock and judges every request against the
+  // name it recorded; a request that arrives anonymous is a different caller
+  // than the one that took the lock, whoever sent it. It is not a credential -
+  // authority travels in Authorization, which is forwarded only when the
+  // deployment says the peer is trusted with it.
+  if (req.has_header("X-Client-Id")) {
+    headers.emplace("X-Client-Id", req.get_header_value("X-Client-Id"));
+  }
 
   httplib::Result result{nullptr, httplib::Error::Unknown};
   const std::string path = path_with_query(req);
   const std::string content_type = req.get_header_value("Content-Type");
+
+  const auto started_at = std::chrono::steady_clock::now();
 
   if (req.method == "GET") {
     result = cli.Get(path, headers);
@@ -629,8 +1084,32 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   }
 
   if (!result) {
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at);
+    const auto kind = classify_peer_error(result.error(), elapsed, std::chrono::milliseconds(timeouts_.forward_read_ms),
+                                          std::chrono::milliseconds(timeouts_.write_ms));
+    if (kind == PeerFailureKind::kTimeout) {
+      // The peer is answering someone; this gateway stopped waiting. Saying it
+      // is unavailable describes a different system state and points an
+      // operator at the wrong box.
+      //
+      // The message names the budget that actually expired. A connect timeout
+      // is bounded by aggregation.timeout_ms, not by the forward budget the
+      // call was hoping to spend, and telling an operator to raise the forward
+      // budget would not move a peer that never accepted the connection.
+      const auto expired = describe_budget(peer_budget_for(result.error()), timeouts_, "aggregation.forward_timeout_ms",
+                                           timeouts_.forward_read_ms);
+      res.status = 504;
+      auto error_body =
+          make_error_body(ERR_NOT_RESPONDING, "Peer '" + name_ + "' at " + url_ + " did not answer within " + expired +
+                                                  ". The request may still be running there.");
+      res.set_content(error_body.dump(), "application/json");
+      return;
+    }
     res.status = 502;
-    auto error_body = make_error_body(ERR_VENDOR_ERROR, "Peer '" + name_ + "' at " + url_ + " is unavailable",
+    auto error_body = make_error_body(ERR_VENDOR_ERROR,
+                                      "Peer '" + name_ + "' at " + url_ + " is unavailable (" +
+                                          std::string(peer_failure_reason(kind)) + ")",
                                       ERR_X_MEDKIT_PEER_UNAVAILABLE);
     res.set_content(error_body.dump(), "application/json");
     return;
@@ -648,8 +1127,14 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   // The x-medkit header allowlist must match headers the gateway actually produces.
   // Currently the only x-medkit HTTP header is X-Medkit-Local-Only (fault_handlers.cpp).
   // Update this list when adding new x-medkit HTTP response headers.
-  static const std::set<std::string> allowed_headers = {"content-type", "etag", "cache-control", "last-modified",
-                                                        "x-medkit-local-only"};
+  //
+  // `location` is what a 201 or 202 hands the client to address the resource it
+  // just created. The peer builds it from the request it received, so it names
+  // the member's own route - a path this gateway resolves to the same member,
+  // and the only address of a resource that lives on the other side. Dropping it
+  // leaves the client a status with nothing to follow.
+  static const std::set<std::string> allowed_headers = {"content-type",  "etag",     "cache-control",
+                                                        "last-modified", "location", "x-medkit-local-only"};
 
   res.status = result->status;
   res.body = result->body;
@@ -664,24 +1149,31 @@ void PeerClient::forward_request(const httplib::Request & req, httplib::Response
   }
 }
 
-tl::expected<nlohmann::json, std::string> PeerClient::forward_and_get_json(const std::string & method,
-                                                                           const std::string & path,
-                                                                           const std::string & auth_header,
-                                                                           const httplib::Headers & extra_headers) {
+tl::expected<nlohmann::json, PeerError> PeerClient::forward_and_get_json(const std::string & method,
+                                                                         const std::string & path,
+                                                                         const std::string & auth_header,
+                                                                         const httplib::Headers & extra_headers) {
   if (shutdown_requested_.load(std::memory_order_acquire)) {
-    return tl::unexpected<std::string>("Peer '" + name_ + "': forward_and_get_json skipped, shutdown in progress");
+    return tl::unexpected(PeerError{PeerFailureKind::kCanceled,
+                                    "Peer '" + name_ + "': forward_and_get_json skipped, shutdown in progress"});
   }
   // Create a dedicated client per call to avoid holding client_mutex_ during I/O.
   // The shared client_ is reserved for short health checks only. ScopedClient
   // registers with the active-client registry so shutdown() can stop() the
   // in-flight call.
-  ScopedClient scoped(*this, url_, timeout_ms_);
+  //
+  // The metadata budget: a fan-out runs against every peer at once with a
+  // client waiting on the slowest of them, so this is bounded by what a
+  // listing is worth, not by what one peer's work might cost.
+  ScopedClient scoped(*this, url_, timeouts_.metadata_read_ms);
   auto & cli = *scoped;
 
   httplib::Headers headers;
   // Only forward auth header when forward_auth is enabled
   if (forward_auth_ && !auth_header.empty()) {
     headers.emplace("Authorization", auth_header);
+  } else if (!peer_auth_header_.empty()) {
+    headers.emplace("Authorization", peer_auth_header_);
   }
   for (const auto & [key, value] : extra_headers) {
     headers.emplace(key, value);
@@ -706,6 +1198,8 @@ tl::expected<nlohmann::json, std::string> PeerClient::forward_and_get_json(const
 
   httplib::Result result{nullptr, httplib::Error::Unknown};
 
+  const auto started_at = std::chrono::steady_clock::now();
+
   if (method == "GET") {
     result = cli.Get(
         path, headers,
@@ -726,36 +1220,60 @@ tl::expected<nlohmann::json, std::string> PeerClient::forward_and_get_json(const
   // cpp-httplib does not offer ContentReceiver overloads for all methods.
   bool used_streaming = (method == "GET");
 
+  // The size guard aborts the download from inside the content receiver, which
+  // cpp-httplib surfaces as a cancelled read. Checked before the transport
+  // error so an oversized body is reported as one rather than as a broken
+  // connection.
+  auto transport_failure = [&]() {
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at);
+    const auto kind =
+        classify_peer_error(result.error(), elapsed, std::chrono::milliseconds(timeouts_.metadata_read_ms),
+                            std::chrono::milliseconds(timeouts_.write_ms));
+    std::string message = kind == PeerFailureKind::kTimeout
+                              ? "Peer '" + name_ + "' at " + url_ + " did not answer " + method + " " + path +
+                                    " within " +
+                                    describe_budget(peer_budget_for(result.error()), timeouts_,
+                                                    "aggregation.timeout_ms", timeouts_.metadata_read_ms)
+                              : "Failed to reach peer '" + name_ + "' at " + url_ + " for " + method + " " + path;
+    return PeerError{kind, std::move(message)};
+  };
+
   if (used_streaming) {
     if (size_exceeded) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' exceeds size limit for " + method + " " +
-                                         path);
+      return tl::unexpected(
+          PeerError{PeerFailureKind::kTooLarge,
+                    "Response from peer '" + name_ + "' exceeds size limit for " + method + " " + path});
     }
     if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
+      return tl::unexpected(transport_failure());
     }
     if (response_status < 200 || response_status >= 300) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(response_status) +
-                                         " for " + method + " " + path);
+      return tl::unexpected(PeerError{PeerFailureKind::kErrorStatus, "Peer '" + name_ + "' returned status " +
+                                                                         std::to_string(response_status) + " for " +
+                                                                         method + " " + path});
     }
   } else {
     if (!result) {
-      return tl::unexpected<std::string>("Failed to connect to peer '" + name_ + "' at " + url_);
+      return tl::unexpected(transport_failure());
     }
     if (result->status < 200 || result->status >= 300) {
-      return tl::unexpected<std::string>("Peer '" + name_ + "' returned status " + std::to_string(result->status) +
-                                         " for " + method + " " + path);
+      return tl::unexpected(PeerError{PeerFailureKind::kErrorStatus, "Peer '" + name_ + "' returned status " +
+                                                                         std::to_string(result->status) + " for " +
+                                                                         method + " " + path});
     }
     if (result->body.size() > MAX_PEER_RESPONSE_SIZE) {
-      return tl::unexpected<std::string>("Response from peer '" + name_ + "' exceeds size limit for " + method + " " +
-                                         path);
+      return tl::unexpected(
+          PeerError{PeerFailureKind::kTooLarge,
+                    "Response from peer '" + name_ + "' exceeds size limit for " + method + " " + path});
     }
     accumulated_body = std::move(result->body);
   }
 
   auto parsed = nlohmann::json::parse(accumulated_body, nullptr, false);
   if (parsed.is_discarded()) {
-    return tl::unexpected<std::string>("Invalid JSON response from peer '" + name_ + "' for " + method + " " + path);
+    return tl::unexpected(PeerError{PeerFailureKind::kInvalidResponse,
+                                    "Invalid JSON response from peer '" + name_ + "' for " + method + " " + path});
   }
 
   return parsed;
@@ -802,10 +1320,16 @@ void PeerClient::unregister_active(httplib::Client * cli) {
   active_clients_.erase(cli);
 }
 
-PeerClient::ScopedClient::ScopedClient(PeerClient & owner, const std::string & url, int timeout_ms)
+PeerClient::ScopedClient::ScopedClient(PeerClient & owner, const std::string & url, int read_timeout_ms)
   : owner_(owner), cli_(url) {
-  cli_.set_connection_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
-  cli_.set_read_timeout(timeout_ms / 1000, (timeout_ms % 1000) * 1000);
+  const int connect_ms = owner.timeouts_.connect_ms;
+  const int write_ms = owner.timeouts_.write_ms;
+  cli_.set_connection_timeout(connect_ms / 1000, (connect_ms % 1000) * 1000);
+  cli_.set_read_timeout(read_timeout_ms / 1000, (read_timeout_ms % 1000) * 1000);
+  // Without this the write budget is cpp-httplib's own 5 s default and follows
+  // no configured value at all, so a large request body to a slow peer is cut
+  // off however high the read budget is set.
+  cli_.set_write_timeout(write_ms / 1000, (write_ms % 1000) * 1000);
   owner_.register_active(&cli_);
   // If shutdown landed between the timeout setup and registration, pre-stop
   // the client so the first Get/Post returns Error::Canceled immediately.

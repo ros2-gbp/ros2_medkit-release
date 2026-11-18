@@ -27,9 +27,8 @@ the wire this surfaces as:
   not both.
 
 Three gateways, three distinct DDS domains, aggregation is the only channel
-between them. Serialised against ``test_daisy_chain_aggregation`` and
-``test_peer_aggregation`` via ``RESOURCE_LOCK medkit_secondary_dds_domains``
-in CMakeLists.txt.
+between them. All three domains are allocated to this test alone, by the
+``DOMAINS`` count on its registration in CMakeLists.txt.
 """
 
 import os
@@ -39,7 +38,6 @@ import unittest
 
 from launch import LaunchDescription
 from launch.actions import SetEnvironmentVariable
-import launch_ros.actions
 import launch_testing
 import launch_testing.actions
 import requests
@@ -53,6 +51,7 @@ from ros2_medkit_test_utils.constants import (
     get_test_domain_id,
     get_test_port,
 )
+from ros2_medkit_test_utils.launch_helpers import create_gateway_node
 
 PRIMARY_PORT = get_test_port(0)
 PEER_B_PORT = get_test_port(1)
@@ -114,8 +113,6 @@ MANIFEST_FILES = [PRIMARY_MANIFEST, PEER_B_MANIFEST, PEER_C_MANIFEST]
 
 def _gateway(port, name, manifest_path, domain, aggregation_peers=None):
     params = {
-        'refresh_interval_ms': 1000,
-        'server.port': port,
         'discovery.mode': 'manifest_only',
         'discovery.manifest_path': manifest_path,
         'discovery.manifest_strict_validation': False,
@@ -131,19 +128,11 @@ def _gateway(port, name, manifest_path, domain, aggregation_peers=None):
             'aggregation.peer_urls': urls,
             'aggregation.peer_names': names,
         })
-    return launch_ros.actions.Node(
-        package='ros2_medkit_gateway',
-        executable='gateway_node',
+    return create_gateway_node(
         name=name,
-        output='screen',
-        parameters=[params],
-        additional_env={'ROS_DOMAIN_ID': str(domain)},
-        # Match create_gateway_node()'s TSan/ASan-safe shutdown windows.
-        # Under sanitizers the gateway teardown sequence (mdns stop, REST
-        # server stop, transport shutdown, plugin shutdown) routinely
-        # exceeds launch's 5s default, causing SIGKILL with exit -9.
-        sigterm_timeout='30',
-        sigkill_timeout='15',
+        port=port,
+        extra_params=params,
+        extra_env={'ROS_DOMAIN_ID': str(domain)},
     )
 
 
@@ -229,7 +218,7 @@ class TestLeafCollisionAggregation(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertIn('warning_schema_version', body)
-        self.assertEqual(body['warning_schema_version'], 1)
+        self.assertEqual(body['warning_schema_version'], 2)
         collisions = [
             w for w in body.get('warnings', [])
             if w.get('code') == 'leaf_id_collision'
