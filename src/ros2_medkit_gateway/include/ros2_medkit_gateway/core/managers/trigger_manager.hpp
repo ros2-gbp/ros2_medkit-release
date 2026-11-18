@@ -32,6 +32,7 @@
 
 #include "ros2_medkit_gateway/core/condition_evaluator.hpp"
 #include "ros2_medkit_gateway/core/resource_change_notifier.hpp"
+#include "ros2_medkit_gateway/core/transports/data_item_source.hpp"
 #include "ros2_medkit_gateway/core/transports/topic_subscription_transport.hpp"
 #include "ros2_medkit_gateway/core/trigger_store.hpp"
 
@@ -91,8 +92,12 @@ class TriggerManager {
   ///                      topic subscriptions. When null the manager retains
   ///                      its CRUD/dispatch behaviour but never subscribes
   ///                      (useful in tests that don't need topic routing).
+  /// @param data_source   Optional source for data triggers that have no topic. With a transport and a source, a
+  ///                      trigger whose topic is known uses the transport and every other data trigger uses the
+  ///                      source. With a source alone, every data trigger uses it.
   TriggerManager(ResourceChangeNotifier & notifier, ConditionRegistry & conditions, TriggerStore & store,
-                 const TriggerConfig & config, std::shared_ptr<TopicSubscriptionTransport> topic_transport = nullptr);
+                 const TriggerConfig & config, std::shared_ptr<TopicSubscriptionTransport> topic_transport = nullptr,
+                 std::shared_ptr<DataItemSource> data_source = nullptr);
   ~TriggerManager();
 
   // Non-copyable, non-movable (owns trigger state and notifier subscription)
@@ -142,7 +147,11 @@ class TriggerManager {
   void shutdown();
 
   /// Load persistent triggers from the store (on gateway restart).
-  void load_persistent_triggers();
+  ///
+  /// Runs once, while the gateway is being constructed, and returns how many
+  /// triggers it put back. Nothing retries it, so a trigger that is not
+  /// restored here is absent for the life of the process.
+  size_t load_persistent_triggers();
 
   // --- Hierarchy matching ---------------------------------------------------
 
@@ -163,6 +172,17 @@ class TriggerManager {
 
   /// Set the topic name resolver. Called by GatewayNode after cache is available.
   void set_resolve_topic_fn(ResolveTopicFn fn);
+
+  /// Operator-facing warning sink (transport-agnostic; GatewayNode wires it to
+  /// the ROS logger). Used when deferred resolution gives up on a trigger.
+  using WarnLogFn = std::function<void(const std::string & message)>;
+  void set_warn_log_fn(WarnLogFn fn);
+
+  /// How long deferred resolution keeps retrying after the trigger's entity has
+  /// been discovered before giving up, and how long it waits for an entity that
+  /// has never been discovered before saying so once. Default 60 s; tests
+  /// shrink it to exercise both paths.
+  void set_unresolved_timeout(std::chrono::seconds timeout);
 
   /// Retry resolving data triggers whose topic names were unknown at creation.
   /// Called periodically (today: from the rclcpp adapter's retry tick) so
@@ -190,6 +210,7 @@ class TriggerManager {
   ///   - `info.entity_id` and `info.entity_type` are immutable after creation
   ///     and safe to read without `mtx` (e.g. in matches_entity()).
   ///   - `active` is atomic and can be read/written without `mtx`.
+  ///   - `entity_seen` is atomic and can be read/written without `mtx`.
   struct TriggerState {
     TriggerInfo info;
     nlohmann::json previous_value;
@@ -197,6 +218,15 @@ class TriggerManager {
     std::mutex mtx;
     std::condition_variable cv;
     std::atomic<bool> active{true};
+    /// Whether this gateway has ever found the trigger's entity in discovery.
+    ///
+    /// The orphan sweep removes a trigger whose entity is missing, and for a
+    /// trigger created through the API the entity was validated to exist, so
+    /// missing can only mean gone: true is the right starting point. A trigger
+    /// restored from the store is the exception - the process that created it
+    /// is not this one, so until discovery reports the entity, missing means
+    /// "not discovered yet" and there is nothing to conclude.
+    std::atomic<bool> entity_seen{true};
     std::deque<nlohmann::json> pending_events;
     static constexpr size_t kMaxPendingEvents = 100;
     std::atomic<uint64_t> event_counter{0};
@@ -265,6 +295,9 @@ class TriggerManager {
   // the rclcpp resources; the manager only stores per-trigger handles.
   std::shared_ptr<TopicSubscriptionTransport> topic_transport_;
 
+  // Data trigger item source (shared, optional). Handles live in topic_handles_ with the topic ones.
+  std::shared_ptr<DataItemSource> data_source_;
+
   // Per-trigger live subscription handles. Destruction of a handle
   // unsubscribes the underlying topic; the manager removes entries from
   // this map on remove()/cleanup_expired_trigger() so the dtor side-effect
@@ -283,17 +316,33 @@ class TriggerManager {
   // worker thread (single-threaded dispatch), so no synchronization needed.
   bool evaluating_trigger_{false};
 
-  // Deferred resolution for data triggers created before topic was discoverable.
-  // Periodically retried via retry_unresolved_triggers().
+  // Deferred resolution for data triggers whose topic was not discoverable when
+  // the trigger entered this process - created through the API before the topic
+  // existed, or restored from the store. Periodically retried via
+  // retry_unresolved_triggers().
   struct UnresolvedTrigger {
     std::string trigger_id;
     std::string entity_id;
     std::string resource_path;
     std::chrono::steady_clock::time_point created_at;
+    /// When this gateway first found the trigger's entity in discovery, empty
+    /// until then. The give-up budget runs from this instant, not from
+    /// created_at: an entity that has never been discovered has not failed to
+    /// resolve, it has simply not been reported yet, which is the same
+    /// distinction TriggerState::entity_seen draws for the orphan sweep. Tying
+    /// both to that one signal is what makes the subscription attempt live
+    /// exactly as long as the trigger record does.
+    std::optional<std::chrono::steady_clock::time_point> entity_seen_at;
+    /// Whether the "entity still undiscovered" notice has been emitted for this
+    /// trigger. Retrying for an entity that has never been seen is correct and
+    /// unbounded, so it is reported once - an unbounded wait nobody is told
+    /// about is the same dead alarm as a silent give-up.
+    bool waiting_reported{false};
   };
   std::vector<UnresolvedTrigger> unresolved_data_triggers_;  // guarded by triggers_mutex_
   ResolveTopicFn resolve_topic_fn_;                          // guarded by triggers_mutex_
-  static constexpr int kUnresolvedTimeoutSec = 60;
+  WarnLogFn warn_log_fn_;                                    // guarded by triggers_mutex_
+  std::chrono::seconds unresolved_timeout_{60};              // guarded by triggers_mutex_
 };
 
 }  // namespace ros2_medkit_gateway
