@@ -48,6 +48,18 @@ Faults
    shall take precedence over global defaults. Unspecified fields shall inherit from global
    configuration. When no entity prefix matches, global defaults shall apply.
 
+.. req:: Per-Fault-Code Debounce Thresholds
+   :id: REQ_INTEROP_107
+   :status: verified
+   :tags: Faults
+
+   The fault manager shall support per-fault_code debounce threshold configuration using
+   exact matching on the reported fault code. A fault-code override for
+   ``confirmation_threshold``, ``healing_enabled``, or ``healing_threshold`` shall take
+   precedence over both the per-entity override resolved for the reporting source and the
+   global defaults. Unspecified fields shall inherit from the layer below. When a fault code
+   has no override, the resolved per-entity or global configuration shall apply unchanged.
+
 .. req:: Fault Snapshot and Rosbag Capture
    :id: REQ_INTEROP_088
    :status: verified
@@ -56,5 +68,6 @@ Faults
    When a fault is confirmed, the system shall automatically capture diagnostic snapshots
    (freeze-frame topic data) and rosbag recordings as configured. Captured data shall be
    stored as environment data associated with the fault and accessible via the bulk-data
-   endpoints on the fault's reporting entity.
-
+   endpoints on the fault's reporting entity. For faults already confirmed when the
+   capturing component starts (e.g. the gateway restarts while a fault is standing), an
+   equivalent snapshot shall be captured at startup and marked with its capture origin.

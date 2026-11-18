@@ -111,8 +111,12 @@ class LifecycleHandlersTest : public ::testing::Test {
     spin_thread_ = std::thread([this]() {
       executor_->spin();
     });
+    // A cancel() that lands before spin() starts is lost, and join() would block.
+    while (!executor_->is_spinning()) {
+      std::this_thread::yield();
+    }
 
-    ctx_ = std::make_unique<HandlerContext>(gateway_node_.get(), cors_, auth_, tls_, nullptr);
+    ctx_ = std::make_unique<HandlerContext>(*gateway_node_, cors_, auth_, tls_, nullptr);
     handlers_ = std::make_unique<LifecycleHandlers>(*ctx_, nullptr);  // no plugin manager
 
     // Give the executor a moment to start before seeding cache.
@@ -328,7 +332,12 @@ class EntityDetailStatusLinkTest : public ::testing::Test {
     }
   }
 
+  // Shut the default context down before exit(). Its destructor would otherwise call
+  // Context::shutdown() after exit() has destroyed rclcpp's thread_local state for this thread.
   static void TearDownTestSuite() {
+    if (rclcpp::ok()) {
+      rclcpp::shutdown();
+    }
   }
 
   void SetUp() override {
@@ -340,6 +349,10 @@ class EntityDetailStatusLinkTest : public ::testing::Test {
     spin_thread_ = std::thread([this]() {
       executor_->spin();
     });
+    // A cancel() that lands before spin() starts is lost, and join() would block.
+    while (!executor_->is_spinning()) {
+      std::this_thread::yield();
+    }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -355,7 +368,7 @@ class EntityDetailStatusLinkTest : public ::testing::Test {
     auto & cache = const_cast<ThreadSafeEntityCache &>(gateway_node_->get_thread_safe_cache());
     cache.update_all({}, {comp}, {app}, {});
 
-    ctx_ = std::make_unique<HandlerContext>(gateway_node_.get(), cors_, auth_, tls_, nullptr);
+    ctx_ = std::make_unique<HandlerContext>(*gateway_node_, cors_, auth_, tls_, nullptr);
     discovery_ = std::make_unique<DiscoveryHandlers>(*ctx_);
   }
 
@@ -470,7 +483,12 @@ class LifecycleHandlersWithProviderTest : public ::testing::Test {
     }
   }
 
+  // Shut the default context down before exit(). Its destructor would otherwise call
+  // Context::shutdown() after exit() has destroyed rclcpp's thread_local state for this thread.
   static void TearDownTestSuite() {
+    if (rclcpp::ok()) {
+      rclcpp::shutdown();
+    }
   }
 
   void SetUp() override {
@@ -482,6 +500,10 @@ class LifecycleHandlersWithProviderTest : public ::testing::Test {
     spin_thread_ = std::thread([this]() {
       executor_->spin();
     });
+    // A cancel() that lands before spin() starts is lost, and join() would block.
+    while (!executor_->is_spinning()) {
+      std::this_thread::yield();
+    }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
@@ -500,7 +522,7 @@ class LifecycleHandlersWithProviderTest : public ::testing::Test {
     plugin_mgr_->add_plugin(std::move(mock));
     plugin_mgr_->register_entity_ownership("mock_lifecycle", {"plugin_app"});
 
-    ctx_ = std::make_unique<HandlerContext>(gateway_node_.get(), cors_, auth_, tls_, nullptr);
+    ctx_ = std::make_unique<HandlerContext>(*gateway_node_, cors_, auth_, tls_, nullptr);
     handlers_ = std::make_unique<LifecycleHandlers>(*ctx_, plugin_mgr_.get());
   }
 
@@ -558,8 +580,9 @@ TEST_F(LifecycleHandlersWithProviderTest, TransitionAcceptedReturns202WithLocati
   auto result = handlers_->handle_transition(req, "restart");
   ASSERT_TRUE(result.has_value());
   const auto & att = result->second;
-  ASSERT_TRUE(att.status_override.has_value());
-  EXPECT_EQ(*att.status_override, 202);
+  // 202 is declared by the Accepted<> return type, not by a runtime override.
+  EXPECT_EQ(http::dto_alternate_status<decltype(result->first)>::value, 202);
+  EXPECT_FALSE(att.status_override.has_value());
   bool found_location = false;
   for (const auto & [name, value] : att.headers) {
     if (name == "Location") {

@@ -13,18 +13,23 @@
 // limitations under the License.
 
 #include "ros2_medkit_gateway/core/http/handlers/discovery_handlers.hpp"
+#include "ros2_medkit_gateway/core/logging.hpp"
 
+#include <algorithm>
 #include <map>
 #include <set>
 #include <variant>
 
+#include "ros2_medkit_gateway/core/discovery/entity_discovery.hpp"
 #include "ros2_medkit_gateway/core/discovery/models/common.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/http/handlers/capability_builder.hpp"
 #include "ros2_medkit_gateway/core/http/http_utils.hpp"
+#include "ros2_medkit_gateway/core/managers/lock_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/script_manager.hpp"
+#include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
 #include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/dto/entities.hpp"
-#include "ros2_medkit_gateway/gateway_node.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_support.hpp"
 
 using json = nlohmann::json;
@@ -34,20 +39,43 @@ namespace handlers {
 
 namespace {
 
-/// Check if a capability name is already present in the capabilities array
-bool has_capability(const json & capabilities, const std::string & name) {
-  for (const auto & cap : capabilities) {
-    if (cap.contains("name") && cap["name"] == name) {
-      return true;
-    }
+/// Emit the x-medkit `external` flag only when the entity is effectively
+/// external (tri-state true). Explicit false and unset both leave the field
+/// absent, so the "absence == not external" wire contract holds. Centralised
+/// here so no call site can leak `external: false` by assigning the raw
+/// optional; every route that carries a Component/App x-medkit calls this (#516).
+void set_x_medkit_external(dto::XMedkitComponent & x_medkit, const std::optional<bool> & external) {
+  if (external.value_or(false)) {
+    x_medkit.external = true;
   }
-  return false;
+}
+void set_x_medkit_external(dto::XMedkitApp & x_medkit, const std::optional<bool> & external) {
+  if (external.value_or(false)) {
+    x_medkit.external = true;
+  }
 }
 
-/// Append plugin-registered capabilities to a capabilities JSON array
-void append_plugin_capabilities(json & capabilities, const std::string & entity_type_path,
-                                const std::string & entity_id, SovdEntityType entity_type, const GatewayNode * node) {
-  auto * pmgr = node->get_plugin_manager();
+/// Emit the x-medkit `available` flag only when the entity cannot be reached,
+/// so an absent field means reachable. Carried by the entities a request can be
+/// addressed to; a grouping entity is a view over members and has no
+/// availability of its own.
+void set_x_medkit_available(dto::XMedkitComponent & x_medkit, bool available) {
+  if (!available) {
+    x_medkit.available = false;
+  }
+}
+
+/// Check if a capability name is already present in the capabilities array
+bool has_capability(const std::vector<dto::EntityCapability> & capabilities, const std::string & name) {
+  return std::any_of(capabilities.begin(), capabilities.end(), [&name](const dto::EntityCapability & cap) {
+    return cap.name == name;
+  });
+}
+
+/// Append plugin-registered capabilities to an entity's capabilities array
+void append_plugin_capabilities(std::vector<dto::EntityCapability> & capabilities, const std::string & entity_type_path,
+                                const std::string & entity_id, SovdEntityType entity_type, GatewayServices & services) {
+  auto * pmgr = services.plugin_manager();
   if (!pmgr) {
     return;
   }
@@ -56,15 +84,22 @@ void append_plugin_capabilities(json & capabilities, const std::string & entity_
   href_prefix.reserve(64);
   href_prefix.append("/api/v1/").append(entity_type_path).append("/").append(entity_id).append("/");
 
+  auto add = [&capabilities, &href_prefix](const std::string & name) {
+    if (has_capability(capabilities, name)) {
+      return;
+    }
+    capabilities.push_back(dto::EntityCapability{name, href_prefix + name});
+  };
+
   // Auto-add standard capabilities based on registered providers
-  if (pmgr->get_data_provider_for_entity(entity_id) && !has_capability(capabilities, "data")) {
-    capabilities.push_back({{"name", "data"}, {"href", href_prefix + "data"}});
+  if (pmgr->get_data_provider_for_entity(entity_id)) {
+    add("data");
   }
-  if (pmgr->get_operation_provider_for_entity(entity_id) && !has_capability(capabilities, "operations")) {
-    capabilities.push_back({{"name", "operations"}, {"href", href_prefix + "operations"}});
+  if (pmgr->get_operation_provider_for_entity(entity_id)) {
+    add("operations");
   }
-  if (pmgr->get_fault_provider_for_entity(entity_id) && !has_capability(capabilities, "faults")) {
-    capabilities.push_back({{"name", "faults"}, {"href", href_prefix + "faults"}});
+  if (pmgr->get_fault_provider_for_entity(entity_id)) {
+    add("faults");
   }
 
   // Plugin-registered custom capabilities (via PluginContext)
@@ -75,16 +110,37 @@ void append_plugin_capabilities(json & capabilities, const std::string & entity_
 
   // Type-level capabilities (registered for all entities of this type)
   for (const auto & cap_name : ctx->get_type_capabilities(entity_type)) {
-    if (!has_capability(capabilities, cap_name)) {
-      capabilities.push_back({{"name", cap_name}, {"href", href_prefix + cap_name}});
-    }
+    add(cap_name);
   }
 
   // Entity-specific capabilities
   for (const auto & cap_name : ctx->get_entity_capabilities(entity_id)) {
-    if (!has_capability(capabilities, cap_name)) {
-      capabilities.push_back({{"name", cap_name}, {"href", href_prefix + cap_name}});
-    }
+    add(cap_name);
+  }
+}
+
+/// Drop base capabilities whose routes cannot serve a plugin-owned entity.
+/// The /data and /operations handlers dispatch plugin entities to their
+/// plugin's Data/OperationProvider and 404 by contract when none is
+/// registered, so advertising those capabilities is a dead link every SOVD
+/// client (and the UI) follows into a guaranteed 404.
+void prune_plugin_unserved_capabilities(std::vector<CapabilityBuilder::Capability> & caps,
+                                        const std::string & entity_id, GatewayServices & services) {
+  auto * pmgr = services.plugin_manager();
+  if (!pmgr || !pmgr->get_entity_owner(entity_id)) {
+    return;  // native entity: the core managers serve these collections
+  }
+  auto drop = [&caps](CapabilityBuilder::Capability cap) {
+    caps.erase(std::remove(caps.begin(), caps.end(), cap), caps.end());
+  };
+  if (!pmgr->get_data_provider_for_entity(entity_id) && !pmgr->has_entity_data_route(entity_id)) {
+    // Only prune when NEITHER serving path exists: data_handlers now falls
+    // back to the plugin's own x-plc-data route, so an entity with that route
+    // serves /data even without a DataProvider.
+    drop(CapabilityBuilder::Capability::DATA);
+  }
+  if (!pmgr->get_operation_provider_for_entity(entity_id)) {
+    drop(CapabilityBuilder::Capability::OPERATIONS);
   }
 }
 
@@ -113,7 +169,7 @@ ErrorInfo make_invalid_id_error(const char * entity_label, const std::string & i
 }
 
 ErrorInfo make_internal_error(const char * where, const std::exception & e) {
-  RCLCPP_ERROR(HandlerContext::logger(), "Error in %s: %s", where, e.what());
+  MEDKIT_LOG_ERROR(HandlerContext::logger(), "Error in %s: %s", where, e.what());
   ErrorInfo err;
   err.code = ERR_INTERNAL_ERROR;
   err.message = "Internal server error";
@@ -123,7 +179,7 @@ ErrorInfo make_internal_error(const char * where, const std::exception & e) {
 }
 
 ErrorInfo make_internal_error_no_details(const char * where, const std::exception & e) {
-  RCLCPP_ERROR(HandlerContext::logger(), "Error in %s: %s", where, e.what());
+  MEDKIT_LOG_ERROR(HandlerContext::logger(), "Error in %s: %s", where, e.what());
   ErrorInfo err;
   err.code = ERR_INTERNAL_ERROR;
   err.message = "Internal server error";
@@ -162,7 +218,7 @@ tl::expected<std::string, ErrorInfo> read_path_param(const http::TypedRequest & 
 http::Result<dto::Collection<dto::AreaListItem>> DiscoveryHandlers::get_areas(const http::TypedRequest & req) {
   (void)req;
   try {
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     const auto areas = cache.get_areas();
 
     dto::Collection<dto::AreaListItem> response;
@@ -222,10 +278,10 @@ http::Result<dto::AreaDetail> DiscoveryHandlers::get_area(const http::TypedReque
     }
 
     // Local entity - look up full object from cache for detail response.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto area_opt = cache.get_area(area_id);
     if (!area_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       area_opt = discovery->get_area(area_id);
     }
 
@@ -252,6 +308,8 @@ http::Result<dto::AreaDetail> DiscoveryHandlers::get_area(const http::TypedReque
     detail.components = base_uri + "/components";
     detail.contains = base_uri + "/contains";
     detail.data = base_uri + "/data";
+    detail.data_categories = base_uri + "/data-categories";
+    detail.data_groups = base_uri + "/data-groups";
     detail.operations = base_uri + "/operations";
     detail.configurations = base_uri + "/configurations";
     detail.faults = base_uri + "/faults";
@@ -260,10 +318,15 @@ http::Result<dto::AreaDetail> DiscoveryHandlers::get_area(const http::TypedReque
     detail.triggers = base_uri + "/triggers";
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::SUBAREAS, Cap::CONTAINS, Cap::DATA,      Cap::OPERATIONS, Cap::CONFIGURATIONS,
-                             Cap::FAULTS,   Cap::LOGS,     Cap::BULK_DATA, Cap::TRIGGERS};
+    // Cap::COMPONENTS matches `detail.components` above: `/areas/{area_id}/components`
+    // is registered for areas, so the capability array advertises it like the
+    // other three types advertise their relationship endpoints.
+    std::vector<Cap> caps = {Cap::SUBAREAS,        Cap::CONTAINS,    Cap::COMPONENTS, Cap::DATA,
+                             Cap::DATA_CATEGORIES, Cap::DATA_GROUPS, Cap::OPERATIONS, Cap::CONFIGURATIONS,
+                             Cap::FAULTS,          Cap::LOGS,        Cap::BULK_DATA,  Cap::TRIGGERS};
+    prune_plugin_unserved_capabilities(caps, area.id, ctx_.services());
     auto area_caps = CapabilityBuilder::build_capabilities("areas", area.id, caps);
-    append_plugin_capabilities(area_caps, "areas", area.id, SovdEntityType::AREA, ctx_.node());
+    append_plugin_capabilities(area_caps, "areas", area.id, SovdEntityType::AREA, ctx_.services());
     detail.capabilities = area_caps;
 
     LinksBuilder links;
@@ -307,7 +370,7 @@ DiscoveryHandlers::get_area_components(const http::TypedRequest & req) {
       return tl::unexpected(make_invalid_id_error("area", "area_id", area_id, validation_result.error()));
     }
 
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
 
     if (!cache.has_area(area_id)) {
       return tl::unexpected(make_not_found_error("Area", "area_id", area_id));
@@ -328,6 +391,7 @@ DiscoveryHandlers::get_area_components(const http::TypedRequest & req) {
         }
 
         dto::XMedkitComponent x_medkit_comp;
+        set_x_medkit_available(x_medkit_comp, component.available);
         if (!component.source.empty()) {
           x_medkit_comp.source = component.source;
         }
@@ -336,6 +400,7 @@ DiscoveryHandlers::get_area_components(const http::TypedRequest & req) {
           ros2.ns = component.namespace_path;
           x_medkit_comp.ros2 = ros2;
         }
+        set_x_medkit_external(x_medkit_comp, component.external);
         item.x_medkit = x_medkit_comp;
 
         response.items.push_back(std::move(item));
@@ -366,10 +431,10 @@ http::Result<dto::Collection<dto::AreaListItem>> DiscoveryHandlers::get_subareas
     }
 
     // Cache-first lookup: EntityCache has merged entities from peers.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto area_opt = cache.get_area(area_id);
     if (!area_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       area_opt = discovery->get_area(area_id);
     }
 
@@ -436,10 +501,10 @@ DiscoveryHandlers::get_area_contains(const http::TypedRequest & req) {
     }
 
     // Cache-first lookup: EntityCache has merged entities from peers.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto area_opt = cache.get_area(area_id);
     if (!area_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       area_opt = discovery->get_area(area_id);
     }
 
@@ -482,6 +547,7 @@ DiscoveryHandlers::get_area_contains(const http::TypedRequest & req) {
       item.type = "component";
 
       dto::XMedkitComponent x_medkit_comp;
+      set_x_medkit_available(x_medkit_comp, comp.available);
       if (!comp.source.empty()) {
         x_medkit_comp.source = comp.source;
       }
@@ -490,6 +556,7 @@ DiscoveryHandlers::get_area_contains(const http::TypedRequest & req) {
         ros2.ns = comp.namespace_path;
         x_medkit_comp.ros2 = ros2;
       }
+      set_x_medkit_external(x_medkit_comp, comp.external);
       item.x_medkit = x_medkit_comp;
 
       response.items.push_back(std::move(item));
@@ -518,7 +585,7 @@ http::Result<dto::Collection<dto::ComponentListItem>>
 DiscoveryHandlers::get_components(const http::TypedRequest & req) {
   (void)req;
   try {
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     const auto components = cache.get_components();
 
     dto::Collection<dto::ComponentListItem> response;
@@ -543,6 +610,7 @@ DiscoveryHandlers::get_components(const http::TypedRequest & req) {
       }
 
       dto::XMedkitComponent x_medkit_comp;
+      set_x_medkit_available(x_medkit_comp, component.available);
       if (!component.source.empty()) {
         x_medkit_comp.source = component.source;
       }
@@ -558,6 +626,10 @@ DiscoveryHandlers::get_components(const http::TypedRequest & req) {
         ros2.ns = component.namespace_path;
         x_medkit_comp.ros2 = ros2;
       }
+      if (!component.identity.empty()) {
+        x_medkit_comp.identity = component.identity.to_json();
+      }
+      set_x_medkit_external(x_medkit_comp, component.external);
       item.x_medkit = x_medkit_comp;
 
       response.items.push_back(std::move(item));
@@ -588,10 +660,10 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
     }
 
     // Local entity - look up full object from cache for detail response.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto comp_opt = cache.get_component(component_id);
     if (!comp_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       comp_opt = discovery->get_component(component_id);
     }
 
@@ -616,6 +688,8 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
     std::string base = "/api/v1/components/" + comp.id;
     detail.status = base + "/status";
     detail.data = base + "/data";
+    detail.data_categories = base + "/data-categories";
+    detail.data_groups = base + "/data-groups";
     detail.operations = base + "/operations";
     detail.configurations = base + "/configurations";
     detail.faults = base + "/faults";
@@ -626,8 +700,15 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
     detail.cyclic_subscriptions = base + "/cyclic-subscriptions";
     detail.triggers = base + "/triggers";
 
-    if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
+    if (ctx_.services().script_manager() && ctx_.services().script_manager()->has_backend()) {
       detail.scripts = base + "/scripts";
+    }
+
+    // Same gate as Cap::LOCKS below. The routes are registered either way; with
+    // `locking.enabled` off there is no LockManager and they answer 501, so the
+    // URI is emitted only when it leads to a collection that exists.
+    if (ctx_.services().lock_manager()) {
+      detail.locks = base + "/locks";
     }
 
     if (!comp.depends_on.empty()) {
@@ -649,6 +730,7 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
     detail.links = links.build();
 
     dto::XMedkitComponent x_medkit_comp;
+    set_x_medkit_available(x_medkit_comp, comp.available);
     if (!comp.source.empty()) {
       x_medkit_comp.source = comp.source;
     }
@@ -685,22 +767,28 @@ http::Result<dto::ComponentDetail> DiscoveryHandlers::get_component(const http::
     if (!comp.contributors.empty()) {
       x_medkit_comp.contributors = sorted_contributors(comp.contributors);
     }
+    if (!comp.identity.empty()) {
+      x_medkit_comp.identity = comp.identity.to_json();
+    }
+    set_x_medkit_external(x_medkit_comp, comp.external);
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {
-        Cap::STATUS,        Cap::DATA,  Cap::OPERATIONS, Cap::CONFIGURATIONS,       Cap::FAULTS,  Cap::LOGS,
-        Cap::SUBCOMPONENTS, Cap::HOSTS, Cap::BULK_DATA,  Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
-    if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
+    std::vector<Cap> caps = {Cap::STATUS,        Cap::DATA,           Cap::DATA_CATEGORIES, Cap::DATA_GROUPS,
+                             Cap::OPERATIONS,    Cap::CONFIGURATIONS, Cap::FAULTS,          Cap::LOGS,
+                             Cap::SUBCOMPONENTS, Cap::HOSTS,          Cap::BULK_DATA,       Cap::CYCLIC_SUBSCRIPTIONS,
+                             Cap::TRIGGERS};
+    if (ctx_.services().script_manager() && ctx_.services().script_manager()->has_backend()) {
       caps.push_back(Cap::SCRIPTS);
     }
-    if (ctx_.node() && ctx_.node()->get_lock_manager()) {
+    if (ctx_.services().lock_manager()) {
       caps.push_back(Cap::LOCKS);
     }
     if (!comp.depends_on.empty()) {
       caps.push_back(Cap::DEPENDS_ON);
     }
+    prune_plugin_unserved_capabilities(caps, comp.id, ctx_.services());
     auto comp_caps = CapabilityBuilder::build_capabilities("components", comp.id, caps);
-    append_plugin_capabilities(comp_caps, "components", comp.id, SovdEntityType::COMPONENT, ctx_.node());
+    append_plugin_capabilities(comp_caps, "components", comp.id, SovdEntityType::COMPONENT, ctx_.services());
     // Capabilities at root level (SOVD standard) and in x-medkit (vendor extension for tools
     // that only read x-medkit). Apps don't duplicate because they have no vendor extensions block.
     detail.capabilities = comp_caps;
@@ -729,10 +817,10 @@ DiscoveryHandlers::get_subcomponents(const http::TypedRequest & req) {
     }
 
     // Cache-first lookup: EntityCache has merged entities from peers.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto comp_opt = cache.get_component(component_id);
     if (!comp_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       comp_opt = discovery->get_component(component_id);
     }
 
@@ -756,6 +844,7 @@ DiscoveryHandlers::get_subcomponents(const http::TypedRequest & req) {
       item.type = "component";
 
       dto::XMedkitComponent x_medkit_comp;
+      set_x_medkit_available(x_medkit_comp, sub.available);
       if (!sub.source.empty()) {
         x_medkit_comp.source = sub.source;
       }
@@ -764,6 +853,7 @@ DiscoveryHandlers::get_subcomponents(const http::TypedRequest & req) {
         ros2.ns = sub.namespace_path;
         x_medkit_comp.ros2 = ros2;
       }
+      set_x_medkit_external(x_medkit_comp, sub.external);
       item.x_medkit = x_medkit_comp;
 
       response.items.push_back(std::move(item));
@@ -800,10 +890,10 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_component
     }
 
     // Cache-first lookup: EntityCache has merged entities from peers.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto comp_opt = cache.get_component(component_id);
     if (!comp_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       comp_opt = discovery->get_component(component_id);
     }
 
@@ -830,6 +920,10 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_component
 
       dto::XMedkitApp x_medkit_app;
       x_medkit_app.is_online = app.is_online;
+      // Emitted only when false: an absent field means reachable.
+      if (!app.available) {
+        x_medkit_app.available = false;
+      }
       if (!app.source.empty()) {
         x_medkit_app.source = app.source;
       }
@@ -838,6 +932,7 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_component
         ros2.node = *app.bound_fqn;
         x_medkit_app.ros2 = ros2;
       }
+      set_x_medkit_external(x_medkit_app, app.external);
       item.x_medkit = x_medkit_app;
 
       response.items.push_back(std::move(item));
@@ -874,10 +969,10 @@ DiscoveryHandlers::get_component_depends_on(const http::TypedRequest & req) {
     }
 
     // Cache-first lookup: EntityCache has merged entities from peers.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto comp_opt = cache.get_component(component_id);
     if (!comp_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       comp_opt = discovery->get_component(component_id);
     }
 
@@ -899,17 +994,19 @@ DiscoveryHandlers::get_component_depends_on(const http::TypedRequest & req) {
         item.name = dep_opt->name.empty() ? dep_id : dep_opt->name;
 
         dto::XMedkitComponent x_medkit_comp;
+        set_x_medkit_available(x_medkit_comp, dep_opt->available);
         if (!dep_opt->source.empty()) {
           x_medkit_comp.source = dep_opt->source;
         }
+        set_x_medkit_external(x_medkit_comp, dep_opt->external);
         item.x_medkit = x_medkit_comp;
       } else {
         item.name = dep_id;
         dto::XMedkitComponent x_medkit_comp;
         x_medkit_comp.missing = true;
         item.x_medkit = x_medkit_comp;
-        RCLCPP_WARN(HandlerContext::logger(), "Component '%s' declares dependency on unknown component '%s'",
-                    component_id.c_str(), dep_id.c_str());
+        MEDKIT_LOG_WARN(HandlerContext::logger(), "Component '%s' declares dependency on unknown component '%s'",
+                        component_id.c_str(), dep_id.c_str());
       }
 
       response.items.push_back(std::move(item));
@@ -938,7 +1035,7 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_apps(cons
   (void)req;
   try {
     // Use ThreadSafeEntityCache for consistent discovery (avoids race with data endpoints).
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto apps = cache.get_apps();
 
     dto::Collection<dto::AppListItem> response;
@@ -961,6 +1058,10 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_apps(cons
         x_medkit_app.source = app.source;
       }
       x_medkit_app.is_online = app.is_online;
+      // Emitted only when false: an absent field means reachable.
+      if (!app.available) {
+        x_medkit_app.available = false;
+      }
       if (!app.component_id.empty()) {
         x_medkit_app.component_id = app.component_id;
       }
@@ -969,6 +1070,7 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_apps(cons
         ros2.node = *app.bound_fqn;
         x_medkit_app.ros2 = ros2;
       }
+      set_x_medkit_external(x_medkit_app, app.external);
       item.x_medkit = x_medkit_app;
 
       response.items.push_back(std::move(item));
@@ -999,10 +1101,10 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
     }
 
     // Local entity - look up full object from cache for detail response.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto app_opt = cache.get_app(app_id);
     if (!app_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       app_opt = discovery->get_app(app_id);
     }
 
@@ -1030,16 +1132,28 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
     std::string base_uri = "/api/v1/apps/" + app.id;
     detail.status = base_uri + "/status";
     detail.data = base_uri + "/data";
+    detail.data_categories = base_uri + "/data-categories";
+    detail.data_groups = base_uri + "/data-groups";
     detail.operations = base_uri + "/operations";
     detail.configurations = base_uri + "/configurations";
+    // Registered for `/apps` alone, and unconditionally: with no engine running
+    // the route answers 501, which is why it is advertised whether or not the
+    // feature is on.
+    detail.fault_triggers = base_uri + "/fault-triggers";
     detail.faults = base_uri + "/faults";
     detail.logs = base_uri + "/logs";
     detail.bulk_data = base_uri + "/bulk-data";
     detail.cyclic_subscriptions = base_uri + "/cyclic-subscriptions";
     detail.triggers = base_uri + "/triggers";
 
-    if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
+    if (ctx_.services().script_manager() && ctx_.services().script_manager()->has_backend()) {
       detail.scripts = base_uri + "/scripts";
+    }
+
+    // Same gate as Cap::LOCKS below, and the same reasoning as the component
+    // handler: registered either way, 501 without a LockManager.
+    if (ctx_.services().lock_manager()) {
+      detail.locks = base_uri + "/locks";
     }
 
     if (!app.component_id.empty()) {
@@ -1052,8 +1166,18 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
     }
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::STATUS, Cap::DATA,      Cap::OPERATIONS,           Cap::CONFIGURATIONS, Cap::FAULTS,
-                             Cap::LOGS,   Cap::BULK_DATA, Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+    std::vector<Cap> caps = {Cap::STATUS,
+                             Cap::DATA,
+                             Cap::DATA_CATEGORIES,
+                             Cap::DATA_GROUPS,
+                             Cap::OPERATIONS,
+                             Cap::CONFIGURATIONS,
+                             Cap::FAULTS,
+                             Cap::FAULT_TRIGGERS,
+                             Cap::LOGS,
+                             Cap::BULK_DATA,
+                             Cap::CYCLIC_SUBSCRIPTIONS,
+                             Cap::TRIGGERS};
     // Relationship endpoints are gated the same way as the top-level URI keys
     // above so the three advertising surfaces (top-level URIs, `_links`,
     // `capabilities` array) describe the same set of available collections.
@@ -1064,14 +1188,15 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
     if (!app.depends_on.empty()) {
       caps.push_back(Cap::DEPENDS_ON);
     }
-    if (ctx_.node()->get_script_manager() && ctx_.node()->get_script_manager()->has_backend()) {
+    if (ctx_.services().script_manager() && ctx_.services().script_manager()->has_backend()) {
       caps.push_back(Cap::SCRIPTS);
     }
-    if (ctx_.node() && ctx_.node()->get_lock_manager()) {
+    if (ctx_.services().lock_manager()) {
       caps.push_back(Cap::LOCKS);
     }
+    prune_plugin_unserved_capabilities(caps, app.id, ctx_.services());
     auto app_caps = CapabilityBuilder::build_capabilities("apps", app.id, caps);
-    append_plugin_capabilities(app_caps, "apps", app.id, SovdEntityType::APP, ctx_.node());
+    append_plugin_capabilities(app_caps, "apps", app.id, SovdEntityType::APP, ctx_.services());
     detail.capabilities = app_caps;
 
     LinksBuilder links;
@@ -1096,6 +1221,10 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
       x_medkit_app.source = app.source;
     }
     x_medkit_app.is_online = app.is_online;
+    // Emitted only when false: an absent field means reachable.
+    if (!app.available) {
+      x_medkit_app.available = false;
+    }
     if (app.bound_fqn) {
       dto::XMedkitRos2 ros2;
       ros2.node = *app.bound_fqn;
@@ -1107,6 +1236,7 @@ http::Result<dto::AppDetail> DiscoveryHandlers::get_app(const http::TypedRequest
     if (!app.contributors.empty()) {
       x_medkit_app.contributors = sorted_contributors(app.contributors);
     }
+    set_x_medkit_external(x_medkit_app, app.external);
     detail.x_medkit = x_medkit_app;
 
     return detail;
@@ -1134,10 +1264,10 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_app_depen
     // Atomic snapshot keeps the app + every dependency resolved in the same
     // cache generation; a writer refresh between per-dependency lookups could
     // otherwise yield a mix from N different generations.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto snapshot = cache.get_app_with_dependencies(app_id);
     if (!snapshot.app) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       snapshot.app = discovery->get_app(app_id);
       if (snapshot.app) {
         snapshot.dependencies.reserve(snapshot.app->depends_on.size());
@@ -1166,14 +1296,19 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_app_depen
           x_medkit_app.source = dep_opt->source;
         }
         x_medkit_app.is_online = dep_opt->is_online;
+        // Emitted only when false: an absent field means reachable.
+        if (!dep_opt->available) {
+          x_medkit_app.available = false;
+        }
+        set_x_medkit_external(x_medkit_app, dep_opt->external);
         item.x_medkit = x_medkit_app;
       } else {
         item.name = dep_id;
         dto::XMedkitApp x_medkit_app;
         x_medkit_app.missing = true;
         item.x_medkit = x_medkit_app;
-        RCLCPP_WARN(HandlerContext::logger(), "App '%s' declares dependency on unknown app '%s'", app_id.c_str(),
-                    dep_id.c_str());
+        MEDKIT_LOG_WARN(HandlerContext::logger(), "App '%s' declares dependency on unknown app '%s'", app_id.c_str(),
+                        dep_id.c_str());
       }
 
       response.items.push_back(std::move(item));
@@ -1213,10 +1348,10 @@ http::Result<dto::Collection<dto::AreaListItem>> DiscoveryHandlers::get_app_belo
     // Area across concurrent cache refreshes. Fall back to the discovery
     // manager (no atomic guarantee, but rare path) when the app is not in
     // the cache.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto snapshot = cache.get_app_with_links(app_id);
     if (!snapshot.app) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       snapshot.app = discovery->get_app(app_id);
       if (snapshot.app && !snapshot.app->component_id.empty()) {
         snapshot.component = discovery->get_component(snapshot.app->component_id);
@@ -1248,8 +1383,8 @@ http::Result<dto::Collection<dto::AreaListItem>> DiscoveryHandlers::get_app_belo
         x_medkit_area.unresolved_component = app.component_id;
         item.x_medkit = x_medkit_area;
         response.items.push_back(std::move(item));
-        RCLCPP_WARN(HandlerContext::logger(), "App '%s' belongs-to unresolvable: parent component '%s' is unknown",
-                    app_id.c_str(), app.component_id.c_str());
+        MEDKIT_LOG_WARN(HandlerContext::logger(), "App '%s' belongs-to unresolvable: parent component '%s' is unknown",
+                        app_id.c_str(), app.component_id.c_str());
       } else if (!snapshot.component->area.empty()) {
         const auto & area_id_ref = snapshot.component->area;
         dto::AreaListItem item;
@@ -1264,8 +1399,8 @@ http::Result<dto::Collection<dto::AreaListItem>> DiscoveryHandlers::get_app_belo
           dto::XMedkitArea x_medkit_area;
           x_medkit_area.missing = true;
           item.x_medkit = x_medkit_area;
-          RCLCPP_WARN(HandlerContext::logger(), "App '%s' belongs to unknown area '%s' (via component '%s')",
-                      app_id.c_str(), area_id_ref.c_str(), app.component_id.c_str());
+          MEDKIT_LOG_WARN(HandlerContext::logger(), "App '%s' belongs to unknown area '%s' (via component '%s')",
+                          app_id.c_str(), area_id_ref.c_str(), app.component_id.c_str());
         }
         response.items.push_back(std::move(item));
       }
@@ -1307,10 +1442,10 @@ DiscoveryHandlers::get_app_is_located_on(const http::TypedRequest & req) {
     // Atomic snapshot keeps app -> component consistent across a concurrent
     // cache refresh. Fall back to discovery manager when the app is not in
     // the cache.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto snapshot = cache.get_app_with_links(app_id);
     if (!snapshot.app) {
-      auto discovery = ctx_.node()->get_discovery_manager();
+      auto discovery = ctx_.services().discovery();
       snapshot.app = discovery->get_app(app_id);
       if (snapshot.app && !snapshot.app->component_id.empty()) {
         snapshot.component = discovery->get_component(snapshot.app->component_id);
@@ -1344,8 +1479,8 @@ DiscoveryHandlers::get_app_is_located_on(const http::TypedRequest & req) {
         item.x_medkit = x_medkit_comp;
         response.items.push_back(std::move(item));
 
-        RCLCPP_WARN(HandlerContext::logger(), "App '%s' references unknown component '%s'", app_id.c_str(),
-                    app.component_id.c_str());
+        MEDKIT_LOG_WARN(HandlerContext::logger(), "App '%s' references unknown component '%s'", app_id.c_str(),
+                        app.component_id.c_str());
       }
     }
 
@@ -1372,7 +1507,7 @@ http::Result<dto::Collection<dto::FunctionListItem>> DiscoveryHandlers::get_func
   (void)req;
   try {
     // Use ThreadSafeEntityCache for consistent discovery (avoids race with data endpoints).
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    const auto & cache = ctx_.services().entity_cache();
     auto functions = cache.get_functions();
 
     dto::Collection<dto::FunctionListItem> response;
@@ -1423,14 +1558,10 @@ http::Result<dto::FunctionDetail> DiscoveryHandlers::get_function(const http::Ty
       return tl::unexpected(flatten_validator_error(entity_result.error()));
     }
 
-    // Local entity - look up full object from cache for detail response.
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    // The cache holds the Functions the gateway serves, after the
+    // internal-node filter. The hosts route reads only the cache too.
+    const auto & cache = ctx_.services().entity_cache();
     auto func_opt = cache.get_function(function_id);
-    if (!func_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
-      func_opt = discovery->get_function(function_id);
-    }
-
     if (!func_opt) {
       return tl::unexpected(make_not_found_error("Function", "function_id", function_id));
     }
@@ -1455,21 +1586,34 @@ http::Result<dto::FunctionDetail> DiscoveryHandlers::get_function(const http::Ty
     std::string base_uri = "/api/v1/functions/" + func.id;
     detail.hosts = base_uri + "/hosts";
     detail.data = base_uri + "/data";
+    detail.data_categories = base_uri + "/data-categories";
+    detail.data_groups = base_uri + "/data-groups";
     detail.operations = base_uri + "/operations";
     detail.configurations = base_uri + "/configurations";
     detail.faults = base_uri + "/faults";
     detail.logs = base_uri + "/logs";
     detail.bulk_data = base_uri + "/bulk-data";
-    detail.x_medkit_graph = base_uri + "/x-medkit-graph";
     detail.cyclic_subscriptions = base_uri + "/cyclic-subscriptions";
     detail.triggers = base_uri + "/triggers";
 
     using Cap = CapabilityBuilder::Capability;
-    std::vector<Cap> caps = {Cap::HOSTS, Cap::DATA,      Cap::OPERATIONS,           Cap::CONFIGURATIONS, Cap::FAULTS,
-                             Cap::LOGS,  Cap::BULK_DATA, Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+    std::vector<Cap> caps = {
+        Cap::HOSTS,  Cap::DATA, Cap::DATA_CATEGORIES, Cap::DATA_GROUPS,          Cap::OPERATIONS, Cap::CONFIGURATIONS,
+        Cap::FAULTS, Cap::LOGS, Cap::BULK_DATA,       Cap::CYCLIC_SUBSCRIPTIONS, Cap::TRIGGERS};
+    prune_plugin_unserved_capabilities(caps, func.id, ctx_.services());
     auto func_caps = CapabilityBuilder::build_capabilities("functions", func.id, caps);
-    append_plugin_capabilities(func_caps, "functions", func.id, SovdEntityType::FUNCTION, ctx_.node());
+    append_plugin_capabilities(func_caps, "functions", func.id, SovdEntityType::FUNCTION, ctx_.services());
     detail.capabilities = func_caps;
+
+    // Read off the capability list rather than set unconditionally: nothing in
+    // the gateway serves `x-medkit-graph`. The route exists only while a
+    // plugin registers the capability (the graph provider does so for every
+    // Function in `set_context`), and `append_plugin_capabilities` above is
+    // where that registration becomes visible here. Set unconditionally, this
+    // URI answered 404 on every gateway running without the plugin.
+    if (has_capability(func_caps, "x-medkit-graph")) {
+      detail.x_medkit_graph = base_uri + "/x-medkit-graph";
+    }
 
     LinksBuilder links;
     links.self("/api/v1/functions/" + func.id).collection("/api/v1/functions");
@@ -1518,14 +1662,11 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_function_
       return tl::unexpected(make_invalid_id_error("function", "function_id", function_id, validation_result.error()));
     }
 
-    // Read from cache (has merged entities from aggregation with combined hosts).
-    const auto & cache = ctx_.node()->get_thread_safe_cache();
+    // Read from cache only (merged hosts from aggregation, after the
+    // internal-node filter), so this route and GET /functions/{id} agree on
+    // which Functions exist. Discovery still holds Functions the filter dropped.
+    const auto & cache = ctx_.services().entity_cache();
     auto func_opt = cache.get_function(function_id);
-    if (!func_opt) {
-      auto discovery = ctx_.node()->get_discovery_manager();
-      func_opt = discovery->get_function(function_id);
-    }
-
     if (!func_opt) {
       return tl::unexpected(make_not_found_error("Function", "function_id", function_id));
     }
@@ -1545,6 +1686,10 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_function_
 
         dto::XMedkitApp x_medkit_app;
         x_medkit_app.is_online = app_opt->is_online;
+        // Emitted only when false: an absent field means reachable.
+        if (!app_opt->available) {
+          x_medkit_app.available = false;
+        }
         if (!app_opt->source.empty()) {
           x_medkit_app.source = app_opt->source;
         }
@@ -1553,6 +1698,7 @@ http::Result<dto::Collection<dto::AppListItem>> DiscoveryHandlers::get_function_
           ros2.node = *app_opt->bound_fqn;
           x_medkit_app.ros2 = ros2;
         }
+        set_x_medkit_external(x_medkit_app, app_opt->external);
         item.x_medkit = x_medkit_app;
 
         response.items.push_back(std::move(item));
