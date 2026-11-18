@@ -1,0 +1,12 @@
+Source: ros-lyrical-ros2-medkit-log-bridge
+Section: misc
+Priority: optional
+Maintainer: "mfaferek93" <michal.faferek@selfpatch.ai>
+Build-Depends: debhelper (>= 9.0.0), ros-lyrical-ament-cmake, ros-lyrical-ament-cmake-clang-format <!nocheck>, ros-lyrical-ament-cmake-clang-tidy <!nocheck>, ros-lyrical-ament-cmake-gtest <!nocheck>, ros-lyrical-ament-lint-auto <!nocheck>, ros-lyrical-ament-lint-common <!nocheck>, ros-lyrical-launch-testing-ament-cmake <!nocheck>, ros-lyrical-launch-testing-ros <!nocheck>, ros-lyrical-rcl-interfaces, ros-lyrical-rclcpp, ros-lyrical-ros2-medkit-cmake, ros-lyrical-ros2-medkit-fault-manager <!nocheck>, ros-lyrical-ros2-medkit-fault-reporter, ros-lyrical-ros2-medkit-msgs, ros-lyrical-ros-workspace
+Homepage: https://index.ros.org/p/ros2_medkit_log_bridge/#lyrical
+Standards-Version: 3.9.2
+
+Package: ros-lyrical-ros2-medkit-log-bridge
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, ros-lyrical-rcl-interfaces, ros-lyrical-rclcpp, ros-lyrical-ros2-medkit-fault-reporter, ros-lyrical-ros2-medkit-msgs, ros-lyrical-ros-workspace
+Description: Bridge node promoting ROS2 /rosout log entries to FaultManager faults
