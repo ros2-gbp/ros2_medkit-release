@@ -26,20 +26,20 @@ A demo node (temp_sensor) is launched alongside so that entities exist in
 discovery for validate_entity_for_route to pass.
 """
 
+import os
 import tempfile
 import time
 import unittest
 
 from launch import LaunchDescription
 from launch.actions import TimerAction
-import launch_ros.actions
 import launch_testing
 import launch_testing.actions
 import requests
 
 from ros2_medkit_test_utils.constants import ALLOWED_EXIT_CODES, API_BASE_PATH, get_test_port
 from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
-from ros2_medkit_test_utils.launch_helpers import create_demo_nodes, get_coverage_env
+from ros2_medkit_test_utils.launch_helpers import create_demo_nodes, create_gateway_node
 
 
 PORT_WITH_SCRIPTS = get_test_port(0)
@@ -58,35 +58,21 @@ SHELL_SCRIPT = '#!/bin/sh\necho "hello"\n'
 
 def generate_test_description():
     """Launch two gateways and a demo node for entity discovery."""
-    coverage_env = get_coverage_env()
-
-    gateway_with_scripts = launch_ros.actions.Node(
-        package='ros2_medkit_gateway',
-        executable='gateway_node',
+    gateway_with_scripts = create_gateway_node(
         name='gateway_with_scripts',
-        output='screen',
-        parameters=[{
+        port=PORT_WITH_SCRIPTS,
+        extra_params={
             'server.host': '127.0.0.1',
-            'server.port': PORT_WITH_SCRIPTS,
-            'refresh_interval_ms': 1000,
             'scripts.scripts_dir': SCRIPTS_DIR,
             'scripts.max_concurrent_executions': 3,
             'scripts.default_timeout_sec': 30,
-        }],
-        additional_env=coverage_env,
+        },
     )
 
-    gateway_no_scripts = launch_ros.actions.Node(
-        package='ros2_medkit_gateway',
-        executable='gateway_node',
+    gateway_no_scripts = create_gateway_node(
         name='gateway_no_scripts',
-        output='screen',
-        parameters=[{
-            'server.host': '127.0.0.1',
-            'server.port': PORT_NO_SCRIPTS,
-            'refresh_interval_ms': 1000,
-        }],
-        additional_env=coverage_env,
+        port=PORT_NO_SCRIPTS,
+        extra_params={'server.host': '127.0.0.1'},
     )
 
     # Launch a demo node so entities are available in discovery.
@@ -220,6 +206,63 @@ class TestScriptsCRUD(GatewayTestCase):
         data = self.get_json('/apps/temp_sensor/scripts')
         self.assertIn('items', data)
         self.assertIsInstance(data['items'], list)
+
+    # @verifies REQ_INTEROP_041
+    def test_01b_urls_name_the_collection_the_caller_addressed(self):
+        """`href`, `_links` and `Location` all use the caller's own collection.
+
+        These used to come from "components if the path says so, else apps".
+        The segment is now read out of the request path instead of chosen, so
+        this pins both reachable collections - a component caller must not
+        start getting `/apps/...` back from the rewritten derivation.
+
+        Areas and functions cannot be checked here: the scripts routes are
+        registered for apps and components only (`rest_server.cpp`), so those
+        paths never route and no URL is built for them. That is why the old
+        guess never actually mislabelled a live response.
+        """
+        r, script_id = self._upload_script(filename='collection_pin.py')
+        self.assertEqual(
+            r.headers['Location'],
+            f'{API_BASE_PATH}/apps/temp_sensor/scripts/{script_id}')
+
+        listed = self.get_json('/apps/temp_sensor/scripts')
+        self.assertEqual(listed['_links']['self'], f'{API_BASE_PATH}/apps/temp_sensor/scripts')
+        self.assertEqual(listed['_links']['parent'], f'{API_BASE_PATH}/apps/temp_sensor')
+        hrefs = [i['href'] for i in listed['items'] if i['id'] == script_id]
+        self.assertEqual(hrefs, [f'{API_BASE_PATH}/apps/temp_sensor/scripts/{script_id}'])
+
+        comp_id = self.get_json('/components')['items'][0]['id']
+        comp_listed = self.get_json(f'/components/{comp_id}/scripts')
+        self.assertEqual(
+            comp_listed['_links']['self'],
+            f'{API_BASE_PATH}/components/{comp_id}/scripts')
+        self.assertEqual(
+            comp_listed['_links']['parent'], f'{API_BASE_PATH}/components/{comp_id}')
+
+    # @verifies REQ_INTEROP_040
+    def test_01c_trailing_slash_location_still_resolves(self):
+        """A stray trailing slash must not produce a `Location` that 404s.
+
+        Route regexes are anchored with `/?$`, so `POST .../scripts/` routes
+        just as `POST .../scripts` does, and nothing normalises the path
+        afterwards. Appending the new id to the raw request path then yields
+        `.../scripts//new_id`, which no route matches - `([^/]+)` cannot match
+        an empty segment - so the header hands the client a dead URI.
+        """
+        files = {'file': ('slash.py', PYTHON_SCRIPT, 'application/octet-stream')}
+        r = requests.post(
+            f'{self.BASE_URL}/apps/temp_sensor/scripts/', files=files, timeout=5)
+        self.assertEqual(r.status_code, 201, r.text)
+
+        location = r.headers['Location']
+        self.assertNotIn('//', location.split('://')[-1])
+        self.assertEqual(
+            location, f'{API_BASE_PATH}/apps/temp_sensor/scripts/{r.json()["id"]}')
+
+        follow = requests.get(
+            self.BASE_URL + location[len(API_BASE_PATH):], timeout=5)
+        self.assertEqual(follow.status_code, 200, follow.text)
 
     # @verifies REQ_INTEROP_040
     def test_02_upload_and_list(self):
@@ -770,6 +813,50 @@ class TestScriptsExecution(GatewayTestCase):
             timeout=5,
         )
         self.assertEqual(r.status_code, 404)
+
+    # @verifies REQ_INTEROP_047
+    def test_15_stop_ends_the_script_process(self):
+        """The stop action ends the process, not only the execution's status."""
+        pid_file = os.path.join(SCRIPTS_DIR, 'stop_target.pid')
+        script = (
+            '#!/usr/bin/env python3\n'
+            'import os\n'
+            'import time\n'
+            f'with open({pid_file!r}, "w") as f:\n'
+            '    f.write(str(os.getpid()))\n'
+            'time.sleep(60)\n'
+        )
+        script_id = self._upload_script(filename='stop_target.py', content=script)
+        _, exec_id = self._start_execution(script_id)
+
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline and not os.path.exists(pid_file):
+            time.sleep(0.1)
+        self.assertTrue(os.path.exists(pid_file), 'the script never wrote its PID')
+        with open(pid_file) as f:
+            pid = int(f.read())
+
+        r = requests.put(
+            f'{self.BASE_URL}/apps/temp_sensor/scripts/{script_id}/executions/{exec_id}',
+            json={'action': 'stop'},
+            timeout=5,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+        # A reaped process has no /proc entry. A zombie waits only for the gateway to reap it.
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and _process_running(pid):
+            time.sleep(0.1)
+        self.assertFalse(_process_running(pid), f'script process {pid} still runs after stop')
+
+
+def _process_running(pid):
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            # The state follows the parenthesised command name.
+            return f.read().rsplit(')', 1)[1].split()[0] != 'Z'
+    except (FileNotFoundError, ProcessLookupError):
+        return False
 
 
 # ---------------------------------------------------------------------------

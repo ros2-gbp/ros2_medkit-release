@@ -16,6 +16,8 @@
 
 #include <unordered_set>
 
+#include "ros2_medkit_gateway/core/discovery/identity_merge.hpp"
+
 namespace ros2_medkit_gateway {
 
 EntityMerger::EntityMerger(const std::string & peer_name) : peer_name_(peer_name) {
@@ -171,11 +173,24 @@ std::vector<Component> EntityMerger::merge_components(const std::vector<Componen
         merged.description = remote_comp.description;
       }
 
-      // A Component ID refers to one physical ECU. When the same ID is
-      // present locally and remotely, the peer is the authoritative owner
-      // of the Component's runtime state (data, logs, hosts, operations,
-      // faults). Route all requests for the merged Component to the peer;
-      // the primary only aggregates its presence in discovery listings.
+      // Merge the remote asset-identity nameplate into the local one. The peer is
+      // tagged as the lowest authority (peer:<name> is not in the default precedence),
+      // so this is a gap-fill: empty local fields are populated from the remote, but a
+      // value the local side already knows is never overridden. Stamp local provenance
+      // first so existing local fields are protected during the merge.
+      static const discovery::IdentityMergeConfig kIdentityConfig;
+      discovery::stamp_identity_provenance(merged.identity, merged.source);
+      discovery::merge_identity(merged.identity, remote_comp.identity, peer_source(), kIdentityConfig);
+
+      // Note the deliberate divergence between the two attributions below: the
+      // peer is the LEAST authoritative source for *identity* (gap-fill only,
+      // above) yet the authoritative owner of *runtime state* (routing, below).
+      // This is intentional and conservative: a remote peer must not clobber
+      // local nameplate knowledge, but a Component ID refers to one physical ECU
+      // and when the same ID is present locally and remotely the peer owns its
+      // live state (data, logs, hosts, operations, faults). Route all requests
+      // for the merged Component to the peer; the primary only aggregates its
+      // presence in discovery listings.
       routing_table_[merged.id] = peer_name_;
       append_contributor_unique(merged.contributors, peer_source());
     } else {
