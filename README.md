@@ -1,207 +1,250 @@
-<!-- The logo, header and diagram live in the selfpatch/.github repository (profile/design/ros2_medkit.html), so this repository carries no image binaries. Change them there, and keep each image's alt text here in step with its words. -->
+# ros2_medkit_fault_reporter
 
-<a href="https://selfpatch.ai"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/logo-dark.png"><img src="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/logo-light.png" alt="selfpatch.ai" height="30"></picture></a>
+Client library for easy fault reporting to the central FaultManager.
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/header-dark.png"><img src="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/header-light.png" alt="ros2_medkit: see what broke on any ROS 2 robot, from one REST API." width="100%"></picture>
+## Overview
 
-[![CI](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml/badge.svg)](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/selfpatch/ros2_medkit/branch/main/graph/badge.svg)](https://codecov.io/gh/selfpatch/ros2_medkit)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selfpatch.github.io/ros2_medkit/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![ROS 2 Jazzy | Humble | Lyrical](https://img.shields.io/badge/ROS%202-Jazzy%20%7C%20Humble%20%7C%20Lyrical-blue)](https://docs.ros.org/en/jazzy/)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/6CXPMApAyq)
+The FaultReporter library provides a simple API for ROS 2 nodes to report faults.
+Just call `report()` when something goes wrong - the fault is immediately confirmed.
 
-ros2_medkit gives your ROS 2 robot a diagnostics REST API. It finds every node, topic, service and
-action by itself, and turns failures - error logs, failed actions, `/diagnostics` - into clear
-faults: what broke, where, how bad, with a snapshot and a rosbag of the moment it happened.
-No changes to your code.
+## Quick Start
 
-<a name="run-it-in-5-minutes"></a>
+```cpp
+#include "ros2_medkit_fault_reporter/fault_reporter.hpp"
 
-## Quick start
+class MyNode : public rclcpp::Node {
+ public:
+  MyNode() : Node("my_node") {
+    reporter_ = std::make_unique<ros2_medkit_fault_reporter::FaultReporter>(
+        shared_from_this(), get_fully_qualified_name());
+  }
 
-1. Get [Docker](https://docs.docker.com/get-started/get-docker/), if you don't have it yet.
+  void check_sensor() {
+    if (sensor_error_detected()) {
+      reporter_->report("SENSOR_FAILURE",
+                        ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR,
+                        "Sensor communication timeout");
+    }
+  }
 
-2. While your robot is running, start ros2_medkit on its computer:
-
-   ```bash
-   docker run --rm --network host --ipc host \
-     -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \
-     -e RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}" \
-     ghcr.io/selfpatch/ros2_medkit-jazzy:latest \
-     ros2 launch ros2_medkit_gateway bringup.launch.py
-   ```
-
-   On Humble or Lyrical, change `jazzy` to `humble` or `lyrical`.
-
-3. See what it found:
-
-   ```bash
-   curl localhost:8080/api/v1/apps     # every node on your robot
-   curl localhost:8080/api/v1/faults   # everything that has failed
-   ```
-
-   Or browse the whole API at [localhost:8080/api/v1/docs](http://localhost:8080/api/v1/docs).
-
-> [!TIP]
-> That's it. ros2_medkit is now watching your robot, and every new failure shows up as a fault.
-
-**No robot at hand?** The sensor demo runs on any laptop and lets you break things on purpose
-(it needs `curl` and `jq`):
-
-```bash
-git clone https://github.com/selfpatch/selfpatch_demos.git
-cd selfpatch_demos/demos/sensor_diagnostics
-./run-demo.sh     # web UI on http://localhost:3000
-./inject-nan.sh   # break a sensor, then watch the fault appear
+ private:
+  std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter> reporter_;
+};
 ```
 
-<details>
-<summary>What a fault looks like</summary>
+That's it! The fault will be immediately confirmed in FaultManager.
 
-<br>
+### Using with a lifecycle node
 
-After a Nav2 goal is aborted:
+`FaultReporter` also works inside an `rclcpp_lifecycle::LifecycleNode` — construct it from the node
+directly (no `shared_from_this()` needed), typically in `on_configure()`:
 
-```jsonc
-// GET /api/v1/faults
-{
-  "items": [
-    { "fault_code": "ACTION_NAVIGATE_TO_POSE_ABORTED",
-      "severity_label": "ERROR", "status": "CONFIRMED",
-      "reporting_sources": ["/bt_navigator"] }
-  ],
-  "x-medkit": { "count": 1 }
-}
+```cpp
+#include "rclcpp_lifecycle/lifecycle_node.hpp"
+#include "ros2_medkit_fault_reporter/fault_reporter.hpp"
+
+using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
+
+class MyLifecycleNode : public rclcpp_lifecycle::LifecycleNode {
+ public:
+  MyLifecycleNode() : LifecycleNode("my_node") {}
+
+  CallbackReturn on_configure(const rclcpp_lifecycle::State &) override {
+    reporter_ = std::make_unique<ros2_medkit_fault_reporter::FaultReporter>(
+        *this, get_fully_qualified_name());
+    return CallbackReturn::SUCCESS;
+  }
+
+ private:
+  std::unique_ptr<ros2_medkit_fault_reporter::FaultReporter> reporter_;
+};
 ```
 
-Each fault also keeps a snapshot of the moment it happened and a rosbag of the seconds around it:
+### Constructors
 
-```bash
-curl localhost:8080/api/v1/apps/bt_navigator/faults/ACTION_NAVIGATE_TO_POSE_ABORTED
-curl -O -J localhost:8080/api/v1/apps/bt_navigator/bulk-data/rosbags/ACTION_NAVIGATE_TO_POSE_ABORTED
-```
+`FaultReporter` can be built from whichever handle you have:
 
-</details>
-
-<details>
-<summary>Watch faults live, or add the web UI</summary>
-
-<br>
-
-```bash
-# Faults as they happen
-curl -N localhost:8080/api/v1/faults/stream
-
-# A dashboard in the browser: open http://localhost:3000, click Connect, enter http://localhost:8080
-docker run -p 3000:80 ghcr.io/selfpatch/ros2_medkit_web_ui:latest
-```
-
-The browser calls the gateway from a different origin, so the gateway must allow that origin via
-CORS. The Docker image and `bringup.launch.py` allow `http://localhost:3000` and
-`http://localhost:5173`. The origin must match exactly: `http://127.0.0.1:3000` is not
-`http://localhost:3000`. To allow other origins, pass the full list, for example
-`cors_allowed_origins:=http://localhost:3000,http://127.0.0.1:3000` (it replaces the defaults).
-
-See the [web UI tutorial](https://selfpatch.github.io/ros2_medkit/tutorials/web-ui.html) and the
-[Postman collection](postman/).
-
-</details>
-
-<details>
-<summary>Install without Docker</summary>
-
-<br>
-
-ros2_medkit is on its way into the official ROS packages. Once it reaches your distro:
-
-```bash
-sudo apt install ros-jazzy-ros2-medkit-gateway   # or ros-humble- / ros-lyrical-
-ros2 launch ros2_medkit_gateway bringup.launch.py
-```
-
-To build from source or use Pixi, follow the
-[installation guide](https://selfpatch.github.io/ros2_medkit/installation.html).
-
-</details>
-
-<details>
-<summary>Troubleshooting</summary>
-
-<br>
-
-- Robot missing? Run ros2_medkit on the robot's computer, or one on the same network, from a
-  terminal where your ROS 2 setup works.
-- Opening it from another computer? Add `server_host:=0.0.0.0` to the end of the command in
-  step 2, on a network you trust, and use the robot's IP address instead of `localhost`.
-- Running it in a container without `--network host`? `bringup.launch.py` binds the REST API to
-  `127.0.0.1`, which is then the container's own loopback, and the published port answers with
-  `Connection reset by peer` or an empty reply. Add `server_host:=0.0.0.0` and publish the port as
-  `-p 127.0.0.1:8080:8080`, which keeps the API, unauthenticated by default, off the LAN.
-- No faults from `/diagnostics`? Add `enable_diagnostic_bridge:=true` to the end of the command
-  in step 2.
-- Still stuck? See [troubleshooting](https://selfpatch.github.io/ros2_medkit/troubleshooting.html)
-  or ask on [Discord](https://discord.gg/6CXPMApAyq).
-
-</details>
-
-## How it works
-
-<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/how-it-works-dark.png"><img src="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/how-it-works-light.png" alt="How it works. Your robot: error logs, failed actions, /diagnostics, and your own nodes through FaultReporter. ros2_medkit listens to logs, actions and diagnostics, records each fault with its history, a snapshot and a rosbag, and serves it all on one REST API, with every node it found. You read it from a browser, curl, the web UI or an AI assistant." width="100%"></picture>
-
-ros2_medkit listens to what your robot already publishes, so it works without code changes. For
-more control, report faults from your own nodes with the
-[`FaultReporter`](src/ros2_medkit_fault_reporter) client, see the
-[integration tutorial](https://selfpatch.github.io/ros2_medkit/tutorials/integration.html).
-The API follows SOVD (ISO 17978), the diagnostics standard from the automotive world.
+- `FaultReporter(rclcpp::Node & node, source_id[, service_name])`
+- `FaultReporter(rclcpp::Node::SharedPtr node, source_id[, service_name])`
+- `FaultReporter(rclcpp_lifecycle::LifecycleNode & node, source_id[, service_name])`
+- `FaultReporter(rclcpp_lifecycle::LifecycleNode::SharedPtr node, source_id[, service_name])`
+- `FaultReporter(node_base, node_graph, node_services, node_params, logger, source_id[, service_name])`
+  — the interface-based constructor the others delegate to, for custom wiring.
 
 ## Features
 
-- Finds every node, topic, service and action, with no config
-- Turns error logs, failed actions and `/diagnostics` into faults
-- Confirms each fault, keeps its history and clears it once it's fixed
-- Saves a snapshot and a rosbag of the moment each fault happened
-- Reads any topic as JSON, calls services and actions, and reads and sets parameters
-- Streams faults as they happen
-- Software updates through a plugin, and sign-in with per-user permissions
-- Rosbags open in whatever tool you already use to browse robot data
+- **Simple API**: Just call `report()` to report a fault
+- **Lifecycle node support**: Construct from a regular `Node` or an `rclcpp_lifecycle::LifecycleNode`
+- **Local Filtering** (optional): Suppress repeated faults until threshold is met
+- **Confirmed delivery**: each report is kept until the FaultManager answers, and sent again if it does not
+- **Per-fault tracking**: Each fault_code has independent filtering
+- **Severity bypass**: High-severity faults bypass local filtering
+- **ROS-free core**: `ReporterCore` (filtering and report building) builds without ROS, see below
 
-<a name="vs-standard-ros-2-diagnostics"></a>
+## API
 
-## Compared with standard ROS 2 diagnostics
+### `report(fault_code, severity, description)`
 
-ros2_medkit builds on them. It reads `/diagnostics` too, so keep your `diagnostic_updater` code.
+Report a fault occurrence. With default FaultManager settings, the fault is immediately confirmed.
 
-| | Standard ROS 2 diagnostics | ros2_medkit |
-|---|---|---|
-| Where you see it | A desktop app next to the robot | A REST API, from anywhere |
-| Code changes | Each node reports its own health | None needed |
-| What you get | OK, WARN, ERROR or STALE, right now | A fault that is confirmed, tracked and cleared once fixed |
-| When it breaks | Nothing is saved | A snapshot and a rosbag |
-| History | None | Saved, so you can look back |
-| Covers | ROS only | ROS today, PLCs and vehicle controllers through the same API |
-| AI assistants | No | Yes, through MCP |
+```cpp
+reporter_->report("MOTOR_OVERHEAT",
+                  ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR,
+                  "Motor temperature exceeded safe limit");
+```
 
-## Ecosystem
+### `report_passed(fault_code)` (Advanced)
 
-- [ros2_medkit_web_ui](https://github.com/selfpatch/ros2_medkit_web_ui) - see your robot and its faults in the browser
-- [ros2_medkit_mcp](https://github.com/selfpatch/ros2_medkit_mcp) - let an AI assistant look into your robot
-- [ros2_medkit_clients](https://github.com/selfpatch/ros2_medkit_clients) - Python and TypeScript clients
-- [selfpatch_demos](https://github.com/selfpatch/selfpatch_demos) - ready-made demo robots, from a mobile robot to an arm
+Report that a fault condition has cleared. PASSED events are filtered by the same threshold and window as FAILED events. Use this when FaultManager is configured with debounce filtering and healing enabled.
 
-## Documentation
+```cpp
+reporter_->report_passed("MOTOR_OVERHEAT");
+```
 
-- [Documentation](https://selfpatch.github.io/ros2_medkit/) and the [step-by-step tutorial](https://selfpatch.github.io/ros2_medkit/getting_started.html)
-- [REST API reference](https://selfpatch.github.io/ros2_medkit/api/rest.html) and the [Postman collection](postman/)
+## Local Filtering
 
-## Contributing
+The reporter includes optional local filtering to reduce noise from repeated fault occurrences.
+Only forwards the fault to FaultManager after threshold is reached within a time window.
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), pick a
-[good first issue](https://github.com/selfpatch/ros2_medkit/labels/good%20first%20issue), or ask on
-[Discord](https://discord.gg/6CXPMApAyq) and in [Discussions](https://github.com/selfpatch/ros2_medkit/discussions).
-Report security issues privately, see [SECURITY.md](SECURITY.md).
+### Configuration
+
+```yaml
+my_node:
+  ros__parameters:
+    fault_reporter:
+      local_filtering:
+        enabled: true           # Enable local filtering (default: true)
+        default_threshold: 3    # Reports needed before forwarding
+        default_window_sec: 10.0  # Time window in seconds
+        bypass_severity: 2      # ERROR and CRITICAL bypass filtering
+```
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `fault_reporter.local_filtering.enabled` | bool | true | Enable/disable local filtering |
+| `fault_reporter.local_filtering.default_threshold` | int | 3 | Reports needed before forwarding |
+| `fault_reporter.local_filtering.default_window_sec` | double | 10.0 | Time window in seconds |
+| `fault_reporter.local_filtering.bypass_severity` | int | 2 | Severity level that bypasses filtering |
+
+A `default_threshold` above `INT_MAX` or a `bypass_severity` outside `[0, 255]` is replaced by its
+default and logged as a warning. A `default_threshold` below 1 becomes 1. A `default_window_sec` that
+is NaN, infinite or not positive becomes 1.0. These last two are not logged.
+
+## Delivery
+
+`report()` and `report_passed()` return at once. The reporter keeps each request until the
+FaultManager answers it, and sends it again when no response comes within `ack_timeout_sec`. After
+`max_attempts` requests it logs a warning that names the fault code and drops the report. A client
+can see the service as ready before the server has matched it, and a request sent then is lost. This
+retry covers that gap.
+
+- **Order:** per fault code only one request is in flight, and later ones wait behind it. The manager
+  receives the events of one code in the order they were reported.
+- **Cap:** at most `max_pending` reports wait for a response, all codes of one reporter together. A
+  report past the cap is dropped with a warning and the older ones are kept.
+- **Not ready:** a report made while the service is not ready is dropped at once, as before.
+- **Client queue:** the client holds 100 requests and 100 responses (the default service QoS holds
+  10). The responses include answers to every other client of the service, which the client drops
+  when it reads them. If more than 100 requests wait for the manager, or more than 100 answers
+  arrive while the node is not spun, the oldest are dropped. Their reports are sent again after
+  `ack_timeout_sec`. The FaultManager's request queue is `report_fault_queue_depth`.
+- **Duplicates:** if the manager answers too late (the retry timer resends between 1 and 1.5 times
+  `ack_timeout_sec` after a send), or a response is lost, the report is sent again and the manager
+  processes every copy it receives. A repeated FAILED counts toward the manager's debounce.
+- **Spinning:** responses and retries need the node to be spun. Every constructor puts the retry
+  timer on the node; the raw interfaces constructor without a timers interface uses the node's
+  default callback group.
+- **Retry while not ready:** a retry is sent whether or not the service is ready, and it counts toward
+  `max_attempts`. A FaultManager that restarts within `ack_timeout_sec` x `max_attempts` (5 s by
+  default) gets the pending reports. After a crash the dead server can look ready for some seconds.
+- **Destroyed reporter:** destroying a reporter does not cancel its reports. The ones still waiting
+  are sent until confirmed or dropped after `max_attempts`, as long as the node is spun.
+- **Shutdown:** when the ROS context shuts down, each report still waiting is dropped with a warning
+  that names its fault code. Reports of a destroyed reporter whose node is gone wait until then.
+
+| Parameter | Type | Default | Range | Why |
+|-----------|------|---------|-------|-----|
+| `fault_reporter.delivery.ack_timeout_sec` | double | 0.5 | 0.05 - 60 | Well above a local round trip, short enough to recover within a second |
+| `fault_reporter.delivery.max_attempts` | int | 10 | 1 - 100 | With the default timeout a report is kept for 5 s |
+| `fault_reporter.delivery.max_pending` | int | 1024 | 1 - 100000 | Bounds memory when the manager does not answer |
+
+A value outside its range (a NaN timeout, an integer beyond the range) is replaced by its default and
+logged as a warning.
+
+## ROS-free core
+
+The package has two parts. The core compiles without ROS and without DDS setup.
+`scripts/check_cores_without_ros` builds it with plain CMake, runs a check program against it with no
+ROS, and fails when the program links rclcpp. The unit test `test_validate_filter_params` links only
+the core. The other unit tests link `fault_reporter_lib`, which uses rclcpp.
+
+- **Core** (`fault_reporter_core`, static library): `core::ReporterCore` and `LocalFilter`. The core
+  applies the local filter, builds a `ros2_medkit::fault_detection::FaultReport` and hands each report
+  that passed the filter to a sink function (`core::ReportSink`). `core::validate_filter_params()` turns
+  raw int64 and double parameter values into a valid `FilterConfig` and reports the replaced values as
+  warnings. `LocalFilter` is guarded by a mutex. The core links only the header-only
+  `ros2_medkit_fault_detection`, so it needs no library besides the C++17 standard library.
+- **ROS adapter** (`fault_reporter_lib`, shared library): `FaultReporter` reads the ROS parameters,
+  owns the `ReportFault` service client and passes a sink to the core that sends the request.
+
+The core and the neutral types (`ros2_medkit_fault_detection/fault_types.hpp`) carry no ROS type.
+
+### Plain-CMake build
+
+`cmake/fault_reporter_core.cmake` is plain CMake (3.16 or newer, C++17), no ament. The ament build
+includes it by path, and so does `scripts/check_cores_without_ros`. The two package directories
+`ros2_medkit_fault_detection` and `ros2_medkit_fault_reporter` must stay side by side, because the file
+finds the detection header at `../ros2_medkit_fault_detection/include`.
+
+```cpp
+#include "ros2_medkit_fault_reporter/core/reporter_core.hpp"
+
+namespace core = ros2_medkit_fault_reporter::core;
+core::ReporterCore reporter("my_source", ros2_medkit_fault_reporter::FilterConfig{},
+                            [](const ros2_medkit::fault_detection::FaultReport & report) { /* send it */ });
+reporter.report("SENSOR_FAILURE", ros2_medkit::fault_detection::severity::kError, "timeout");
+```
+
+There is one definition of the target. It is not installed or exported.
+`scripts/check_cores_without_ros/run.sh` builds and runs the core on Ubuntu 20.04 with gcc 9, the oldest
+compiler the cores are checked with.
+
+## Advanced: Debounce Integration
+
+When FaultManager is configured with debounce filtering (`confirmation_threshold < -1`),
+you can use `report_passed()` to signal that a fault condition has cleared:
+
+```cpp
+void check_sensor() {
+  if (sensor_error_detected()) {
+    // Fault condition detected
+    reporter_->report("SENSOR_FAILURE",
+                      ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR,
+                      "Sensor timeout");
+  } else if (was_sensor_failing()) {
+    // Fault condition cleared - helps with healing
+    reporter_->report_passed("SENSOR_FAILURE");
+  }
+}
+```
+
+See [ros2_medkit_fault_manager README](../ros2_medkit_fault_manager/README.md) for debounce configuration details.
+
+## Building
+
+```bash
+colcon build --packages-select ros2_medkit_fault_reporter
+```
+
+## Testing
+
+```bash
+colcon test --packages-select ros2_medkit_fault_reporter
+colcon test-result --verbose
+```
 
 ## License
 
-Apache License 2.0, see [LICENSE](LICENSE). ros2_medkit is built and maintained by
-[selfpatch.ai](https://selfpatch.ai).
+Apache-2.0
