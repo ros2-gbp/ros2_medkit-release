@@ -1,0 +1,66 @@
+ros-jazzy-ros2-medkit-diagnostic-bridge (0.7.1-1bookworm) bookworm; urgency=high
+
+  * Reporter parameters out of range fall back to their defaults with a warning: a ``default_threshold`` above INT_MAX falls back to 3 and a ``bypass_severity`` of 256 to 2. 0.7.0 narrowed them to 1 and 0, so a WARN went through at once (#739 <https://github.com/selfpatch/ros2_medkit/pull/739>)
+  * Contributors: @bburda
+
+ -- "mfaferek93" <michal.faferek@selfpatch.ai>  Wed, 18 Nov 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-diagnostic-bridge (0.7.0-1bookworm) bookworm; urgency=high
+
+  * The ``hardware_id`` of a diagnostic message is passed through as the fault's source id, so a fault raised from ``/diagnostics`` is attributed to the device the publisher named rather than to the bridge (#622 <https://github.com/selfpatch/ros2_medkit/pull/622>)
+  * A fault code can be extracted from a diagnostic message's key/value attributes, so a publisher that already carries its own code no longer has to encode it in the message name (#527 <https://github.com/selfpatch/ros2_medkit/pull/527>)
+  * The Humble fallback warning builds again (#622 <https://github.com/selfpatch/ros2_medkit/pull/622>)
+  * Build and test only: the package is instrumented for coverage (#582 <https://github.com/selfpatch/ros2_medkit/pull/582>), every integration launch test runs on its own DDS domain taken at run time (#551 <https://github.com/selfpatch/ros2_medkit/pull/551>, #597 <https://github.com/selfpatch/ros2_medkit/pull/597>), and the suite re-emits and polls until the fault surfaces instead of asserting once against a graph that may not have settled (#504 <https://github.com/selfpatch/ros2_medkit/pull/504>)
+  * Contributors: @bburda, @mfaferek93, @nnarain
+
+ -- "mfaferek93" <michal.faferek@selfpatch.ai>  Thu, 27 Aug 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-diagnostic-bridge (0.6.0-1bookworm) bookworm; urgency=high
+
+  * Tests: label ``test_integration`` as an integration test so it runs in the integration suite instead of the unit set (#443 <https://github.com/selfpatch/ros2_medkit/pull/443>)
+  * Contributors: @bburda
+
+ -- "mfaferek93" <michal.faferek@selfpatch.ai>  Mon, 22 Jun 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-diagnostic-bridge (0.5.0-1bookworm) bookworm; urgency=high
+
+  * Build: adopt the centralized ``ROS2MedkitWarnings`` and ``ROS2MedkitSanitizers`` cmake modules
+  * Tests: use centralized ``ROS_DOMAIN_ID`` allocation for DDS isolation
+  * Contributors: @bburda
+
+ -- "mfaferek93" <michal.faferek@selfpatch.ai>  Mon, 08 Jun 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-diagnostic-bridge (0.4.0-1bookworm) bookworm; urgency=high
+
+  * Build: use shared cmake modules from ``ros2_medkit_cmake`` package
+  * Build: auto-detect ccache, centralized clang-tidy configuration
+  * Contributors: @bburda
+
+ -- "mfaferek93" <michal.faferek.coe@gmail.com>  Fri, 20 Mar 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-diagnostic-bridge (0.3.0-1bookworm) bookworm; urgency=high
+
+  * Multi-distro CI support for ROS 2 Humble, Jazzy, and Rolling (#219 <https://github.com/selfpatch/ros2_medkit/pull/219>, #242 <https://github.com/selfpatch/ros2_medkit/pull/242>)
+  * Contributors: @bburda
+
+ -- "mfaferek93" <michal.faferek.coe@gmail.com>  Fri, 27 Feb 2026 00:00:00 -0000
+
+ros-jazzy-ros2-medkit-diagnostic-bridge (0.2.0-1bookworm) bookworm; urgency=high
+
+  * Initial rosdistro release
+  * Bridge node converting standard ROS 2 /diagnostics to FaultManager fault reports
+  * Severity mapping:
+    
+      * OK -> PASSED event (fault condition cleared)
+      * WARN -> WARN severity FAILED event
+      * ERROR -> ERROR severity FAILED event
+      * STALE -> CRITICAL severity FAILED event
+    
+  * Auto-generated fault codes from diagnostic names (UPPER_SNAKE_CASE)
+  * Custom name_to_code mappings via ROS parameters
+  * Stateless design: always sends PASSED for OK status (handles restarts)
+  * Contributors: Michal Faferek
+
+ -- "mfaferek93" <michal.faferek.coe@gmail.com>  Sat, 07 Feb 2026 00:00:00 -0000
+
+
