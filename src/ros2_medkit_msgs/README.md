@@ -21,9 +21,10 @@ Core fault data model representing an aggregated fault condition with AUTOSAR DE
 | `fault_code` | string | Global fault identifier (e.g., "MOTOR_OVERHEAT") |
 | `severity` | uint8 | Severity level (use SEVERITY_* constants) |
 | `description` | string | Human-readable description |
-| `first_occurred` | builtin_interfaces/Time | When fault was first reported |
-| `last_occurred` | builtin_interfaces/Time | When fault was last reported (FAILED or PASSED) |
-| `occurrence_count` | uint32 | Total FAILED events aggregated across all sources |
+| `first_occurred` | builtin_interfaces/Time | When the current occurrence started; reset when a FAILED event reactivates a CLEARED fault, so it moves with `occurrence_count` |
+| `last_occurred` | builtin_interfaces/Time | When fault last occurred (FAILED events only) |
+| `last_passed` | builtin_interfaces/Time | When fault last reported PASSED (zero = never) |
+| `occurrence_count` | uint32 | Times this fault has occurred, counted on edges (first FAILED, then each FAILED that arrives while CLEARED). Repeats within one occurrence do not increment it |
 | `status` | string | Current status (see STATUS_* constants) |
 | `reporting_sources` | string[] | List of source identifiers that reported this fault |
 
@@ -63,12 +64,13 @@ Real-time fault event notification for SSE streaming (published on `/fault_manag
 | `event_type` | string | Event type (see constants below) |
 | `fault` | Fault | The fault data (state after event) |
 | `timestamp` | builtin_interfaces/Time | When the event occurred |
+| `auto_cleared_codes` | string[] | Symptom codes auto-cleared with the root cause (correlation) |
 
 **Event Types:**
 | Constant | Trigger |
 |----------|---------|
 | `EVENT_CONFIRMED` | Fault transitions PREFAILED → CONFIRMED |
-| `EVENT_CLEARED` | Fault transitions to CLEARED |
+| `EVENT_CLEARED` | Fault ends: CLEARED via ClearFault, or HEALED by PASSED events (`fault.status` tells which) |
 | `EVENT_UPDATED` | Fault data changes without status transition |
 
 ## Services
@@ -80,7 +82,7 @@ Report a fault event (FAILED or PASSED) to the FaultManager.
 **Request:**
 | Field | Type | Description |
 |-------|------|-------------|
-| `fault_code` | string | Global identifier (UPPER_SNAKE_CASE, max 64 chars) |
+| `fault_code` | string | Global identifier (UPPER_SNAKE_CASE, max 256 chars; alphanumerics, `_`, `-` and `.` only) |
 | `event_type` | uint8 | Event type: EVENT_FAILED (0) or EVENT_PASSED (1) |
 | `severity` | uint8 | Severity level (0-3, only for FAILED events) |
 | `description` | string | Human-readable description (only for FAILED events) |

@@ -41,7 +41,8 @@ class RouteRegistry;
 namespace ros2_medkit_gateway {
 
 class AggregationManager;
-class GatewayNode;
+class GatewayServices;
+class LifecycleStateReader;
 class TriggerManager;
 
 /**
@@ -60,8 +61,9 @@ class TriggerManager;
  */
 class RESTServer {
  public:
-  RESTServer(GatewayNode * node, const std::string & host, int port, const CorsConfig & cors_config,
-             const AuthConfig & auth_config, const RateLimitConfig & rate_limit_config,
+  RESTServer(GatewayServices & services, std::shared_ptr<LifecycleStateReader> lifecycle_reader,
+             const std::string & host, int port, const CorsConfig & cors_config, const AuthConfig & auth_config,
+             const RateLimitConfig & rate_limit_config, const RestConfig & rest_config,
              const TlsConfig & tls_config = TlsConfig{});
   ~RESTServer();
 
@@ -95,6 +97,16 @@ class RESTServer {
 
  private:
   void setup_routes();
+
+  /// Log every issue `RouteRegistry::validate_completeness()` finds for the
+  /// route set this configuration assembled, plus an unconditional summary line
+  /// carrying the error and warning counts. Called once, after registration.
+  ///
+  /// Never fatal - an incomplete OpenAPI declaration is a documentation defect,
+  /// not a reason to refuse traffic. The summary is what the integration suite
+  /// asserts on, so the check is gated rather than merely logged.
+  void report_route_metadata_issues() const;
+
   void setup_pre_routing_handler();
   void setup_global_error_handlers();
 
@@ -102,7 +114,7 @@ class RESTServer {
   void set_cors_headers(httplib::Response & res, const std::string & origin) const;
   bool is_origin_allowed(const std::string & origin) const;
 
-  GatewayNode * node_;
+  GatewayServices & services_;
   std::string host_;
   int port_;
   CorsConfig cors_config_;

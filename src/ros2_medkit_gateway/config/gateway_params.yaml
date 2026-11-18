@@ -5,6 +5,22 @@
 #   - Command line: --ros-args -p server.port:=9000
 #   - Launch files: parameters=[...]
 #   - This YAML file
+#
+# Ranges: where a parameter below documents a valid range, that range is
+# enforced when the value is read, and an out-of-range value is never accepted
+# in silence. What happens next differs by parameter:
+#   - most are coerced to the nearest endpoint, and the gateway logs both
+#     values:   [WARN] [rest_server]: server.http_thread_pool_size 0 clamped to 1
+#   - some are refused instead, because clamping them makes no sense (half a
+#     port number is not a port); the documented default is used and the
+#     warning names the value that was refused
+#   - a couple are declared with a floating-point range descriptor, so rclcpp
+#     itself rejects the value and the gateway does not start at all
+# Which parameter falls in which group is listed once, in the "Out-of-range
+# values" section of docs/config/server.rst. It is deliberately not repeated
+# here: the same list in two files is the kind that quietly drifts apart.
+# So if the gateway behaves as though a parameter were different from what this
+# file says, its startup log will name the parameter.
 
 ros2_medkit_gateway:
   ros__parameters:
@@ -50,11 +66,14 @@ ros2_medkit_gateway:
       keep_alive_timeout_sec: 2
 
       # Number of threads in the main rclcpp MultiThreadedExecutor. This
-      # executor only dispatches the gateway node's own callbacks (timers,
-      # graph events, log/fault subscriptions); HTTP handlers that issue ROS
-      # service calls use their own private executors, so a small pool here is
-      # safe. Bounded to a small fixed size instead of std::thread::
-      # hardware_concurrency(). Clamped to [1, 256].
+      # executor dispatches the gateway node's own callbacks (timers, graph
+      # events, log/fault subscriptions) plus the response callbacks that
+      # complete operation/action RPC futures. The RPC response callbacks run
+      # in a shared reentrant callback group, so with 2+ threads a service or
+      # action response is delivered even while another gateway callback
+      # (e.g. a discovery refresh pass) is running. Bounded to a small fixed
+      # size instead of std::thread::hardware_concurrency().
+      # Clamped to [1, 256].
       # Default: 2
       executor_threads: 2
 
@@ -205,6 +224,15 @@ ros2_medkit_gateway:
       # Default: 3600 (1 hour)
       max_duration_sec: 3600
 
+      # Comment interval on an idle SSE stream, in seconds. Also how long the
+      # server takes to notice a client has gone: a closed socket is found on
+      # the next write. On an aggregating gateway that is how long a fault-stream
+      # relay keeps a client slot on a peer after nobody is watching.
+      # Shorten it behind a proxy that drops idle connections sooner than 30 s.
+      # Range 1-3600, clamped to the nearest end with a warning.
+      # Default: 30
+      keepalive_interval_sec: 30
+
     # Entity Cache Configuration
     entity_cache:
       # Pre-reserved capacity for the thread-safe entity cache.
@@ -248,6 +276,19 @@ ros2_medkit_gateway:
 
       # Strict manifest validation (reject invalid manifests)
       manifest_strict_validation: true
+
+      # Manual asset inventory CSV (requires a manifest-backed mode:
+      # manifest_only, or hybrid with manifest_path set). Each row becomes a
+      # Component with source "inventory", appended to the manifest on every
+      # load/reload and merged into the tree by id. Canonical columns:
+      # id (required), manufacturer, model, serial, hardware_rev, firmware,
+      # endpoint, role, area (aliases: serial_number, hardware_revision/hw_rev,
+      # firmware_version/fw); any other column is kept as an identity extra.
+      # RFC-4180 quoting, 1 MiB size cap. Malformed rows / id collisions are
+      # skipped with a warning (manifest wins); a missing file is skipped, an
+      # unreadable or malformed file fails the load. Empty = disabled (default).
+      inventory:
+        csv_path: ""
 
       # Configurable main layers (hybrid mode only)
       # Set false to disable a layer - useful when running manifest+plugin or runtime+plugin
@@ -297,6 +338,11 @@ ros2_medkit_gateway:
         # Values: "authoritative", "enrichment", "fallback"
         # Defaults: manifest=AUTH for identity/hierarchy/metadata, ENRICH for live_data, FALLBACK for status
         #           runtime=AUTH for live_data/status, ENRICH for metadata, FALLBACK for identity/hierarchy
+        #
+        # A manifest can demote all five manifest-layer groups at once with
+        # `config.allow_manifest_override: false`. An explicit (non-empty) value
+        # set here is applied afterwards and therefore wins for that group,
+        # while the remaining groups stay demoted to fallback.
         layers:
           manifest:
             identity: ""
@@ -443,8 +489,10 @@ ros2_medkit_gateway:
     # When enabled, a plugin implementing UpdateProvider is required to provide
     # the backend functionality. Without such a plugin, endpoints return 501.
     updates:
-      # Enable/disable /updates endpoints
-      # When false, update routes are not registered
+      # Enable/disable the /updates backend.
+      # The routes are always registered and always appear in the OpenAPI
+      # document; when this is false (or no UpdateProvider plugin is loaded)
+      # every one of them answers 501 not-implemented.
       # Default: false
       enabled: false
 
@@ -555,10 +603,27 @@ ros2_medkit_gateway:
       # Default: false
       enabled: false
 
-      # HTTP timeout for peer requests (health checks, entity fetching, forwarding)
-      # in milliseconds
+      # Connect budget for every peer request, and the read budget for reading a
+      # peer's description of itself: health checks, entity fetching, and the
+      # collection fan-out a client waits on across every peer at once.
+      # Milliseconds. Range 100-600000, clamped to the nearest end with a warning.
       # Default: 2000
       timeout_ms: 2000
+
+      # Read budget for a forwarded request - an operation execution, or a read
+      # of a large resource - on the gateway that owns it. Sized above a peer
+      # gateway's own service_call_timeout_sec default of 10 s,
+      # because what this waits for is the peer doing that work.
+      # A value below timeout_ms is raised to it, with a warning.
+      # Milliseconds. Range 100-600000, clamped to the nearest end with a warning.
+      # Default: 15000
+      forward_timeout_ms: 15000
+
+      # Budget for pushing a request body to a peer. Raise for large uploads
+      # over a slow link.
+      # Milliseconds. Range 100-600000, clamped to the nearest end with a warning.
+      # Default: 5000
+      write_timeout_ms: 5000
 
       # Announce this gateway's presence via mDNS
       # Default: false (opt-in to avoid surprising network behavior)
@@ -584,6 +649,19 @@ ros2_medkit_gateway:
       # Only enable when all peers are trusted and use the same JWT config.
       # Default: false (safe default - no token forwarding)
       forward_auth: false
+
+      # What this gateway presents as Authorization on connections it opens on
+      # its OWN behalf: the peer health check, the entity fetch, the fault-stream
+      # relay, and any forward whose caller sent no credential to pass on.
+      # Needed against peers that authenticate their reads - while it is empty
+      # such a peer answers 401, is recorded offline, and contributes neither
+      # entities nor events.
+      # Sent ONLY to peers named in peer_urls; a peer discovered over mDNS never
+      # receives it. Redacted from the configurations API, like auth.jwt_secret.
+      # Separate from forward_auth, which forwards an end user's token per
+      # request and has no effect on the relay.
+      # Default: "" (no credential)
+      peer_auth_header: ""
 
       # Security: Require TLS (https://) for all peer communication.
       # When true, peers with http:// URLs are rejected with an error log.

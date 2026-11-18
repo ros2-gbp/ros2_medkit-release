@@ -17,10 +17,12 @@
 #include <algorithm>
 #include <builtin_interfaces/msg/time.hpp>
 #include <chrono>
+#include <cmath>
 #include <string>
 
 #include "ros2_medkit_gateway/fault_manager_paths.hpp"
 #include "ros2_medkit_gateway/ros2/conversions/fault_msg_conversions.hpp"
+#include "ros2_medkit_gateway/ros2_common/helper_node.hpp"
 #include "ros2_medkit_msgs/msg/environment_data.hpp"
 #include "ros2_medkit_msgs/msg/fault.hpp"
 
@@ -79,6 +81,20 @@ Ros2FaultServiceTransport::Ros2FaultServiceTransport(rclcpp::Node * node) : node
   if (!node_->get_parameter("fault_manager.service_timeout_sec", service_timeout_sec_)) {
     service_timeout_sec_ = 5.0;
   }
+  // isfinite first, and the range as a positive test. Do NOT rewrite this as
+  // "not positive or too large": every comparison against NaN is false, so that
+  // form lets NaN reach wait_for_service, where the duration_cast to
+  // nanoseconds is undefined and the result is treated as "wait forever" - one
+  // fault RPC then pins an HTTP worker for the life of the process. A
+  // non-positive value is the quiet version of the same problem: every fault
+  // RPC returns "service not available" with nothing in the log.
+  const bool timeout_usable = std::isfinite(service_timeout_sec_) && service_timeout_sec_ > 0.0;
+  if (!timeout_usable) {
+    RCLCPP_WARN(node_->get_logger(),
+                "fault_manager.service_timeout_sec %.2f must be finite and > 0. Using default 5.0.",
+                service_timeout_sec_);
+    service_timeout_sec_ = 5.0;
+  }
   fault_manager_base_path_ = build_fault_manager_base_path(node_);
 
   // The fault service clients live on a private node driven by a private
@@ -86,8 +102,12 @@ Ros2FaultServiceTransport::Ros2FaultServiceTransport(rclcpp::Node * node) : node
   // processes these clients, so the client's pending-request cleanup cannot
   // race against the calling thread destroying the response shared_ptr - both
   // happen inline on the caller's thread inside spin_until_future_complete().
-  client_node_ = std::make_shared<rclcpp::Node>(std::string(node_->get_name()) + "_fault_clients");
-  executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+  client_node_ = ros2_common::make_helper_node(*node_, "_fault_clients");
+  // Joins the graph listener while the context is valid. A first join after
+  // rclcpp::shutdown() half-registers the node and ~NodeGraph aborts.
+  static_cast<void>(client_node_->get_graph_event());
+  executor_ =
+      std::make_shared<rclcpp::executors::SingleThreadedExecutor>(ros2_common::executor_options_for(*client_node_));
   executor_->add_node(client_node_);
 
   report_fault_client_ =
@@ -128,8 +148,18 @@ Ros2FaultServiceTransport::~Ros2FaultServiceTransport() {
 }
 
 bool Ros2FaultServiceTransport::wait_for_services(std::chrono::duration<double> timeout) {
-  return report_fault_client_->wait_for_service(timeout) && get_fault_client_->wait_for_service(timeout) &&
-         list_faults_client_->wait_for_service(timeout) && clear_fault_client_->wait_for_service(timeout);
+  // One deadline shared by all four waits: per-client timeouts would stack to
+  // 4x on an absent fault manager. Clamped to 0 (= non-blocking check) because
+  // a negative rclcpp timeout means wait forever.
+  const auto clamped = std::chrono::duration<double>(std::max(timeout.count(), 0.0));
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(clamped);
+  const auto remaining = [deadline] {
+    return std::max(std::chrono::duration<double>(deadline - std::chrono::steady_clock::now()),
+                    std::chrono::duration<double>::zero());
+  };
+  return report_fault_client_->wait_for_service(remaining()) && get_fault_client_->wait_for_service(remaining()) &&
+         list_faults_client_->wait_for_service(remaining()) && clear_fault_client_->wait_for_service(remaining());
 }
 
 bool Ros2FaultServiceTransport::is_available() const {
@@ -153,6 +183,7 @@ FaultResult Ros2FaultServiceTransport::report_fault(const std::string & fault_co
       "ReportFault", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -196,6 +227,7 @@ FaultResult Ros2FaultServiceTransport::list_faults(const std::string & source_id
       "ListFaults", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -270,6 +302,7 @@ FaultWithEnvJsonResult Ros2FaultServiceTransport::get_fault_with_env(const std::
       "GetFault", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -308,6 +341,7 @@ FaultResult Ros2FaultServiceTransport::get_fault(const std::string & fault_code,
   FaultResult result;
   result.success = env_result.success;
   result.error_message = env_result.error_message;
+  result.failure = env_result.failure;
 
   if (env_result.success) {
     result.data = env_result.data["fault"];
@@ -328,6 +362,7 @@ FaultResult Ros2FaultServiceTransport::clear_fault(const std::string & fault_cod
       "ClearFault", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -356,6 +391,7 @@ FaultResult Ros2FaultServiceTransport::get_snapshots(const std::string & fault_c
       "GetSnapshots", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -381,7 +417,12 @@ FaultResult Ros2FaultServiceTransport::get_snapshots(const std::string & fault_c
 FaultResult Ros2FaultServiceTransport::get_rosbag(const std::string & fault_code) {
   FaultResult result;
 
+  // The parameter is the bulk-data id, which is a recording id. It is sent in BOTH
+  // fields: the fault manager prefers recording_id and falls back to fault_code,
+  // which is what keeps a pre-#620 URL (and every existing .test.py that calls this
+  // service with a fault code) working unchanged.
   auto request = std::make_shared<ros2_medkit_msgs::srv::GetRosbag::Request>();
+  request->recording_id = fault_code;
   request->fault_code = fault_code;
 
   auto response = invoke_fault_service<ros2_medkit_msgs::srv::GetRosbag>(
@@ -389,16 +430,16 @@ FaultResult Ros2FaultServiceTransport::get_rosbag(const std::string & fault_code
       "GetRosbag", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
   result.success = response->success;
 
   if (response->success) {
-    result.data = {{"file_path", response->file_path},
-                   {"format", response->format},
-                   {"duration_sec", response->duration_sec},
-                   {"size_bytes", response->size_bytes}};
+    result.data = {{"file_path", response->file_path},       {"recording_id", response->recording_id},
+                   {"fault_codes", response->fault_codes},   {"format", response->format},
+                   {"duration_sec", response->duration_sec}, {"size_bytes", response->size_bytes}};
   } else {
     result.error_message = response->error_message;
   }
@@ -417,6 +458,7 @@ FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_f
       "ListRosbags", result.error_message);
   if (!response) {
     result.success = false;
+    result.failure = FaultFailure::Unavailable;
     return result;
   }
 
@@ -425,28 +467,31 @@ FaultResult Ros2FaultServiceTransport::list_rosbags(const std::string & entity_f
   if (response->success) {
     // The response uses parallel arrays. Trust nothing about the remote
     // service: a server bug or schema drift could ship arrays of different
-    // lengths, and indexing past end-of-vector is UB. Take the shortest
-    // length and surface the mismatch rather than silently truncate.
+    // lengths, and indexing past end-of-vector is UB. Any array that does not
+    // match fault_codes is reported as a mismatch rather than silently truncated.
     const size_t n = response->fault_codes.size();
-    const size_t shortest = std::min({n, response->file_paths.size(), response->formats.size(),
-                                      response->durations_sec.size(), response->sizes_bytes.size()});
-    if (shortest != n || response->file_paths.size() != n || response->formats.size() != n ||
-        response->durations_sec.size() != n || response->sizes_bytes.size() != n) {
+    if (response->recording_ids.size() != n || response->file_paths.size() != n || response->formats.size() != n ||
+        response->durations_sec.size() != n || response->sizes_bytes.size() != n ||
+        response->created_at_ns.size() != n) {
       result.success = false;
       result.error_message = "ListRosbags response has mismatched array sizes (fault_codes=" + std::to_string(n) +
+                             ", recording_ids=" + std::to_string(response->recording_ids.size()) +
                              ", file_paths=" + std::to_string(response->file_paths.size()) +
                              ", formats=" + std::to_string(response->formats.size()) +
                              ", durations_sec=" + std::to_string(response->durations_sec.size()) +
-                             ", sizes_bytes=" + std::to_string(response->sizes_bytes.size()) + ")";
+                             ", sizes_bytes=" + std::to_string(response->sizes_bytes.size()) +
+                             ", created_at_ns=" + std::to_string(response->created_at_ns.size()) + ")";
       return result;
     }
     json rosbags = json::array();
     for (size_t i = 0; i < n; ++i) {
       rosbags.push_back({{"fault_code", response->fault_codes[i]},
+                         {"recording_id", response->recording_ids[i]},
                          {"file_path", response->file_paths[i]},
                          {"format", response->formats[i]},
                          {"duration_sec", response->durations_sec[i]},
-                         {"size_bytes", response->sizes_bytes[i]}});
+                         {"size_bytes", response->sizes_bytes[i]},
+                         {"created_at_ns", response->created_at_ns[i]}});
     }
     result.data = {{"rosbags", rosbags}};
   } else {
