@@ -14,6 +14,12 @@
 
 #pragma once
 
+#include <memory>
+#include <utility>
+
+#include "ros2_medkit_gateway/core/config.hpp"
+#include "ros2_medkit_gateway/core/http/sse_client_tracker.hpp"
+
 #include "ros2_medkit_gateway/dto/health.hpp"
 #include "ros2_medkit_gateway/http/handlers/handler_context.hpp"
 #include "ros2_medkit_gateway/http/typed_router.hpp"
@@ -45,8 +51,19 @@ namespace handlers {
  */
 class HealthHandlers {
  public:
-  explicit HealthHandlers(HandlerContext & ctx, const openapi::RouteRegistry * route_registry = nullptr)
-    : ctx_(ctx), route_registry_(route_registry) {
+  /// @param sse_tracker Shared SSE client counter, so /health can report how
+  /// much of `sse.max_clients` is in use. Optional: a gateway built without
+  /// one simply omits the field.
+  /// @param docs_enabled Value of `docs.enabled`; hides the Swagger UI entry when false.
+  /// @param identity Name, vendor name and version reported on `GET /` and `GET /version-info`.
+  explicit HealthHandlers(HandlerContext & ctx, const openapi::RouteRegistry * route_registry = nullptr,
+                          std::shared_ptr<const SSEClientTracker> sse_tracker = nullptr, bool docs_enabled = true,
+                          ServerIdentity identity = {})
+    : ctx_(ctx)
+    , route_registry_(route_registry)
+    , sse_tracker_(std::move(sse_tracker))
+    , docs_enabled_(docs_enabled)
+    , identity_(std::move(identity)) {
   }
 
   /// GET /health - Health check endpoint
@@ -61,6 +78,9 @@ class HealthHandlers {
  private:
   HandlerContext & ctx_;
   const openapi::RouteRegistry * route_registry_{nullptr};
+  std::shared_ptr<const SSEClientTracker> sse_tracker_;
+  bool docs_enabled_;
+  ServerIdentity identity_;
 };
 
 }  // namespace handlers
