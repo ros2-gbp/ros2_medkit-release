@@ -106,8 +106,9 @@ def generate_test_description():
     script_file.close()
     PUBLISHER_SCRIPT_PATH = script_file.name
 
+    # Inherit the CMake-injected per-test ROS_DOMAIN_ID; ROS_LOCALHOST_ONLY
+    # keeps discovery on loopback.
     env = os.environ.copy()
-    env['ROS_DOMAIN_ID'] = '43'
     env['ROS_LOCALHOST_ONLY'] = '1'
 
     publishers = launch.actions.ExecuteProcess(
@@ -122,7 +123,7 @@ def generate_test_description():
         executable='fault_manager_node',
         name='fault_manager',
         output='screen',
-        additional_env={'ROS_DOMAIN_ID': '43', 'ROS_LOCALHOST_ONLY': '1'},
+        additional_env={'ROS_LOCALHOST_ONLY': '1'},
         parameters=[{
             'storage_type': 'memory',
             'confirmation_threshold': -1,
@@ -135,6 +136,9 @@ def generate_test_description():
             'snapshots.rosbag.storage_path': ROSBAG_STORAGE_PATH,
             'snapshots.rosbag.lazy_start': False,
         }],
+        # Give the node room to flush coverage data at shutdown before SIGKILL.
+        sigterm_timeout='30',
+        sigkill_timeout='15',
     )
 
     delayed_fault_manager = launch.actions.TimerAction(
@@ -156,7 +160,8 @@ class TestRosbagEntityScope(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        os.environ['ROS_DOMAIN_ID'] = '43'
+        # Inherit the CMake-injected per-test ROS_DOMAIN_ID; keep discovery
+        # on loopback.
         os.environ['ROS_LOCALHOST_ONLY'] = '1'
         rclpy.init()
         cls.node = Node('test_entity_scope_client')
