@@ -18,18 +18,23 @@
 #include <chrono>
 #include <memory>
 #include <rclcpp/rclcpp.hpp>
+#include <set>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "ros2_medkit_gateway/aggregation/aggregation_manager.hpp"
-#include "ros2_medkit_gateway/core/aggregation/mdns_discovery.hpp"
+#include "ros2_medkit_gateway/core/aggregation/aggregation_host.hpp"
 #include "ros2_medkit_gateway/core/auth/auth_config.hpp"
 #include "ros2_medkit_gateway/core/condition_evaluator.hpp"
 #include "ros2_medkit_gateway/core/config.hpp"
 #include "ros2_medkit_gateway/core/data/topic_data_provider.hpp"
 #include "ros2_medkit_gateway/core/default_script_provider.hpp"
+#include "ros2_medkit_gateway/core/fault_trigger_engine.hpp"
+#include "ros2_medkit_gateway/core/fault_trigger_host.hpp"
+#include "ros2_medkit_gateway/core/gateway_services.hpp"
 #include "ros2_medkit_gateway/core/http/rate_limiter.hpp"
 #include "ros2_medkit_gateway/core/http/rest_server.hpp"
 #include "ros2_medkit_gateway/core/http/sse_client_tracker.hpp"
@@ -38,6 +43,7 @@
 #include "ros2_medkit_gateway/core/managers/data_access_manager.hpp"
 #include "ros2_medkit_gateway/core/managers/fault_manager.hpp"
 #include "ros2_medkit_gateway/core/managers/lock_manager.hpp"
+#include "ros2_medkit_gateway/core/managers/lock_reaper.hpp"
 #include "ros2_medkit_gateway/core/managers/log_manager.hpp"
 #include "ros2_medkit_gateway/core/managers/operation_manager.hpp"
 #include "ros2_medkit_gateway/core/managers/script_manager.hpp"
@@ -50,8 +56,12 @@
 #include "ros2_medkit_gateway/core/resource_change_notifier.hpp"
 #include "ros2_medkit_gateway/core/resource_sampler.hpp"
 #include "ros2_medkit_gateway/core/subscription_transport.hpp"
+#include "ros2_medkit_gateway/core/trigger_host.hpp"
 #include "ros2_medkit_gateway/core/trigger_store.hpp"
 #include "ros2_medkit_gateway/discovery/discovery_manager.hpp"
+#include "ros2_medkit_gateway/entity_freeze_frame_capture.hpp"
+#include "ros2_medkit_gateway/ros2/ros2_fault_event_source.hpp"
+#include "ros2_medkit_gateway/ros2/ros2_type_schema_provider.hpp"
 #include "ros2_medkit_gateway/ros2/transports/ros2_action_transport.hpp"
 #include "ros2_medkit_gateway/ros2/transports/ros2_fault_service_transport.hpp"
 #include "ros2_medkit_gateway/ros2/transports/ros2_log_source.hpp"
@@ -60,18 +70,20 @@
 #include "ros2_medkit_gateway/ros2/transports/ros2_topic_subscription_transport.hpp"
 #include "ros2_medkit_gateway/ros2/transports/ros2_topic_transport.hpp"
 #include "ros2_medkit_gateway/ros2/trigger_topic_subscriber.hpp"
+#include "ros2_medkit_gateway/ros2_common/callback_groups.hpp"
+#include "ros2_medkit_gateway/ros2_common/graph_node_list.hpp"
 #include "ros2_medkit_gateway/trigger_fault_subscriber.hpp"
 
 namespace ros2_medkit_gateway {
 
-class GatewayNode : public rclcpp::Node {
+class GatewayNode : public rclcpp::Node, public GatewayServices {
  public:
   explicit GatewayNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions{});
   ~GatewayNode() override;
 
   /// Count application (peer) nodes from (name, namespace) pairs: excludes hidden
-  /// nodes and the gateway's own nodes (whose FQN starts with @p self_fqn). Static
-  /// and public so the startup-summary counting logic is unit-testable.
+  /// nodes (the gateway's helper nodes are hidden) and the node at @p self_fqn.
+  /// Static and public so the startup-summary counting logic is unit-testable.
   static size_t count_peer_nodes(const std::vector<std::pair<std::string, std::string>> & nodes_and_namespaces,
                                  const std::string & self_fqn);
 
@@ -82,6 +94,77 @@ class GatewayNode : public rclcpp::Node {
   GatewayNode & operator=(const GatewayNode &) = delete;
   GatewayNode(GatewayNode &&) = delete;
   GatewayNode & operator=(GatewayNode &&) = delete;
+
+  // GatewayServices: the HTTP layer reaches the managers through these.
+  const ThreadSafeEntityCache & entity_cache() const override {
+    return get_thread_safe_cache();
+  }
+  PluginManager * plugin_manager() override {
+    return get_plugin_manager();
+  }
+  EntityDiscovery * discovery() override {
+    return get_discovery_manager();
+  }
+  ScriptManager * script_manager() override {
+    return get_script_manager();
+  }
+  FaultManager * fault_manager() override {
+    return get_fault_manager();
+  }
+  LockManager * lock_manager() override {
+    return get_lock_manager();
+  }
+  ConfigurationManager * configuration_manager() override {
+    return get_configuration_manager();
+  }
+  DataAccessManager * data_access_manager() override {
+    return get_data_access_manager();
+  }
+  OperationManager * operation_manager() override {
+    return get_operation_manager();
+  }
+  UpdateManager * update_manager() override {
+    return get_update_manager();
+  }
+  LogManager * log_manager() override {
+    return get_log_manager();
+  }
+  BulkDataStore * bulk_data_store() override {
+    return get_bulk_data_store();
+  }
+  FaultTriggerEngine * fault_trigger_engine() override {
+    return get_fault_trigger_engine();
+  }
+  FreezeFrameSource * freeze_frames() override {
+    return get_entity_freeze_frame_capture();
+  }
+  FaultEventSource * fault_events() override {
+    return fault_event_source_.get();
+  }
+  TopicDataProvider * topic_data_provider() override {
+    return get_topic_data_provider();
+  }
+  TriggerManager * trigger_manager() override {
+    return get_trigger_manager();
+  }
+  SubscriptionManager * subscription_manager() override {
+    return get_subscription_manager();
+  }
+  ResourceSamplerRegistry * sampler_registry() override {
+    return get_sampler_registry();
+  }
+  TransportRegistry * transport_registry() override {
+    return get_transport_registry();
+  }
+  TypeSchemaProvider * type_schemas() override {
+    return type_schemas_.get();
+  }
+  std::shared_ptr<SSEClientTracker> sse_client_tracker() override {
+    return get_sse_client_tracker();
+  }
+  GatewayNode * ros_node() override {
+    return this;
+  }
 
   /**
    * @brief Get the thread-safe entity cache with O(1) lookups
@@ -181,6 +264,62 @@ class GatewayNode : public rclcpp::Node {
   PluginManager * get_plugin_manager() const;
 
   /**
+   * @brief Wire the zero-config entity freeze-frame capture onto the shared
+   *        subscription executor. Call once after the executor is built and
+   *        plugins are loaded (main.cpp). No-op when disabled or no plugins.
+   */
+  void init_entity_freeze_frame_capture(ros2_common::Ros2SubscriptionExecutor & exec);
+
+  /**
+   * @brief Get the zero-config entity freeze-frame capture
+   * @return Raw pointer, or nullptr when disabled / no plugins loaded
+   */
+  EntityFreezeFrameCapture * get_entity_freeze_frame_capture() const;
+
+  /**
+   * @brief Route the trigger topic subscriber through the shared subscription
+   *        executor (issue #548). Its per-trigger subscriptions are then
+   *        created, destroyed, and dispatched on the executor's single worker
+   *        thread, so callbacks drain before teardown instead of racing the
+   *        main multi-threaded executor. Call once after the executor is built
+   *        (main.cpp). No-op when triggers are disabled.
+   */
+  void set_trigger_subscription_executor(ros2_common::Ros2SubscriptionExecutor & exec);
+
+  /**
+   * @brief Shut down the trigger topic subscriber, draining and destroying its
+   *        subscriptions on the executor worker. Idempotent. Must be called
+   *        BEFORE the subscription executor is destroyed (the trigger
+   *        subscriptions live on the executor's node and are torn down via its
+   *        worker). No-op when triggers are disabled. ~GatewayNode also calls
+   *        it, which becomes a no-op once this has run.
+   */
+  void shutdown_trigger_subscriber();
+
+  /**
+   * @brief Stop and join the REST server.
+   *
+   * Callable from the main teardown before the subscription executor is
+   * destroyed, so no httplib handler thread can be mid-subscribe()/unsubscribe()
+   * (which dereference the subscription executor) when it is freed. Idempotent;
+   * ~GatewayNode also calls it.
+   */
+  void stop_rest_server();
+
+  /**
+   * @brief Wire the config-less threshold-rule (fault-trigger) engine and its
+   *        evaluation loop. Call once after plugins are loaded (main.cpp).
+   *        No-op when disabled (``fault_triggers.enabled=false``) or no plugins.
+   */
+  void init_fault_trigger_engine();
+
+  /**
+   * @brief Get the config-less fault-trigger (threshold-rule) engine.
+   * @return Raw pointer, or nullptr when disabled / no plugins loaded
+   */
+  FaultTriggerEngine * get_fault_trigger_engine() const;
+
+  /**
    * @brief Get the ResourceSamplerRegistry instance
    * @return Raw pointer to ResourceSamplerRegistry (valid for lifetime of GatewayNode)
    */
@@ -253,10 +392,21 @@ class GatewayNode : public rclcpp::Node {
    */
   void trigger_reentrant_notification_for_testing(const EntityChangeScope & scope);
 
+  /**
+   * @brief Test hook: stop the gateway's own discovery refresh.
+   *
+   * Cancels the graph-event and backstop refresh timers and drops the graph
+   * event so `refresh_cache()` never runs again after this call. Tests that
+   * inject a known entity-cache state directly (via `get_thread_safe_cache()`)
+   * must call this first, otherwise a graph-event-driven `refresh_cache()`
+   * reconciles the cache back to the live ROS graph and silently wipes the
+   * injected entities. Do NOT call this from production code.
+   */
+  void stop_discovery_refresh_for_testing();
+
  private:
   void refresh_cache();
   void start_rest_server();
-  void stop_rest_server();
 
   /// Log a one-time discovery summary shortly after startup: discovered node /
   /// topic / entity counts, the REST URL and a sample curl. When no application
@@ -284,10 +434,21 @@ class GatewayNode : public rclcpp::Node {
   // as a raw TopicDataProvider* to DataAccessManager.
   std::shared_ptr<TopicDataProvider> topic_data_provider_;
 
+  // Message, service and action schemas. The one TypeIntrospection of the
+  // gateway lives here, so it is declared before everything that uses it.
+  std::unique_ptr<ros2::Ros2TypeSchemaProvider> type_schemas_;
+
   // Topic transport adapter shared with DataAccessManager. Held here so the
   // provider attach/detach hooks can forward into the adapter alongside the
   // manager and discovery side updates.
   std::shared_ptr<ros2::Ros2TopicTransport> topic_transport_;
+
+  // Shared callback groups for blocking-RPC response dispatch (Reentrant)
+  // and per-action status subscriptions (MutuallyExclusive) - issue #575.
+  // Declared BEFORE the transports so the groups destruct after every
+  // entity registered into them; the node itself only holds weak
+  // references to its callback groups.
+  ros2_common::GatewayCallbackGroups callback_groups_;
 
   // Service / action transport adapters shared with OperationManager. Held
   // here so their lifetime matches the gateway's executor (transports own
@@ -332,22 +493,29 @@ class GatewayNode : public rclcpp::Node {
   std::unique_ptr<ScriptManager> script_mgr_;
   std::unique_ptr<UpdateManager> update_mgr_;
   std::unique_ptr<LockManager> lock_manager_;
+  // Declared after lock_manager_ and subscription_mgr_, which it uses: destroyed before both.
+  std::unique_ptr<LockReaper> lock_reaper_;
 
   // Trigger infrastructure (destroyed after rest_server_)
   std::unique_ptr<ResourceChangeNotifier> resource_change_notifier_;
   std::unique_ptr<ConditionRegistry> condition_registry_;
-  std::unique_ptr<TriggerStore> trigger_store_;
-  std::unique_ptr<TriggerManager> trigger_mgr_;
+  TriggerHost trigger_host_;
   std::unique_ptr<TriggerFaultSubscriber> trigger_fault_subscriber_;
+  // Zero-config freeze-frames for plugin-backed entities (nullptr when disabled)
+  std::unique_ptr<EntityFreezeFrameCapture> entity_freeze_frame_capture_;
+  // Destroyed after rest_server_, whose SSE fault handler holds a subscription to it.
+  std::unique_ptr<Ros2FaultEventSource> fault_event_source_;
+  // Threshold-rule engine and its evaluation loop. Reset in ~GatewayNode
+  // BEFORE plugin/fault shutdown.
+  std::unique_ptr<FaultTriggerHost> fault_trigger_host_;
   std::unique_ptr<TriggerTopicSubscriber> trigger_topic_subscriber_;
   // Adapter routing manager-side subscribe() calls onto trigger_topic_subscriber_.
   std::shared_ptr<ros2::Ros2TopicSubscriptionTransport> trigger_topic_transport_;
 
-  // Aggregation infrastructure (destroyed in order: mdns -> rest_server -> aggregation)
-  // mDNS threads must stop before rest_server to avoid callbacks during shutdown.
+  // Aggregation infrastructure (destroyed in order: rest_server -> aggregation)
+  // The host stops its mDNS threads in ~GatewayNode, before rest_server, to avoid callbacks during shutdown.
   // AggregationManager must outlive rest_server because handlers reference it.
-  std::unique_ptr<AggregationManager> aggregation_mgr_;
-  std::unique_ptr<MdnsDiscovery> mdns_discovery_;
+  std::unique_ptr<AggregationHost> aggregation_host_;
 
   std::unique_ptr<RESTServer> rest_server_;
 
@@ -356,6 +524,9 @@ class GatewayNode : public rclcpp::Node {
   // One-shot WARN when entity_cache capacity is exceeded (grew on first refresh after reserve).
   // Cleared only at construction time; never reset so the WARN fires at most once per run.
   bool warned_cache_grow_{false};
+  /// Declared apps the helper-node rule last warned about, so a static
+  /// misconfiguration is reported when it appears or changes, not every refresh.
+  std::set<std::string> warned_helper_bound_apps_;
 
   // Graph-change-driven discovery refresh.
   //
@@ -406,26 +577,73 @@ class GatewayNode : public rclcpp::Node {
   // Timer for periodic cleanup of expired cyclic subscriptions
   rclcpp::TimerBase::SharedPtr subscription_cleanup_timer_;
 
-  // Timer for periodic cleanup of expired locks
-  rclcpp::TimerBase::SharedPtr lock_cleanup_timer_;
-
   // REST server thread management
   std::unique_ptr<std::thread> server_thread_;
 };
 
+using ros2_common::is_own_gateway_helper_node;
+
 /**
  * @brief Filter ROS 2 internal nodes from an app list
  *
- * Removes apps whose base name begins with '_' (ROS 2 internal node convention).
- * For remote (peer-prefixed) apps, the peer prefix ("peer_name__") is stripped
- * before checking for the underscore prefix, using the routing table for precise
- * prefix detection.
+ * Removes ROS 2 internal nodes, whose name begins with '_'. A runtime app
+ * (source discovery::kRuntimeAppSource) is judged by the node name in its FQN
+ * only, because a name collision prefixes its id with the namespace. Every
+ * other app is judged by its id.
+ *
+ * Also removes local apps bound to one of the gateway's in-process helper nodes
+ * (is_own_gateway_helper_node), whatever their id or source. The gateway's own
+ * node is NOT removed - it is a diagnosable App whose ROS parameters are served
+ * as its configurations.
+ *
+ * Apps with a routing-table entry came from a peer, which filtered them by its
+ * own rules. They are kept.
  *
  * @param apps App vector to filter in place
- * @param peer_routing_table Maps entity_id -> peer_name for remote entities
+ * @param peer_routing_table Maps entity_id -> peer_name for remote entities, which are kept
+ * @param self_fqn The gateway node's own FQN. Empty disables the helper check
+ * @param dropped_declared_apps Optional sink for "<app id> -> <node fqn>" of
+ *        every app removed by the helper rule whose source is not runtime
+ *        discovery. Removing a declared entity silently would override the
+ *        manifest without saying so, and this function has no logger
  * @return Number of apps removed
  */
 size_t filter_internal_node_apps(std::vector<App> & apps,
-                                 const std::unordered_map<std::string, std::string> & peer_routing_table);
+                                 const std::unordered_map<std::string, std::string> & peer_routing_table,
+                                 const std::string & self_fqn,
+                                 std::vector<std::string> * dropped_declared_apps = nullptr);
+
+/**
+ * @brief Remember which declared apps were dropped, and say whether that changed
+ *
+ * The condition this gates is a static misconfiguration, while the caller runs
+ * on every graph event and on the refresh cadence, so warning per call would
+ * repeat the same line for the life of the process. Returns true only when the
+ * set differs from the remembered one and is not empty; the remembered set is
+ * updated either way, so a condition that clears and returns is reported again.
+ *
+ * @param dropped App ids (with their bound FQNs) dropped by the helper rule
+ * @param remembered In/out: the set the caller last warned about
+ * @return true when the caller should warn
+ */
+bool remember_dropped_declared_apps(const std::vector<std::string> & dropped, std::set<std::string> & remembered);
+
+/**
+ * @brief Keep only the Function hosts that name a served App or Component
+ *
+ * Runs once, after every filter and merge. Removes every host id that names
+ * neither an App in `apps` nor a Component in `components`. Drops a Function
+ * whose id is in `introspection_only_ids` once it has no hosts. A Function
+ * anything else contributed to stays, with or without hosts.
+ *
+ * @param functions Function vector to prune in place
+ * @param apps The Apps the gateway serves
+ * @param components The Components the gateway serves
+ * @param introspection_only_ids Ids of the Functions only runtime
+ *        introspection created
+ */
+void keep_served_function_hosts(std::vector<Function> & functions, const std::vector<App> & apps,
+                                const std::vector<Component> & components,
+                                const std::unordered_set<std::string> & introspection_only_ids);
 
 }  // namespace ros2_medkit_gateway
