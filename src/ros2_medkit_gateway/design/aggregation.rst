@@ -31,7 +31,7 @@ not need to know which gateway owns which entity.
 
    package "Primary Gateway" {
        class AggregationManager {
-           + fetch_all_peer_entities()
+           + fetch_and_merge_peer_entities()
            + fan_out_get()
            + forward_request()
            + check_all_health()
@@ -163,7 +163,8 @@ entities instead.
 Resource Collections on Functions and Areas
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Functions and Areas support the same resource collections as Components and Apps:
+Functions and Areas expose the aggregating subset of the collections Components
+and Apps expose:
 
 - **data** - Aggregated topic data from all hosted entities
 - **operations** - Aggregated services and actions from hosted entities
@@ -171,9 +172,18 @@ Functions and Areas support the same resource collections as Components and Apps
 - **faults** - Aggregated faults from hosted entities
 - **logs** - Aggregated log entries from hosted entities
 
-Requests to ``/functions/{id}/data`` are fan-out queries that collect data from
-all entities listed in the Function's ``hosts`` field. Similarly, Area resource
-collection requests aggregate from all Components contained in that Area.
+They do not expose ``locks`` or ``scripts`` (components and apps only), nor
+``fault-triggers`` (apps only); Areas additionally have no
+``cyclic-subscriptions``. What each entity type serves - and therefore what it
+advertises in its ``capabilities`` array - is the matrix in
+:ref:`sovd-compliance`.
+
+A request to ``/functions/{id}/data`` collects data from the hosts this gateway
+serves and fans out to every peer that contributes to the Function (see
+:ref:`per-entity fan-out <aggregation-fan-out>`). Each peer answers with its own
+view, so a peer can return data of an App this gateway does not list as a host.
+Similarly, Area resource collection requests aggregate from all Components
+contained in that Area.
 
 Entity Merge Logic
 ------------------
@@ -260,7 +270,11 @@ classification pass over the full Component set:
 
 - **Functions**: Merge by ID, combining the ``hosts`` lists from both sides.
   If both gateways expose a ``navigation`` Function, the merged entity lists
-  hosts from both gateways. Same ownership semantics as Areas.
+  hosts from both gateways. Same ownership semantics as Areas. A peer host that
+  names a peer App the App merge prefixed takes the prefixed id, so it cannot
+  bind to the local App with the same id. The merge keeps the other hosts as
+  the peer listed them. After the merge and the internal-node filter, the
+  gateway keeps only the hosts that name an App or Component it serves.
 
 - **Components**: Merge by ID, combining tags and metadata. Components
   represent either a single physical ECU *or* a hierarchical parent that
@@ -409,20 +423,252 @@ maps to a peer, the request is forwarded transparently:
 
    @enduml
 
+Member Dispatch
+---------------
+
+The routing table answers "who owns this entity", and for an entity that draws
+its resources from members that question has no single answer: an Area, a
+merged Function and a hierarchical parent Component all have members on both
+sides of the link, which is exactly why they are deliberately absent from the
+table. Routing one of them whole would hand the request to one peer and discard
+every member the other contributors hold.
+
+A request naming one member is a different question, and it does have a single
+answer. ``HandlerContext::dispatch_to_member`` re-addresses such a request to
+the member's own entity route - ``/apps/{member}/...`` or
+``/components/{member}/...`` - on the gateway the routing table names for that
+member:
+
+.. code-block:: text
+
+   POST /api/v1/functions/vehicle_health/operations/peer_calibration:calibrate/executions
+     -> POST /api/v1/apps/peer_calibration/operations/calibrate/executions   (on the peer)
+
+   GET  /api/v1/functions/vehicle_health/data/pressure_sensor:chassis/brakes/pressure
+     -> GET  /api/v1/apps/pressure_sensor/data/chassis/brakes/pressure       (on the peer)
+
+   PUT  /api/v1/functions/vehicle_health/configurations/peer_calibration:calibration_offset
+     -> PUT  /api/v1/apps/peer_calibration/configurations/calibration_offset (on the peer)
+
+An id with no member half is the same question asked differently, and it has to
+have the same answer. Qualification follows ambiguity, so an item a single member
+provides keeps its bare id, and that bare id is what the collection hands a
+client - it has to reach the owner too, or the most ordinary item in an
+aggregating entity is the one that cannot be read. Each collection recovers the
+owner from what the tree already records:
+``AggregatedOperations::owner_by_path`` maps a ROS path to the member that owns
+the operation, and ``AggregatedData::owners_by_topic`` maps a topic path to the
+members that provide it. The dispatch is then identical:
+
+.. code-block:: text
+
+   GET  /api/v1/functions/vehicle_health/data/chassis%2Fbrakes%2Fpressure
+     -> GET  /api/v1/apps/pressure_sensor/data/chassis/brakes/pressure       (on the peer)
+
+A topic differs from an operation in having a LIST of owners, because one topic
+that a member publishes and another subscribes to is one item. That list settles
+where, not how many: an owner this gateway runs means the topic is on this graph
+and is sampled here; owners all on one peer mean the topic is on that peer, and
+any one of them addresses it there; owners spread across gateways mean the bare
+id names no single place, and the local graph answers it as it always did.
+
+A member half a peer supplied is read through the collision rename before it
+means anything here. A peer describes its own tree in its own names, and an App
+whose id collided with a local one was merged under ``<peer>__<id>``, so the
+name the peer sends names the LOCAL leaf on this gateway. ``fan_out_get``
+therefore records the peer each item came from in
+``FanOutResult::item_peers``, and ``AggregationManager::local_member_id``
+resolves that name against the routing table: an item arriving through the
+fan-out is re-attributed to the id the merge gave its owner, in
+``x-medkit.member_ids`` and in the member half of the item id, before any of it
+is offered to a client. Read verbatim instead, the peer's item is attributed to
+a member that does not own it, the collection offers one id for two operations,
+and the peer's copy is not addressable through the aggregate at all.
+
+Each collection keeps its own id scheme and each hands the same two halves to
+the dispatch. ``/data`` and ``/operations`` qualify only an ambiguous id and
+carry ``x-medkit.member_ids``; ``/configurations`` qualifies every id on a
+multi-node entity as ``<app_id>:<param_name>`` and carries
+``x-medkit.source``. What the two schemes agree on is what the dispatch needs:
+the member half is an entity id, and the item half is the id the member's own
+route uses. Nothing on the owning gateway is aggregating, so the item half is
+sent bare - a parameter as its plain name, a topic as its plain path.
+
+Which half is which is decided from the entity's MEMBER SET, not from the number
+of ROS nodes the local walk resolves for the entity. The two answer different
+questions. A member another gateway runs announces no ROS binding, so it
+contributes no node here: the node count measures how much of the entity is
+local, and reading an id from it refuses the qualified form on exactly the two
+deployments that need it most - an aggregator that runs no node of its own,
+where the count is zero, and a gateway running one node beside peer-owned
+members, where the count is one. The member set includes what the peers
+contributed, so it says the same thing on every deployment.
+
+A prefix that names no member is part of the parameter name. That is what makes
+the rule self-protecting: a parameter whose own name contains a colon stays
+addressable, and no id that resolves today moves, because a split only happens
+where the prefix matches a real member. An entity's own id is not a member half
+of itself - it separates nothing - and a member half with an empty item after it
+is not one either, since one path segment shorter is the member's configurations
+COLLECTION and answering there would hand a list to a caller that asked for one
+value.
+
+An operation's item half is its short name, except where the member carrying it
+exposes that short name at more than one ROS path. There the member half names
+one member for both copies and cannot separate them, so the item half is the
+ROS path with its leading slash stripped - and it stays that on the member's own
+route too, because the member has the same two operations under the same short
+name:
+
+.. code-block:: text
+
+   POST /api/v1/components/vehicle-ecu/operations/dual_calibration:testrig/dual/left/calibrate/executions
+     -> POST /api/v1/apps/dual_calibration/operations/testrig/dual/left/calibrate/executions
+
+The executions of an operation are addressed the same way, and dispatched for
+the same reason. A goal lives on the gateway that sent it - the one the ``POST``
+was dispatched to - so listing it has to reach that gateway too:
+
+.. code-block:: text
+
+   GET /api/v1/functions/vehicle_health/operations/peer_long_calibration:long_calibration/executions
+     -> GET /api/v1/apps/peer_long_calibration/operations/long_calibration/executions
+
+Answering that from the aggregator's own goal tracking returns an empty
+collection for goals that exist, which reads as "this operation has never been
+run".
+
+Every verb that takes one of those execution ids back resolves it the same way,
+for the same reason - ``GET`` for its status, ``PUT`` to apply a capability and
+``DELETE`` to cancel:
+
+.. code-block:: text
+
+   GET /api/v1/functions/vehicle_health/operations/peer_long_calibration:long_calibration/executions/{exec}
+     -> GET /api/v1/apps/peer_long_calibration/operations/long_calibration/executions/{exec}
+
+An id that does not resolve to exactly one owned operation is left to the local
+path, whose key is the execution id alone: resolving is how the owning gateway
+is found, not a second place for these routes to refuse a request. So a
+locally-owned execution is answered here exactly as before, and an id naming no
+goal gets the same ``404`` it always did.
+
+The peer's ``Location`` header is carried back through the forward, because it
+names the member's own route - a path the aggregator resolves to the same
+member - and it is the only address of a resource that lives on the other side.
+
+The member's own gateway is the only one that can answer: the ROS service, the
+topic and the parameter behind the id exist on its graph and nowhere else. What
+this gateway holds for a peer-owned member is a declaration, which is why the
+local walk's record of "does this member provide this item" is consulted only
+once the member is known to be served here. What that declaration carries is
+whatever the peer last reported - the topics and operations it has, and no node
+FQN to ask for a parameter - so a member whose report has not arrived yet, or
+whose parameters were never in it, would have every one of its items read as a
+miss.
+
+The order inside ``dispatch_to_member`` is load-bearing:
+
+1. **Reachability, before anything is sent.** A member retained while its
+   gateway is silent is answered from what it declared: ``504`` with the SOVD
+   code ``not-responding``, naming the member. Forwarding to a dead peer instead
+   produces a socket failure dressed as ``502``, which reports this gateway as
+   broken rather than the link as down.
+2. **Ownership.** No routing entry means this gateway owns the member and the
+   handler carries on.
+3. **Addressing.** The member is looked up in the cache to decide whether it is
+   an App or a Component, because that decides which collection its route lives
+   under.
+4. **Forward.** ``AggregationManager::forward_request`` is called with the
+   built path. The overload taking an explicit target applies the same
+   ``/api/v1/`` SSRF guard and the same ``<peer>__`` prefix rewrite to that path
+   as the two-argument form applies to the incoming one - the target is
+   assembled from client-supplied ids and is exactly as untrusted.
+
+Reset-all, ``DELETE /{entity}/configurations``, is not a member-qualified
+request and does not go through this dispatch: it names no member, and its
+members can sit on several gateways at once, so there is no single owner to hand
+it to. This gateway resets what it runs, by calling the parameter services on
+its own ROS graph. A member owned by a peer is therefore not reset, and the
+response says so rather than implying otherwise - ``207`` with that member named
+and its owning gateway named with it, instead of a ``204`` that would report a
+reset of parameters the entity lists and this request never touched.
+
+The wire is committed by the forward, so the handler returns
+``HandlerContext::forwarded_sentinel_error()``: the typed router recognises the
+``x-medkit-internal-forwarded`` code and renders nothing, the same channel the
+remote-entity branch of ``validate_entity_for_route`` uses.
+
+Termination does not depend on a hop count. The target is the member's own route
+on the gateway that owns it, and there that entity is local, so the receiving
+gateway serves it rather than forwarding again. A ``X-Medkit-No-Fan-Out`` header
+on the incoming request is propagated but does not suppress the dispatch:
+suppression bounds collection fan-out, while a member-qualified request names
+its owner and is one hop by construction.
+
 **Entity collection endpoints** (``GET /api/v1/areas``, ``/components``,
 ``/apps``, ``/functions``) serve from the local entity cache, which is
 populated during periodic cache refresh cycles that fetch entities from all
 healthy peers.
 
+.. _aggregation-fan-out:
+
 **Per-entity resource collections** (data, operations, faults, configurations,
-logs) and the global ``GET /api/v1/faults`` endpoint use real-time **fan-out**
-via ``fan_out_get()`` (handlers call the ``merge_peer_items()`` helper from
-``fan_out_helpers.hpp``): the primary gateway sends the same request to all
+logs) use real-time **fan-out** via ``fan_out_get()``, reached through the
+``merge_peer_items()`` / ``fan_out_collection()`` helpers in
+``fan_out_helpers.hpp``: the primary gateway sends the same request to all
 healthy peers, collects the responses, and merges the ``items`` arrays. If some
 peers fail, the response body includes ``x-medkit.partial: true`` and
-``x-medkit.failed_peers``. Fan-out requests include an
-``X-Medkit-No-Fan-Out`` header to prevent recursive loops when peers have
-bidirectional aggregation.
+``x-medkit.failed_peers``. Fan-out requests carry an ``X-Medkit-No-Fan-Out``
+header, and both helpers return early when the incoming request has it, so a
+peer that aggregates back never fans out a second time. These routes and the
+global fault list below are the ones that declare the header in the OpenAPI
+document (``RouteEntry::fan_out_aware()``).
+
+**The global fault list** (``GET /api/v1/faults``) fans out as well, but it
+cannot stop at the first peer. There is no routing table behind it: in a chain
+A -> B -> C the only way A lists C's faults is for B to ask C. So
+``FaultHandlers::list_all_faults`` (and ``PluginContext::list_all_faults``,
+which calls the same route on the peers) sends ``X-Medkit-Fan-Out-Visited``
+next to ``X-Medkit-No-Fan-Out``. The header carries the instance ids of the
+gateways the request has passed through. Each ``AggregationManager`` generates
+its id at startup, because a peer name is what the aggregator calls a peer and
+a gateway cannot recognise itself by it. It publishes the id as
+``x-medkit-instance-id`` on ``/health``, and ``PeerClient::check_health``
+records each peer's. ``plan_global_fault_fan_out()`` in ``fan_out_helpers.hpp``
+reads the request:
+
+- No visited path and no ``X-Medkit-No-Fan-Out``: a client request. Answer
+  locally and fan out with the path set to this gateway's id.
+- Visited path that does not name this gateway: answer locally and fan out
+  with this gateway's id added. ``X-Medkit-No-Fan-Out`` is ignored here,
+  because ``fan_out_get()`` puts it on every peer request.
+- Visited path that names this gateway: the request came back round a loop.
+  Answer ``200`` with an empty list, since this gateway's faults are already
+  in the answer the first pass is building.
+- A path of 16 ids, or one holding an id longer than 64 characters: answer
+  locally, do not extend it, and report every healthy peer as failed with
+  reason ``too-deep``, so a truncated list is not reported complete.
+- ``X-Medkit-No-Fan-Out`` alone: answer locally only. That is a client opting
+  out, or a gateway that predates the visited path.
+
+``fan_out_get()`` does not send the request to a peer whose recorded id is on
+the path. Two gateways that aggregate each other therefore do not ask each
+other twice: A asks B with ``[A]``, and B asks only its other peers. This
+matters for more than latency. A is holding a worker while it waits for B, so
+a request sent back to A could only be answered once another of A's workers
+is free. Under as many concurrent requests as A has workers, none would be,
+and every one would wait for the peer timeout. The empty answer for a gateway
+that finds itself on the path covers a peer whose id is not known yet (before
+its first health check) or one that predates the id.
+
+A peer that answers partial makes the result partial too. Its failed peers are
+named ``<peer>/<its peer>`` with the reason it gave, so a dead gateway at the
+end of a chain shows up at the head. ``x-medkit.count`` is the length of the
+merged ``items``.
+
+The path does not deduplicate a gateway reached over two different routes in
+the same request (A -> B -> C plus A -> C): C answers both, as it did before.
 
 **Target-filtered fan-out.** For per-entity paths, ``merge_peer_items()``
 asks ``AggregationManager::get_peer_contributors(id)`` for the list of
@@ -511,7 +757,80 @@ GETs ``/api/v1/health`` on its peer. If the health check fails, the peer is
 marked unhealthy and excluded from fan-out queries and entity fetching.
 
 When a peer recovers (health check succeeds again), it is automatically
-re-included.
+re-included: the next refresh fetches it like any other healthy peer, and since
+a retained declaration is replayed only for a peer that could not be read that
+cycle, the live answer replaces the retained one wholesale rather than being
+merged beside it. ``x-medkit.available`` therefore clears on that same refresh,
+and the entities the peer only discovered at runtime - dropped while it was
+silent - are merged again with it. ``x-medkit.is_online`` is read off the wire
+as the peer's own account of an App, not as a statement about the link, so an
+App on a gateway that has just restarted stays ``false`` for however many
+refreshes that gateway needs to relink its ROS graph, and then turns true.
+
+``PeerClient::fetch_entities()`` reads a peer over several requests and either
+describes it whole or reports failure: a dead connection, a status a route has
+no other meaning for, an oversized body or unparsable JSON on any of them fails
+the fetch, because a picture missing a branch is indistinguishable on the wire
+from a peer that does not have that branch. Two statuses carry a meaning of
+their own: a ``404`` on a nested collection route (``/subareas``,
+``/subcomponents``, an app's ``/operations`` or ``/data``) identifies a peer
+running a
+gateway that predates the route and is reported in
+``PeerEntities::absent_routes`` for the caller to log; a ``504`` with error code
+``not-responding`` on any route hanging off an entity - its detail, or one of
+its nested collections - is the peer reporting that the gateway contributing
+that entity has gone quiet, which is what a middle gateway in a chain answers
+for a declaration it is retaining. The entity is kept as the list named it and
+marked unavailable, and a nested collection answering that way costs the members
+that route carries and nothing else. Read as a failed request instead, one
+unreachable member anywhere behind a peer would discard that peer's whole
+picture on every refresh, and the aggregator would go on serving its last
+pre-failure view indefinitely. A ``504`` that does not carry
+``not-responding`` says nothing about an entity and still fails the fetch.
+
+Two of those requests are made per App: its ``/operations`` and its ``/data``.
+Neither collection is ever declared in a manifest - both are discovered from the
+ROS graph - so what the peer reports on those routes is the only record of them
+this gateway can have, and both records are what addressing is built on. Without
+the operations, ambiguity between two members sharing an operation short name
+could only be settled by asking at request time, and an answer that depends on
+who is reachable is not one a client can rely on. Without the topics, nothing
+here maps a peer's topic to the member that provides it, so the bare path a
+single-provider topic is listed under resolves to no owner, is served from the
+local graph, and is refused as an unknown topic while the member and its gateway
+are both healthy. Both requests carry ``X-Medkit-No-Fan-Out``, which keeps the
+peer from re-asking ITS peers: each gateway reports what it holds, the hop that
+owns an entity is the hop that answers for it, and that is also what makes the
+walk terminate.
+
+Availability travels the same way in the other direction. ``x-medkit.available``
+is emitted only when false, so absence means reachable, and both
+``parse_component`` and ``parse_app`` read it back with a default of ``true``.
+Without that, a chain of three gateways loses the fact at the second hop: an App
+still carries ``is_online``, but a Component has no other signal, and the head of
+the chain would report an unreachable leaf as reachable. Local retention only
+ever sets the flag false and never back to true, so a peer's own statement that
+something it holds is unreachable survives being replayed, and where the marking
+does apply over a peer's ``available`` it is because the peer itself stopped
+answering - the stronger statement, since everything it holds sits behind the
+link that is down.
+``AggregationManager`` never records a failed fetch as the peer's declaration,
+so the last complete one survives; it re-checks that peer's health to decide
+whether to replay it marked unavailable (health check failed) or exactly as it
+was last read (health check still passes).
+
+The same field on a listed ITEM answers for that item's member and for nothing
+else. ``/operations`` and ``/data`` hold back the copies their declared tree
+carries for peer-owned members and offer them only when the fan-out did not bring
+the owner's own copy - keyed on the full ROS path, which is what makes two copies
+one item - and whether such a copy is marked unavailable is decided from
+the member's reachability - the same reading ``dispatch_to_member`` acts on, so
+the listing and the request cannot disagree. A fan-out that produced nothing is
+not evidence on its own: it also never runs when no peer contributes the entity,
+which is the ordinary shape of a grouping declared on this gateway alone that
+hosts a member another gateway runs. Deciding from the fan-out there marks every
+peer-owned item of that entity unreachable while its gateway is answering
+normally.
 
 The aggregator also publishes its own ``/health`` response with two
 additional fields when aggregation is enabled (x-medkit extensions on our
@@ -535,11 +854,40 @@ detection algorithm and the fall-back routing behaviour.
 Stream Proxy
 ~~~~~~~~~~~~
 
-For streaming connections (e.g., SSE fault subscriptions), the ``StreamProxy``
-interface provides transport-agnostic event proxying. The ``SSEStreamProxy``
-implementation connects to a peer's SSE endpoint and relays events back to the
-primary gateway's client. Each ``StreamEvent`` carries the ``peer_name`` so the
+For streaming connections, the ``StreamProxy`` interface provides
+transport-agnostic event proxying. The ``SSEStreamProxy`` implementation
+connects to a peer's SSE endpoint and relays events back to the primary
+gateway's client. Each ``StreamEvent`` carries the ``peer_name`` so the
 aggregator can attribute events to their source.
+
+``GET /faults/stream`` on an aggregating gateway uses it. An aggregator runs on
+its own ROS domain with its own ``fault_manager``, which no producer reports
+to, so a stream fed from the local graph alone is open, valid and silent - and
+a silent stream reads to a client exactly like a healthy system. ``GET
+/faults`` already fans out; ``PeerFaultRelay`` gives the stream the same
+answer.
+
+Lifecycle and the three constraints that shape it:
+
+* **Opened on the first client, closed with the last.** A relayed stream holds
+  one SSE client slot on every peer for as long as it is open, and
+  ``sse.max_clients`` defaults to 2. An aggregator nobody is watching therefore
+  holds none.
+* **Reconciled from the streaming loop.** Peers that appear or go away are
+  picked up on a later wakeup: the loop wakes on every event and at least once
+  per keepalive interval, and reconciliation itself runs at most once a second
+  so a burst of events does not become a burst of lock acquisitions. Only the
+  first attached client forces it immediately. No timer of its own.
+* **Loop suppression is the same mechanism the collections use.** The relay's
+  own request carries ``X-Medkit-No-Fan-Out``, and a stream request carrying
+  that header is served from the local graph only. Without it a chain of
+  aggregating gateways would relay one event round the loop.
+
+Each relayed event goes out under the aggregator's own event id, carrying the
+peer's payload with ``x-medkit.peer`` added. **Replay covers this gateway's own
+ids only.** Two peers number their events independently, so a ``Last-Event-ID``
+cannot address a position in a merged stream; a reconnecting client resumes
+from what the aggregator has buffered, not from each peer's own history.
 
 Deployment Topologies
 ---------------------
@@ -635,7 +983,14 @@ Key Classes
 ``StreamProxy`` / ``SSEStreamProxy``
     Transport-agnostic interface for proxying streaming connections to peers.
     ``SSEStreamProxy`` implements SSE-based event relaying with a background
-    reader thread.
+    reader thread that reconnects with exponential backoff.
+
+``PeerFaultRelay``
+    Holds one ``SSEStreamProxy`` per healthy peer for as long as a client is
+    attached to this gateway's ``/faults/stream``, and hands each event to the
+    handler that owns the local replay buffer. Takes its peer list through a
+    supplier callback rather than from ``AggregationManager`` directly, because
+    it lives in the ROS-neutral core.
 
 ``HostInfoProvider``
     Reads local host system info (hostname, OS, architecture) and produces a
@@ -733,4 +1088,6 @@ Function Host Remapping
 When App ID collision causes prefixing (e.g., ``camera_driver`` becomes
 ``peer_b__camera_driver``), Function entities that reference the original App ID
 in their ``hosts`` list are automatically remapped to use the prefixed ID. This
-ensures Function host references remain valid after merge.
+ensures Function host references remain valid after merge. The hosts are not
+reduced at this point: the one pass at the end of the cache refresh removes
+every host that names no served App or Component.

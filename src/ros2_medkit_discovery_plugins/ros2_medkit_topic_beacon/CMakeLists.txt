@@ -23,6 +23,8 @@ find_package(ros2_medkit_cmake REQUIRED)
 include(ROS2MedkitCompat)
 include(ROS2MedkitCcache)
 include(ROS2MedkitSanitizers)
+include(ROS2MedkitCoverage)
+include(ROS2MedkitLinting)
 include(ROS2MedkitWarnings)
 
 find_package(ament_cmake REQUIRED)
@@ -79,17 +81,17 @@ if(BUILD_TESTING)
     file(GLOB_RECURSE _format_files
       "include/*.hpp" "src/*.cpp" "test/*.cpp"
     )
+    medkit_lint_config(.clang-format _clang_format_config)
     ament_clang_format(${_format_files}
-      CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.clang-format")
+      CONFIG_FILE "${_clang_format_config}")
   endif()
 
   find_package(ament_cmake_gtest REQUIRED)
 
   include(ROS2MedkitTestDomain)
-  medkit_init_test_domains(START 110 END 119)
 
   # Include plugin source in test (plugin is MODULE/dlopen, test instantiates directly)
-  ament_add_gtest(test_topic_beacon_plugin
+  medkit_add_gtest(test_topic_beacon_plugin
     test/test_topic_beacon_plugin.cpp
     src/topic_beacon_plugin.cpp
     TIMEOUT 30)
@@ -100,7 +102,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_topic_beacon_plugin
     nlohmann_json::nlohmann_json
     ros2_medkit_beacon_common::beacon_common_lib)
-  medkit_set_test_domain(test_topic_beacon_plugin)
   ros2_medkit_relax_vendor_warnings()
 endif()
 

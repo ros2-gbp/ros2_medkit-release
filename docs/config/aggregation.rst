@@ -59,9 +59,40 @@ Core Parameters
    * - ``aggregation.timeout_ms``
      - int
      - ``2000``
-     - HTTP timeout in milliseconds for all peer communication: health checks,
-       entity fetching, and request forwarding. Increase for high-latency
-       networks.
+     - Connect budget for every peer call, and the read budget for reading a
+       peer's description of itself: entity fetching and the collection fan-out
+       a client waits on across every peer at once. Increase for high-latency
+       networks. The health check is the exception: it caps both its budgets at
+       1000 ms, because an unresponsive peer is unhealthy whether the gateway
+       waits one second or five, and the wait bounds how long shutdown takes.
+       Range 100-600000; a value outside it is clamped to the nearest end, and
+       the clamp is logged when aggregation is enabled.
+   * - ``aggregation.forward_timeout_ms``
+     - int
+     - ``15000``
+     - Read budget for a forwarded request - an operation execution, or a read
+       of a large resource - on the gateway that owns it. What this waits for
+       is the peer doing that work, so it is sized above a peer gateway's own
+       ``service_call_timeout_sec`` default of 10 s. A value below
+       ``aggregation.timeout_ms`` is raised to it and the change is logged: a
+       forwarded request must not be cut off sooner than a metadata read.
+       Range 100-600000, clamped and logged as above.
+   * - ``aggregation.write_timeout_ms``
+     - int
+     - ``5000``
+     - Budget for pushing a request body to a peer. Raise it when forwarding
+       large uploads over a slow link. Range 100-600000, clamped and logged as
+       above.
+
+.. note::
+
+   These three are separate because they bound different things. One value
+   serving as connect, metadata read and forward read at once gives an
+   operation on a peer the budget of a listing, and the peer is then reported
+   as unavailable while it is still working. Raising that one value also
+   cannot reach the write budget, which is its own key: before it existed the
+   write timeout stayed at the HTTP client library's default and followed
+   nothing.
 
 mDNS Discovery Parameters
 --------------------------
@@ -123,6 +154,30 @@ for peer communication.
        ``false`` (default), auth tokens are **never** sent to peers - this
        prevents token leakage to untrusted or mDNS-discovered peers. Only
        enable when all peers are trusted and share the same JWT configuration.
+   * - ``aggregation.peer_auth_header``
+     - string
+     - ``""``
+     - What this gateway presents as ``Authorization`` on connections it opens
+       on its **own** behalf rather than for a request it is serving. The fault
+       stream relay is the one that needs it: an aggregator holds one stream per
+       peer, opened when the first local client attaches and shared by every
+       client after it, so there is no single client whose token it could carry.
+       It is presented on every connection this gateway opens for itself: the
+       peer health check, the entity fetch behind aggregation, the relay, and
+       any forward whose caller sent no credential to pass on. Leave it empty
+       unless the peers require authentication; while it is empty, such a peer
+       answers 401, is recorded as offline, and contributes neither entities
+       nor events.
+
+       Sent **only to peers named in the configuration**. A peer discovered
+       over mDNS never receives it, because it is not one the operator vouched
+       for - so a discovered peer that requires authentication stays
+       unreachable rather than being handed this gateway's credential. The
+       value is redacted from the configurations API, like ``auth.jwt_secret``.
+
+       This is separate from ``forward_auth``, which forwards an end user's
+       token per request. Where both apply, a caller's own token wins, so
+       ``forward_auth`` goes on naming the end user to the peer.
    * - ``aggregation.require_tls``
      - bool
      - ``false``
@@ -140,7 +195,8 @@ for peer communication.
    * - ``aggregation.max_discovered_peers``
      - int
      - ``50``
-     - Maximum number of peers that can be added via mDNS discovery. Prevents
+     - Maximum number of peers that can be added via mDNS discovery. Range:
+       1-1000, clamped with a warning. Prevents
        unbounded growth of the peer list from rogue mDNS announcements on the
        local network. Static peers (configured via ``peer_urls``/``peer_names``)
        do not count against this limit. When the limit is reached, additional
@@ -311,6 +367,16 @@ Combine static peers for known infrastructure with mDNS for dynamic discovery:
    configuration. See :ref:`Security Parameters <aggregation-security>`
    for details on securing peer communication.
 
+.. note::
+
+   ``X-Client-Id`` is always forwarded, and is not governed by
+   ``forward_auth``. It names the caller rather than granting it anything:
+   a lock on a peer-owned entity is held on the peer and judged there, so a
+   forwarded request that arrived without the name would be a different
+   caller than the one holding the lock. Authority still travels only in
+   ``Authorization``, which is forwarded when the deployment says the peer
+   is trusted with it.
+
 Secure Aggregation (TLS + Auth)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -348,11 +414,59 @@ When aggregation is enabled, entities from peers are merged with local entities:
 - **Apps**: Prefixed on collision. If a remote App has the same ID as a local
   one, the remote App's ID is prefixed with ``peername__`` (double underscore).
   For example, App ``camera_driver`` from peer ``arm`` becomes
-  ``arm__camera_driver``. Apps represent individual ROS 2 nodes with unique
-  behavior.
+  ``arm__camera_driver``, and a Function host of that peer that names it does
+  too. Apps represent individual ROS 2 nodes with unique behavior. The
+  aggregator does not filter a peer's Apps again: the peer applied its own
+  ``filter_internal_nodes``.
 
 Requests for remote entities are transparently forwarded to the owning peer.
 The routing table maps entity IDs to peer names.
+
+An entity that draws its resources from members - an Area, a merged Function, a
+hierarchical parent Component - is deliberately absent from that table, because
+its members can sit on different gateways and routing it whole would discard
+every member the other contributors hold. A request that names one member is
+routed instead: it is re-addressed to that member's own entity route on the
+gateway that owns it, so
+
+.. code-block:: text
+
+   POST /api/v1/functions/vehicle_health/operations/peer_calibration:calibrate/executions
+
+becomes, on the peer that runs ``peer_calibration``,
+
+.. code-block:: text
+
+   POST /api/v1/apps/peer_calibration/operations/calibrate/executions
+
+The same routing applies to a single ``/data`` item and to a single
+``/configurations`` parameter. A configuration id is ``<app_id>:<param_name>``,
+and on the owning gateway the parameter is addressed by its bare name, so
+
+.. code-block:: text
+
+   PUT /api/v1/functions/vehicle_health/configurations/peer_calibration:calibration_offset
+
+becomes
+
+.. code-block:: text
+
+   PUT /api/v1/apps/peer_calibration/configurations/calibration_offset
+
+A member half is recognised when the text before the first colon names a member
+of the addressed entity, so the qualified form works on an aggregating entity
+whose members are all owned by peers - a parent gateway that runs no ROS node of
+its own - and on one that runs a single node beside peer-owned members. Neither
+shape changes the ids the entity's listing offers.
+
+``DELETE /api/v1/{entity_type}/{id}/configurations`` resets the nodes this
+gateway runs. A member another gateway runs is not reset by it, and the response
+says so: ``207`` instead of ``204``, with that member named and the gateway that
+owns it named with it.
+
+Reachability is answered before anything is forwarded, so a member whose gateway
+is silent gets ``504 not-responding`` rather than a ``502`` from a failed
+connection. A member this gateway owns is served here, unchanged.
 
 See :doc:`../design/ros2_medkit_gateway/aggregation` for detailed merge logic
 and architecture diagrams.
@@ -377,6 +491,14 @@ into the local response. This applies to:
 - ``GET /api/v1/{entity_type}/{id}/logs``
 - ``GET /api/v1/faults`` (global fault list)
 
+The global fault list reaches the whole chain: in A -> B -> C, ``GET
+/api/v1/faults`` on A lists the faults of A, B and C. Each gateway adds its own
+id to an ``X-Medkit-Fan-Out-Visited`` header on the peer requests and does not
+ask a peer whose id is already there. Two gateways that list each other as
+peers therefore do not pass the request back and forth. If B cannot reach C,
+A's answer is partial and names ``subsystem_b/subsystem_c`` in
+``failed_peers``.
+
 If a peer request fails during fan-out (peer unreachable or non-2xx response),
 the response body includes:
 
@@ -387,6 +509,62 @@ This allows clients to detect degraded responses and take appropriate
 action. Individual entity requests for remote entities (e.g.,
 ``GET /api/v1/apps/{id}``) return ``502 Bad Gateway`` if the owning peer
 is unreachable.
+
+Peer Refresh Completeness
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A cache refresh reads a peer over several requests: the four entity lists, the
+nested ``subareas`` and ``subcomponents`` collections, the per-entity detail
+that carries a Component's relationships and a Function's hosts, and each app's
+``operations``. If any of them cannot be read - connection failure, a status
+the route has no other meaning for, an oversized body, unparsable JSON - the
+refresh for that peer is discarded whole. A partial picture is never published
+as a complete one, and the peer's last complete declaration is left in place.
+
+What clients see then depends on the peer's health check:
+
+- Health check fails: the retained declaration is served with
+  ``x-medkit.available: false`` (and ``x-medkit.is_online: false`` for Apps),
+  because a request addressed there cannot arrive.
+- Health check passes: the retained declaration is served unchanged and the
+  incomplete refresh is logged at ``WARN``. Availability is untouched - the
+  peer can still be reached; this gateway merely failed to read all of it.
+
+A peer that starts answering again is read again on the next refresh, and a
+retained declaration is replayed only for a peer that could not be read - so
+the live answer replaces the retained one rather than being merged beside it.
+``x-medkit.available`` clears on that refresh, and the entities the peer only
+discovered at runtime, dropped while it was silent, are merged again with it.
+``x-medkit.is_online`` is the peer's own account of an App rather than a
+statement about the link, so after a gateway restart it stays ``false`` until
+that gateway has relinked its ROS graph.
+
+Two statuses are read rather than treated as failures:
+
+- ``404`` on a nested collection route means the peer runs a gateway version
+  that does not expose the route. Those members are omitted, the rest of the
+  peer merges normally, and the absent routes are logged once per refresh at
+  ``WARN``.
+- ``504`` with error code ``not-responding`` on any route hanging off an entity
+  - its detail, or one of its nested collections - means the peer holds that id
+  and the gateway contributing it has gone quiet, which is the answer an
+  aggregating peer gives for a declaration it is retaining. In a chain topology
+  this is how the far end reports a dead leaf, so the entity is kept as the
+  peer's list named it and marked ``x-medkit.available: false``. A nested
+  collection answering that way costs only the members that route carries;
+  treated as a failure it would discard the whole peer on every refresh, so one
+  unreachable member would freeze this gateway's view of everything that peer
+  holds. A ``504`` without ``not-responding`` is not a statement about an entity
+  and still discards the refresh.
+
+Availability is also read back off the wire. ``x-medkit.available`` is emitted
+only when false, so an absent field means the entity is reachable, and that is
+the default this gateway parses it with. It matters most beyond one hop: an App
+also carries ``x-medkit.is_online``, but a Component has no second signal, so
+without the read-back the head of a three-gateway chain reports a leaf behind a
+dead gateway as reachable. Retention never contradicts what a peer said - it
+only ever sets ``available`` to false, and it does so when the peer itself
+stopped answering, which already covers everything behind it.
 
 .. _aggregation-breaking-changes:
 
