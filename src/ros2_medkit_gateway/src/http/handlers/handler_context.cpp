@@ -19,12 +19,14 @@
 #include "ros2_medkit_gateway/aggregation/aggregation_manager.hpp"
 #include "ros2_medkit_gateway/core/entity_validation.hpp"
 #include "ros2_medkit_gateway/core/faults/fault_scope.hpp"
+#include "ros2_medkit_gateway/core/gateway_services.hpp"
 #include "ros2_medkit_gateway/core/http/error_codes.hpp"
 #include "ros2_medkit_gateway/core/managers/lock_manager.hpp"
 #include "ros2_medkit_gateway/core/models/entity_capabilities.hpp"
 #include "ros2_medkit_gateway/core/models/entity_types.hpp"
 #include "ros2_medkit_gateway/core/models/error_info.hpp"
-#include "ros2_medkit_gateway/gateway_node.hpp"
+#include "ros2_medkit_gateway/core/models/thread_safe_entity_cache.hpp"
+#include "ros2_medkit_gateway/core/plugins/plugin_manager.hpp"
 #include "ros2_medkit_gateway/http/detail/forward_response_scope.hpp"
 
 using json = nlohmann::json;
@@ -38,7 +40,7 @@ tl::expected<void, std::string> HandlerContext::validate_entity_id(const std::st
 
 tl::expected<std::string, std::string>
 HandlerContext::get_component_namespace_path(const std::string & component_id) const {
-  const auto & cache = node_->get_thread_safe_cache();
+  const auto & cache = services_.entity_cache();
   auto component = cache.get_component(component_id);
   if (component) {
     return component->namespace_path;
@@ -47,7 +49,7 @@ HandlerContext::get_component_namespace_path(const std::string & component_id) c
 }
 
 EntityInfo HandlerContext::get_entity_info(const std::string & entity_id, SovdEntityType expected_type) const {
-  const auto & cache = node_->get_thread_safe_cache();
+  const auto & cache = services_.entity_cache();
   EntityInfo info;
   info.id = entity_id;
 
@@ -63,7 +65,7 @@ EntityInfo HandlerContext::get_entity_info(const std::string & entity_id, SovdEn
     }
     // Check plugin ownership (only if not already a remote entity)
     if (!ei.is_remote) {
-      auto * pmgr = node_->get_plugin_manager();
+      auto * pmgr = services_.plugin_manager();
       if (pmgr) {
         auto owner = pmgr->get_entity_owner(ei.id);
         if (owner) {
@@ -208,10 +210,7 @@ tl::expected<void, ErrorInfo> HandlerContext::validate_lock_access(const http::T
                                                                    const EntityInfo & entity,
                                                                    const std::string & collection) {
   // Phase 1: If locking disabled, allow all access.
-  if (!node_) {
-    return {};
-  }
-  auto * lock_mgr = node_->get_lock_manager();
+  auto * lock_mgr = services_.lock_manager();
   if (!lock_mgr) {
     return {};
   }
@@ -313,6 +312,23 @@ http::ValidatorResult<EntityInfo> HandlerContext::validate_entity_for_route(cons
   // aggregation) the forwarding path returns Forwarded without mutating any
   // wire - the framework guarantees a sink whenever aggregation is active.
   if (entity_info.is_remote && aggregation_mgr_) {
+    // A retained entity is one its peer declared and is no longer answering
+    // for. Forwarding to that peer produces a connection failure dressed as a
+    // 502, which says the gateway had a problem rather than that the thing
+    // asked for is not reachable. The retained declaration is exactly the
+    // information needed to answer properly, so answer here.
+    if (!is_entity_available(entity_id)) {
+      ErrorInfo err;
+      err.code = ERR_NOT_RESPONDING;
+      err.message = "Member '" + entity_id + "' is not available";
+      err.http_status = 504;
+      err.params = json{{"entity_id", entity_id},
+                        {"peer", entity_info.peer_name},
+                        {"details",
+                         "The gateway contributing this entity is not answering; it is retained from its "
+                         "last known declaration"}};
+      return tl::unexpected(ErrorVariant{std::move(err)});
+    }
     if (tl_forward_response != nullptr) {
       aggregation_mgr_->forward_request(entity_info.peer_name, raw_req, *tl_forward_response);
     }
@@ -320,6 +336,77 @@ http::ValidatorResult<EntityInfo> HandlerContext::validate_entity_for_route(cons
   }
 
   return entity_info;
+}
+
+http::Result<MemberDispatch> HandlerContext::dispatch_to_member(const http::TypedRequest & req,
+                                                                const std::string & member_id,
+                                                                const std::string & member_resource_path,
+                                                                json error_params) const {
+  if (member_id.empty()) {
+    return MemberDispatch::kServeLocally;
+  }
+
+  // Reachability first, and unconditionally: a retained member is answered from
+  // what it declared, never by asking the gateway that stopped answering.
+  if (!is_entity_available(member_id)) {
+    ErrorInfo err;
+    err.code = ERR_NOT_RESPONDING;
+    err.message = "Member '" + member_id + "' is not available";
+    err.http_status = 504;
+    error_params["details"] =
+        "The gateway contributing this member is not answering; it is retained from its last known declaration";
+    error_params["member_id"] = member_id;
+    err.params = std::move(error_params);
+    return tl::unexpected(std::move(err));
+  }
+
+  if (aggregation_mgr_ == nullptr) {
+    return MemberDispatch::kServeLocally;
+  }
+  auto peer = aggregation_mgr_->find_peer_for_entity(member_id);
+  if (!peer) {
+    return MemberDispatch::kServeLocally;
+  }
+
+  // Only an App or a Component can be addressed on the peer; those are the two
+  // collections a resource route exists under. A member that is neither names
+  // nothing this gateway can re-address, so the local path answers for it.
+  const auto & cache = services_.entity_cache();
+  std::string collection;
+  if (cache.get_app(member_id)) {
+    collection = "apps";
+  } else if (cache.get_component(member_id)) {
+    collection = "components";
+  } else {
+    return MemberDispatch::kServeLocally;
+  }
+
+  // Same escape hatch, and same justification, as the remote-entity branch of
+  // validate_entity_for_route: proxying commits the wire, and the sink is the
+  // framework's, not the handler's.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  const auto & raw_req = req.raw_for_framework();
+#pragma GCC diagnostic pop
+  if (tl_forward_response != nullptr) {
+    aggregation_mgr_->forward_request(*peer, raw_req, *tl_forward_response,
+                                      api_path("/" + collection + "/" + member_id + "/" + member_resource_path));
+  }
+  return MemberDispatch::kForwarded;
+}
+
+/// False when the entity is present only because its peer's declaration is
+/// being retained. An entity this gateway has never heard of is not "not
+/// available" - it is absent, and the caller already got a 404 for it.
+bool HandlerContext::is_entity_available(const std::string & entity_id) const {
+  const auto & cache = services_.entity_cache();
+  if (auto app = cache.get_app(entity_id)) {
+    return app->available;
+  }
+  if (auto component = cache.get_component(entity_id)) {
+    return component->available;
+  }
+  return true;
 }
 
 void HandlerContext::set_cors_headers(httplib::Response & res, const std::string & origin) const {
@@ -390,11 +477,11 @@ std::vector<std::string> HandlerContext::resolve_app_host_fqns(const ThreadSafeE
   fqns.reserve(app_ids.size());
   std::unordered_set<std::string> seen;
   for (const auto & app_id : app_ids) {
-    auto app = cache.get_app(app_id);
-    if (!app) {
-      continue;
-    }
-    auto fqn = app->effective_fqn();
+    // Same app -> source resolution as the fault-scope path, so a plugin app
+    // (external, no ROS binding) keeps its bare entity id here too. Resolving
+    // by effective_fqn() alone dropped it, and the empty filter set made every
+    // rosbag download and log query for its component match nothing.
+    auto fqn = faults::resolve_app_source_fqn(cache, app_id);
     if (fqn.empty()) {
       continue;
     }
