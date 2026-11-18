@@ -1,3 +1,47 @@
+## ros2_medkit (humble) - 0.7.1-1
+
+The packages in the `ros2_medkit` repository were released into the `humble` distro by running `/opt/bloom/bin/bloom-release --rosdistro humble --track humble ros2_medkit --non-interactive --no-web --no-pull-request` on `Wed, 18 Nov 2026 17:48:34 -0000`
+
+These packages were released:
+- `ros2_medkit_action_status_bridge`
+- `ros2_medkit_beacon_common`
+- `ros2_medkit_cmake`
+- `ros2_medkit_diagnostic_bridge`
+- `ros2_medkit_fault_detection`
+- `ros2_medkit_fault_manager`
+- `ros2_medkit_fault_reporter`
+- `ros2_medkit_gateway`
+- `ros2_medkit_graph_provider`
+- `ros2_medkit_integration_tests`
+- `ros2_medkit_linux_introspection`
+- `ros2_medkit_log_bridge`
+- `ros2_medkit_msgs`
+- `ros2_medkit_param_beacon`
+- `ros2_medkit_serialization`
+- `ros2_medkit_sovd_service_interface`
+- `ros2_medkit_topic_beacon`
+
+These packages were explicitly ignored:
+- `ros2_medkit_opcua`
+- `ros2_medkit_graph_watchdog`
+
+Version of package(s) in repository `ros2_medkit`:
+
+- upstream repository: https://github.com/selfpatch/ros2_medkit.git
+- release repository: https://github.com/ros2-gbp/ros2_medkit-release.git
+- rosdistro version: `0.6.0-1`
+- old version: `0.6.0-1`
+- new version: `0.7.1-1`
+
+Versions of tools used:
+
+- bloom version: `0.14.4`
+- catkin_pkg version: `1.1.1`
+- rosdep version: `0.27.0`
+- rosdistro version: `1.1.0`
+- vcstools version: `0.1.42`
+
+
 ## ros2_medkit (lyrical) - 0.6.0-1
 
 The packages in the `ros2_medkit` repository were released into the `lyrical` distro by running `/home/michal/.local/bin/bloom-release --non-interactive --no-web --ros-distro lyrical ros2_medkit` on `Mon, 22 Jun 2026 20:39:56 -0000`
