@@ -18,7 +18,9 @@
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <string>
@@ -27,121 +29,26 @@
 #include <unordered_set>
 #include <vector>
 
-#include "ros2_medkit_gateway/core/aggregation/network_utils.hpp"
+#include "ros2_medkit_gateway/core/builtin_samplers.hpp"
 #include "ros2_medkit_gateway/core/data/topic_data_provider.hpp"
+#include "ros2_medkit_gateway/core/discovery/merge_types.hpp"
 #include "ros2_medkit_gateway/core/discovery/refresh_debounce.hpp"
 #include "ros2_medkit_gateway/core/entity_validation.hpp"
 #include "ros2_medkit_gateway/core/thread_pool_config.hpp"
+#include "ros2_medkit_gateway/fault_manager_paths.hpp"
 #include "ros2_medkit_gateway/param_utils.hpp"
 #include "ros2_medkit_gateway/plugins/ros_plugin_context.hpp"
+#include "ros2_medkit_gateway/ros2/ros2_log_sink.hpp"
+#include "ros2_medkit_gateway/ros2/status/ros2_lifecycle_state_reader.hpp"
 
 #include "ros2_medkit_gateway/core/http/handlers/sse_transport_provider.hpp"
-#include "ros2_medkit_gateway/core/sqlite_trigger_store.hpp"
 
 using namespace std::chrono_literals;
 
 namespace ros2_medkit_gateway {
 
-namespace {
-
-/// Convert an rclcpp::Parameter to a nlohmann::json value
-nlohmann::json parameter_to_json(const rclcpp::Parameter & param) {
-  switch (param.get_type()) {
-    case rclcpp::ParameterType::PARAMETER_BOOL:
-      return param.as_bool();
-    case rclcpp::ParameterType::PARAMETER_INTEGER:
-      return param.as_int();
-    case rclcpp::ParameterType::PARAMETER_DOUBLE:
-      return param.as_double();
-    case rclcpp::ParameterType::PARAMETER_STRING:
-      return param.as_string();
-    case rclcpp::ParameterType::PARAMETER_BYTE_ARRAY:
-      return param.as_byte_array();
-    case rclcpp::ParameterType::PARAMETER_BOOL_ARRAY:
-      return param.as_bool_array();
-    case rclcpp::ParameterType::PARAMETER_INTEGER_ARRAY:
-      return param.as_integer_array();
-    case rclcpp::ParameterType::PARAMETER_DOUBLE_ARRAY:
-      return param.as_double_array();
-    case rclcpp::ParameterType::PARAMETER_STRING_ARRAY:
-      return param.as_string_array();
-    case rclcpp::ParameterType::PARAMETER_NOT_SET:
-    default:
-      return nullptr;
-  }
-}
-
-/// Extract per-plugin config from ROS 2 parameters.
-/// Scans for keys matching "plugins.<name>.<key>" (excluding ".path")
-/// and builds a flat JSON object: {"<key>": value, ...}
-///
-/// Checks two sources:
-///   1. NodeOptions::parameter_overrides (set programmatically, e.g. in unit tests)
-///   2. Global YAML overrides from --params-file (declared on-demand, production path)
-nlohmann::json extract_plugin_config(rclcpp::Node * node, const std::string & plugin_name) {
-  auto config = nlohmann::json::object();
-  std::string prefix = "plugins." + plugin_name + ".";
-  std::string path_key = prefix + "path";
-
-  // Source 1: NodeOptions parameter_overrides (programmatic, used in tests)
-  for (const auto & param : node->get_node_options().parameter_overrides()) {
-    const auto & name = param.get_name();
-    if (name.rfind(prefix, 0) == 0 && name != path_key) {
-      config[name.substr(prefix.size())] = parameter_to_json(param);
-    }
-  }
-  if (!config.empty()) {
-    return config;
-  }
-
-  // Source 2: global YAML overrides from --params-file
-  declare_plugin_params_from_yaml(node, prefix, path_key);
-
-  // list_parameters uses "." as hierarchy separator - prefix must NOT have trailing dot.
-  std::string list_prefix = "plugins." + plugin_name;
-  auto result = node->list_parameters({list_prefix}, 10);
-  for (const auto & name : result.names) {
-    if (name != path_key) {
-      config[name.substr(prefix.size())] = parameter_to_json(node->get_parameter(name));
-    }
-  }
-  return config;
-}
-
-/// Filter faults by FQN prefix match on reporting_sources.
-/// Used for FUNCTION and COMPONENT entities that aggregate faults from hosted apps.
-nlohmann::json filter_faults_by_fqns(const nlohmann::json & fault_data, const std::set<std::string> & fqns) {
-  nlohmann::json filtered = nlohmann::json::array();
-  if (!fault_data.contains("faults") || !fault_data["faults"].is_array()) {
-    return filtered;
-  }
-  for (const auto & fault : fault_data["faults"]) {
-    if (!fault.contains("reporting_sources")) {
-      continue;
-    }
-    bool matches = false;
-    for (const auto & src : fault["reporting_sources"]) {
-      const std::string src_str = src.get<std::string>();
-      for (const auto & fqn : fqns) {
-        if (src_str.rfind(fqn, 0) == 0) {
-          matches = true;
-          break;
-        }
-      }
-      if (matches) {
-        break;
-      }
-    }
-    if (matches) {
-      filtered.push_back(fault);
-    }
-  }
-  return filtered;
-}
-
-}  // namespace
-
 GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medkit_gateway", options) {
+  log::set_sink(std::make_shared<Ros2LogSink>());
   RCLCPP_INFO(get_logger(), "Initializing ROS 2 Medkit Gateway...");
 
   // Declare parameters with defaults
@@ -152,14 +59,20 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // instead of scaling with the host core count, so the footprint stays the
   // same on a 4-core SBC and a 64-core server.
   //
-  // executor_threads: the main executor only delivers the node's own callbacks
+  // executor_threads: the main executor delivers the node's own callbacks
   // (timers, graph events, subscriptions) and the service-response callbacks
-  // that complete operation/action RPC futures. All of these run on the node's
-  // default callback group, which is mutually-exclusive, so they serialize
-  // through a single thread regardless of this count - raising it buys no
-  // RPC-response parallelism. The reason a small executor is safe is solely that
-  // the blocking wait for an RPC runs on the cpp-httplib pool thread (off the
-  // executor), never on an executor thread, so it cannot deadlock the executor.
+  // that complete operation/action RPC futures. The RPC response callbacks
+  // live in a shared Reentrant callback group (issue #575; see
+  // ros2_common/callback_groups.hpp), so a second executor thread can
+  // dispatch a response while a default-group callback (e.g. a discovery
+  // refresh pass) is running - the default of 2 buys real RPC-response
+  // parallelism. Timers and the SSE-fault / trigger-fault / rosout
+  // subscriptions stay in the default MutuallyExclusive group on purpose:
+  // refresh passes must stay serialized and those subscriptions rely on
+  // in-order delivery. A single thread remains safe (a Reentrant group does
+  // not require a second thread), and the blocking wait for an RPC runs on
+  // the cpp-httplib pool thread (off the executor), never on an executor
+  // thread, so it cannot deadlock the executor.
   //
   // http_thread_pool_size: each active SSE stream pins one worker for its
   // lifetime and each cold-/data wait parks one for up to
@@ -201,6 +114,12 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   declare_parameter("sse.max_clients", 2);
   declare_parameter("sse.max_subscriptions", 100);  // Maximum active cyclic subscriptions across all entities
   declare_parameter("sse.max_duration_sec", 3600);  // Maximum subscription duration in seconds (1 hour default)
+  // Comment interval on an idle SSE stream. It is also how long the server
+  // takes to notice a client has gone, because a closed socket is discovered
+  // on the next write - which on an aggregating gateway is how long a relay
+  // keeps a slot on a peer after nobody is watching. Shorten it behind a proxy
+  // that drops idle connections sooner than 30 s.
+  declare_parameter("sse.keepalive_interval_sec", 30);
 
   // Log management parameters
   declare_parameter("logs.buffer_size",
@@ -279,6 +198,12 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // disabled (default). See ManifestManager::set_fragments_dir for the
   // merge semantics.
   declare_parameter("discovery.manifest.fragments_dir", "");
+  // CSV file listing manually inventoried assets (columns: id, manufacturer,
+  // model, serial, hardware_rev, firmware, endpoint, role, area, plus extras).
+  // Each row is appended to the manifest as a Component and merged into the
+  // tree by id. Requires a manifest-backed discovery mode (manifest_only /
+  // hybrid with discovery.manifest_path set). Empty = disabled (default).
+  declare_parameter("discovery.inventory.csv_path", "");
   declare_parameter("discovery.runtime.enabled", true);
 
   // Software updates parameters
@@ -298,8 +223,16 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   declare_parameter("triggers.on_restart_behavior", "reset");
   declare_parameter("triggers.storage.path", "");
 
+  // Config-less threshold-rule (fault-trigger) engine parameters (issue #235).
+  declare_parameter("fault_triggers.enabled", true);
+  declare_parameter("fault_triggers.poll_interval_ms", 1000);
+  declare_parameter("fault_triggers.storage.path", "");
+
   // Plugin framework parameters
   declare_parameter("plugins", std::vector<std::string>{});
+
+  // Zero-config freeze-frames for plugin-backed entities (opt-out)
+  declare_parameter("entity_freeze_frame.enabled", true);
 
   // Locking parameters
   declare_parameter("locking.enabled", true);
@@ -313,12 +246,15 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // Aggregation parameters (peer gateway federation)
   declare_parameter("aggregation.enabled", false);
   declare_parameter("aggregation.timeout_ms", 2000);
+  declare_parameter("aggregation.forward_timeout_ms", 15000);
+  declare_parameter("aggregation.write_timeout_ms", 5000);
   declare_parameter("aggregation.announce", false);
   declare_parameter("aggregation.discover", false);
   declare_parameter("aggregation.mdns_service", std::string("_medkit._tcp.local"));
   declare_parameter("aggregation.mdns_name", std::string(""));  // defaults to hostname
   // Security: forward Authorization header to peers (default: false to prevent token leakage)
   declare_parameter("aggregation.forward_auth", false);
+  declare_parameter("aggregation.peer_auth_header", "");
   // Security: require TLS for all peer URLs (default: false)
   declare_parameter("aggregation.require_tls", false);
   // URL scheme for mDNS-discovered peer URLs (default: "http")
@@ -331,8 +267,9 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   declare_parameter("aggregation.peer_names", std::vector<std::string>{""});
 
   // Bulk data storage parameters
-  declare_parameter("bulk_data.storage_dir", "/tmp/ros2_medkit_bulk_data");
-  declare_parameter("bulk_data.max_upload_size", 104857600);  // 100MB
+  const BulkDataConfig bulk_data_defaults;
+  declare_parameter("bulk_data.storage_dir", bulk_data_defaults.storage_dir);
+  declare_parameter("bulk_data.max_upload_size", bulk_data_defaults.max_upload_size);
   declare_parameter("bulk_data.categories", std::vector<std::string>{});
 
   // Runtime (heuristic) discovery options
@@ -398,8 +335,12 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
 
   // Get parameter values
   server_host_ = get_parameter("server.host").as_string();
-  server_port_ = static_cast<int>(get_parameter("server.port").as_int());
-  refresh_interval_ms_ = static_cast<int>(get_parameter("refresh_interval_ms").as_int());
+  // Port and backstop interval are read as int64 and validated below, before
+  // they are narrowed to int. Narrowing first would wrap a value above INT_MAX
+  // back into the valid band and let it through in silence: 4294976296 narrows
+  // to 9000, a legal port nobody asked for.
+  const int64_t server_port_raw = get_parameter("server.port").as_int();
+  const int64_t refresh_interval_raw = get_parameter("refresh_interval_ms").as_int();
   // Read as int64 and validate BEFORE narrowing to int: a value above INT_MAX
   // would otherwise wrap into the valid range and silently bypass the range
   // check (e.g. 4294967296 -> 0, disabling debounce). 0 disables debouncing
@@ -427,9 +368,12 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
                      .build();
 
   // Validate port range
-  if (server_port_ < 1024 || server_port_ > 65535) {
-    RCLCPP_ERROR(get_logger(), "Invalid port %d. Must be between 1024-65535. Using default 8080.", server_port_);
+  if (server_port_raw < 1024 || server_port_raw > 65535) {
+    RCLCPP_ERROR(get_logger(), "Invalid port %" PRId64 ". Must be between 1024-65535. Using default 8080.",
+                 server_port_raw);
     server_port_ = 8080;
+  } else {
+    server_port_ = static_cast<int>(server_port_raw);
   }
 
   // Validate host
@@ -447,11 +391,13 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // graph events polled every 100 ms; this value only governs the
   // safety-backstop timer that periodically forces a refresh in case a
   // graph event is missed.
-  if (refresh_interval_ms_ < 100 || refresh_interval_ms_ > 60000) {
+  if (refresh_interval_raw < 100 || refresh_interval_raw > 60000) {
     RCLCPP_WARN(get_logger(),
-                "Invalid backstop refresh interval %dms. Must be between 100-60000ms. Using default 30000ms.",
-                refresh_interval_ms_);
+                "Invalid backstop refresh interval %" PRId64 "ms. Must be between 100-60000ms. Using default 30000ms.",
+                refresh_interval_raw);
     refresh_interval_ms_ = 30000;
+  } else {
+    refresh_interval_ms_ = static_cast<int>(refresh_interval_raw);
   }
 
   // Log configuration
@@ -496,8 +442,15 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
                         .build();
       // Note: HttpServerManager will log TLS configuration details
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(get_logger(), "Invalid TLS configuration: %s. TLS disabled.", e.what());
-      tls_config_ = TlsConfig{};  // Disabled
+      // Fail closed: TLS was explicitly requested but could not be built (e.g.
+      // missing/invalid cert or key). Refuse to start rather than silently
+      // serving plaintext HTTP. Disabling here would expose the API in the
+      // clear under a configuration that asked for encryption.
+      RCLCPP_FATAL(get_logger(),
+                   "TLS is enabled (server.tls.enabled=true) but the TLS configuration is invalid: %s. "
+                   "Refusing to start in plaintext - fix the certificate/key configuration or disable TLS.",
+                   e.what());
+      throw std::runtime_error(std::string("Invalid TLS configuration: ") + e.what());
     }
   } else {
     RCLCPP_INFO(get_logger(), "TLS/HTTPS: disabled");
@@ -551,8 +504,15 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
                   algorithm_to_string(auth_config_.jwt_algorithm).c_str(),
                   get_parameter("auth.require_auth_for").as_string().c_str());
     } catch (const std::exception & e) {
-      RCLCPP_ERROR(get_logger(), "Invalid authentication configuration: %s. Authentication disabled.", e.what());
-      auth_config_ = AuthConfig{};  // Disabled
+      // Fail closed: authentication was explicitly requested but could not be
+      // built (e.g. empty jwt_secret). Refuse to start rather than silently
+      // serving an unauthenticated API under a configuration that asked for
+      // auth.
+      RCLCPP_FATAL(get_logger(),
+                   "Authentication is enabled (auth.enabled=true) but the auth configuration is invalid: %s. "
+                   "Refusing to start unauthenticated - fix the auth configuration or disable auth.",
+                   e.what());
+      throw std::runtime_error(std::string("Invalid authentication configuration: ") + e.what());
     }
   } else {
     RCLCPP_INFO(get_logger(), "Authentication: disabled");
@@ -620,6 +580,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   discovery_config.manifest_strict_validation = get_parameter("discovery.manifest_strict_validation").as_bool();
   discovery_config.manifest_enabled = get_parameter("discovery.manifest.enabled").as_bool();
   discovery_config.manifest_fragments_dir = get_parameter("discovery.manifest.fragments_dir").as_string();
+  discovery_config.inventory_csv_path = get_parameter("discovery.inventory.csv_path").as_string();
   discovery_config.runtime_enabled = get_parameter("discovery.runtime.enabled").as_bool();
 
   // Runtime discovery options
@@ -655,20 +616,73 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     throw std::runtime_error("Discovery initialization failed");
   }
 
-  const auto topic_sample_timeout_sec = get_parameter("topic_sample_timeout_sec").as_double();
-  topic_transport_ = std::make_shared<ros2::Ros2TopicTransport>(this, topic_sample_timeout_sec);
+  // Validated here, at the read, rather than in the two consumers. Both
+  // Ros2TopicTransport and DataAccessManager fall back to 1.0 on their own, but
+  // DataAccessManager lives in the ROS-neutral core and cannot log, so a value
+  // rejected there disappeared without a trace. Their fallbacks stay as
+  // contract guards; this is the one place that reports.
+  const auto raw_topic_sample_timeout_sec = get_parameter("topic_sample_timeout_sec").as_double();
+  auto topic_sample_timeout_sec = raw_topic_sample_timeout_sec;
+  // isfinite first, and the range as a positive test. Do NOT rewrite this as
+  // "below 0.1 or above 30.0": every comparison against NaN is false, so that
+  // form hands NaN to both consumers as a sampling timeout.
+  const bool timeout_in_range =
+      std::isfinite(topic_sample_timeout_sec) && topic_sample_timeout_sec >= 0.1 && topic_sample_timeout_sec <= 30.0;
+  if (!timeout_in_range) {
+    RCLCPP_WARN(get_logger(), "topic_sample_timeout_sec %.2f is outside 0.1-30.0. Using default 1.0.",
+                raw_topic_sample_timeout_sec);
+    topic_sample_timeout_sec = 1.0;
+  }
+  type_schemas_ = std::make_unique<ros2::Ros2TypeSchemaProvider>();
+  topic_transport_ = std::make_shared<ros2::Ros2TopicTransport>(this, topic_sample_timeout_sec, *type_schemas_);
   data_access_mgr_ = std::make_unique<DataAccessManager>(topic_transport_, topic_sample_timeout_sec);
-  service_transport_ = std::make_shared<ros2::Ros2ServiceTransport>(this);
-  action_transport_ = std::make_shared<ros2::Ros2ActionTransport>(this);
-  const auto service_call_timeout_sec =
-      static_cast<int>(declare_parameter<int64_t>("service_call_timeout_sec", static_cast<int64_t>(10)));
+  // Shared callback groups for blocking-RPC response dispatch and action
+  // status tracking (issue #575). Created once, here on the startup thread,
+  // before any executor spins this node and before RESTServer threads exist
+  // (see ros2_common/callback_groups.hpp for the thread-safety contract).
+  callback_groups_ = ros2_common::create_gateway_callback_groups(*this);
+  service_transport_ = std::make_shared<ros2::Ros2ServiceTransport>(this, callback_groups_.rpc_reentrant);
+  action_transport_ =
+      std::make_shared<ros2::Ros2ActionTransport>(this, callback_groups_.rpc_reentrant, callback_groups_.action_status);
+  // Budget for every service call and every action RPC, including the action
+  // cancel (issue #576 removed the special 15s cancel floor, making this the
+  // sole cancel budget). Degenerate values are not cosmetic here: 0 or a
+  // negative makes the response wait expire immediately, so every cancel
+  // answers 504 unless the status stream wins the race, and an unbounded
+  // value pins an HTTP worker for as long as it says. Clamp to the documented
+  // range with a warning, like the sibling timeouts.
+  static constexpr int64_t kMinServiceCallTimeoutSec = 1;
+  static constexpr int64_t kMaxServiceCallTimeoutSec = 3600;
+  const auto raw_service_call_timeout =
+      declare_parameter<int64_t>("service_call_timeout_sec", static_cast<int64_t>(10));
+  const auto clamped_service_call_timeout =
+      std::clamp(raw_service_call_timeout, kMinServiceCallTimeoutSec, kMaxServiceCallTimeoutSec);
+  if (clamped_service_call_timeout != raw_service_call_timeout) {
+    RCLCPP_WARN(get_logger(), "service_call_timeout_sec %" PRId64 " clamped to %" PRId64, raw_service_call_timeout,
+                clamped_service_call_timeout);
+  }
+  const auto service_call_timeout_sec = static_cast<int>(clamped_service_call_timeout);
   operation_mgr_ = std::make_unique<OperationManager>(service_transport_, action_transport_, discovery_mgr_.get(),
                                                       service_call_timeout_sec);
 
   // Parameter-service tuning parameters were declared at construction-time
   // alongside the rest of the gateway parameters; resolve them here.
-  const double parameter_service_timeout_sec = get_parameter("parameter_service_timeout_sec").as_double();
-  const double parameter_service_negative_cache_sec = get_parameter("parameter_service_negative_cache_sec").as_double();
+  // The FloatingPointRange descriptors on these two do not cover NaN the same
+  // way everywhere: the range check compares with < and >, both false for NaN,
+  // so Jazzy accepts NaN as in-range (verified on a running gateway, which
+  // reported "timeout=nans") while Lyrical refuses it before main gets this
+  // far. Where it gets through it reaches a duration_cast and a try_lock_for,
+  // where it is undefined. isfinite here is what closes that distro gap.
+  auto resolve_finite = [this](const char * name, double fallback) {
+    const double value = get_parameter(name).as_double();
+    if (std::isfinite(value)) {
+      return value;
+    }
+    RCLCPP_WARN(get_logger(), "%s is not a finite number. Using default %.1f.", name, fallback);
+    return fallback;
+  };
+  const double parameter_service_timeout_sec = resolve_finite("parameter_service_timeout_sec", 2.0);
+  const double parameter_service_negative_cache_sec = resolve_finite("parameter_service_negative_cache_sec", 60.0);
   parameter_transport_ = std::make_shared<ros2::Ros2ParameterTransport>(this, parameter_service_timeout_sec,
                                                                         parameter_service_negative_cache_sec);
   config_mgr_ = std::make_unique<ConfigurationManager>(parameter_transport_);
@@ -676,21 +690,28 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   fault_mgr_ = std::make_unique<FaultManager>(fault_service_transport_);
 
   // Initialize bulk data store
-  auto bd_storage_dir = get_parameter("bulk_data.storage_dir").as_string();
-  auto bd_max_upload = static_cast<size_t>(get_parameter("bulk_data.max_upload_size").as_int());
-  auto bd_categories = get_parameter("bulk_data.categories").as_string_array();
-  bd_categories.erase(std::remove_if(bd_categories.begin(), bd_categories.end(),
-                                     [](const auto & item) {
-                                       return item.empty();
-                                     }),
-                      bd_categories.end());
-
-  bulk_data_store_ = std::make_unique<BulkDataStore>(bd_storage_dir, bd_max_upload, bd_categories);
-  RCLCPP_INFO(get_logger(), "Bulk data store: dir=%s, max_upload=%zuB, categories=%zu", bd_storage_dir.c_str(),
-              bd_max_upload, bd_categories.size());
+  BulkDataConfig bulk_data_config;
+  bulk_data_config.storage_dir = get_parameter("bulk_data.storage_dir").as_string();
+  bulk_data_config.max_upload_size = get_parameter("bulk_data.max_upload_size").as_int();
+  bulk_data_config.categories = get_parameter("bulk_data.categories").as_string_array();
+  bulk_data_store_ = make_bulk_data_store(bulk_data_config);
+  RCLCPP_INFO(get_logger(), "Bulk data store: dir=%s, max_upload=%zuB, categories=%zu",
+              bulk_data_config.storage_dir.c_str(), bulk_data_store_->max_upload_bytes(),
+              bulk_data_store_->list_categories().size());
 
   // Initialize subscription manager for cyclic subscriptions
-  auto max_subscriptions = static_cast<size_t>(get_parameter("sse.max_subscriptions").as_int());
+  // Same wrap hazard as bulk_data.max_upload_size: a negative here becomes a
+  // huge size_t, and the documented "HTTP 503 when this limit is reached" then
+  // never fires. There is no documented ceiling for this knob, so only the
+  // nonsensical low end is refused.
+  const int64_t max_subscriptions_raw = get_parameter("sse.max_subscriptions").as_int();
+  size_t max_subscriptions = 100;
+  if (max_subscriptions_raw < 1) {
+    RCLCPP_WARN(get_logger(), "sse.max_subscriptions %" PRId64 " must be >= 1. Using default 100.",
+                max_subscriptions_raw);
+  } else {
+    max_subscriptions = static_cast<size_t>(max_subscriptions_raw);
+  }
   subscription_mgr_ = std::make_unique<SubscriptionManager>(max_subscriptions);
   RCLCPP_INFO(get_logger(), "Subscription manager: max_subscriptions=%zu", max_subscriptions);
 
@@ -698,7 +719,11 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   // Clamp like the pool knobs (issue #440): read raw, a negative value would wrap
   // to a huge size_t. Bounded to [1, 1024]; main.cpp warns at startup if this
   // exceeds the HTTP pool budget (pool < sse.max_clients + cold_wait_cap).
-  auto max_sse_clients = clamp_thread_count(get_parameter("sse.max_clients").as_int(), 1, 1024);
+  auto requested_sse_clients = get_parameter("sse.max_clients").as_int();
+  auto max_sse_clients = clamp_thread_count(requested_sse_clients, 1, 1024);
+  if (static_cast<int64_t>(max_sse_clients) != requested_sse_clients) {
+    RCLCPP_WARN(get_logger(), "sse.max_clients %" PRId64 " clamped to %zu", requested_sse_clients, max_sse_clients);
+  }
   sse_client_tracker_ = std::make_shared<SSEClientTracker>(max_sse_clients);
 
   // Initialize resource sampler and transport registries
@@ -776,6 +801,10 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     // per plugin handles both injection and ownership). No separate init-time registration
     // needed because refresh_cache() runs before the HTTP server accepts requests.
   }
+
+  // Zero-config freeze-frames need the shared subscription executor, which is
+  // built after the node (main.cpp). Its wiring is deferred to
+  // init_entity_freeze_frame_capture(), called once the executor exists.
 
   // Initialize log manager (subscribes to /rosout, delegates to plugin if available)
   static constexpr int kMinBufferSize = 1;
@@ -877,29 +906,8 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
 
     lock_manager_ = std::make_unique<LockManager>(get_thread_safe_cache(), lock_config);
 
-    auto cleanup_interval = lock_config.cleanup_interval;
-    lock_cleanup_timer_ = this->create_wall_timer(std::chrono::seconds(cleanup_interval), [this]() {
-      auto expired = lock_manager_->cleanup_expired();
-      for (const auto & info : expired) {
-        RCLCPP_INFO(get_logger(), "Lock %s expired on entity %s", info.lock_id.c_str(), info.entity_id.c_str());
-
-        // Clean up temporary resources within expired lock scope
-        auto scope_includes = [&](const std::string & collection) {
-          return info.scopes.empty() ||
-                 std::find(info.scopes.begin(), info.scopes.end(), collection) != info.scopes.end();
-        };
-
-        // Remove cyclic subscriptions for the entity
-        if (scope_includes("cyclic-subscriptions") && subscription_mgr_) {
-          auto subs = subscription_mgr_->list(info.entity_id);
-          for (const auto & sub : subs) {
-            if (subscription_mgr_->remove(sub.id)) {
-              RCLCPP_INFO(get_logger(), "Removed subscription %s on lock expiry", sub.id.c_str());
-            }
-          }
-        }
-      }
-    });
+    lock_reaper_ = std::make_unique<LockReaper>(*lock_manager_, subscription_mgr_.get(), lock_config.cleanup_interval,
+                                                log::Logger(get_logger().get_name()));
 
     RCLCPP_INFO(get_logger(), "Lock manager: enabled, max_expiration=%ds, cleanup_interval=%ds",
                 lock_config.default_max_expiration, lock_config.cleanup_interval);
@@ -908,48 +916,38 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   }
 
   // Scripts
-  script_mgr_ = std::make_unique<ScriptManager>();
   auto * plugin_script_provider = plugin_mgr_->get_script_provider();
-  if (plugin_script_provider) {
-    script_mgr_->set_backend(plugin_script_provider);
-    RCLCPP_INFO(get_logger(), "Using plugin ScriptProvider");
-  } else {
-    auto scripts_dir = get_parameter("scripts.scripts_dir").as_string();
-    if (!scripts_dir.empty()) {
-      ScriptsConfig scripts_config;
-      scripts_config.scripts_dir = scripts_dir;
-      scripts_config.max_file_size_mb = static_cast<int>(get_parameter("scripts.max_file_size_mb").as_int());
-      scripts_config.max_concurrent_executions =
-          static_cast<int>(get_parameter("scripts.max_concurrent_executions").as_int());
-      scripts_config.default_timeout_sec = static_cast<int>(get_parameter("scripts.default_timeout_sec").as_int());
-      scripts_config.max_execution_history = static_cast<int>(get_parameter("scripts.max_execution_history").as_int());
-      scripts_config.allow_uploads = get_parameter("scripts.allow_uploads").as_bool();
-
-      // Load manifest-defined scripts
-      auto * manifest_mgr = discovery_mgr_->get_manifest_manager();
-      if (manifest_mgr) {
-        scripts_config.entries = manifest_mgr->get_scripts();
-        if (!scripts_config.entries.empty()) {
-          RCLCPP_INFO(get_logger(), "Loaded %zu manifest-defined scripts", scripts_config.entries.size());
-        }
-      }
-
-      default_script_provider_ = std::make_unique<DefaultScriptProvider>(scripts_config);
-      script_mgr_->set_backend(default_script_provider_.get());
-      RCLCPP_INFO(get_logger(), "Scripts enabled with directory: %s", scripts_dir.c_str());
-    } else {
-      auto * manifest_mgr = discovery_mgr_->get_manifest_manager();
-      if (manifest_mgr) {
-        auto manifest_scripts = manifest_mgr->get_scripts();
-        if (!manifest_scripts.empty()) {
-          RCLCPP_WARN(get_logger(),
-                      "Manifest defines %zu script(s) but scripts.scripts_dir is not configured - "
-                      "manifest scripts will not be loaded. Set 'scripts.scripts_dir' in gateway parameters to enable.",
-                      manifest_scripts.size());
-        }
-      }
-    }
+  ScriptsConfig scripts_config;
+  scripts_config.scripts_dir = get_parameter("scripts.scripts_dir").as_string();
+  scripts_config.max_file_size_mb = static_cast<int>(get_parameter("scripts.max_file_size_mb").as_int());
+  scripts_config.max_concurrent_executions =
+      static_cast<int>(get_parameter("scripts.max_concurrent_executions").as_int());
+  scripts_config.default_timeout_sec = static_cast<int>(get_parameter("scripts.default_timeout_sec").as_int());
+  scripts_config.max_execution_history = static_cast<int>(get_parameter("scripts.max_execution_history").as_int());
+  scripts_config.allow_uploads = get_parameter("scripts.allow_uploads").as_bool();
+  // Manifest-defined scripts come from the discovery manager.
+  auto * script_manifest_mgr = discovery_mgr_->get_manifest_manager();
+  std::vector<ScriptEntryConfig> manifest_scripts;
+  if (script_manifest_mgr) {
+    manifest_scripts = script_manifest_mgr->get_scripts();
   }
+  if (plugin_script_provider) {
+    RCLCPP_INFO(get_logger(), "Using plugin ScriptProvider");
+  } else if (!scripts_config.scripts_dir.empty()) {
+    scripts_config.entries = manifest_scripts;
+    if (!scripts_config.entries.empty()) {
+      RCLCPP_INFO(get_logger(), "Loaded %zu manifest-defined scripts", scripts_config.entries.size());
+    }
+    RCLCPP_INFO(get_logger(), "Scripts enabled with directory: %s", scripts_config.scripts_dir.c_str());
+  } else if (!manifest_scripts.empty()) {
+    RCLCPP_WARN(get_logger(),
+                "Manifest defines %zu script(s) but scripts.scripts_dir is not configured - "
+                "manifest scripts will not be loaded. Set 'scripts.scripts_dir' in gateway parameters to enable.",
+                manifest_scripts.size());
+  }
+  auto script_host = make_script_host(scripts_config, plugin_script_provider);
+  default_script_provider_ = std::move(script_host.default_provider);
+  script_mgr_ = std::move(script_host.manager);
 
   // --- Trigger infrastructure ---
   resource_change_notifier_ = std::make_unique<ResourceChangeNotifier>([this](const std::string & msg) {
@@ -957,23 +955,14 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   });
 
   condition_registry_ = std::make_unique<ConditionRegistry>();
-  condition_registry_->register_condition("OnChange", std::make_shared<OnChangeEvaluator>());
-  condition_registry_->register_condition("OnChangeTo", std::make_shared<OnChangeToEvaluator>());
-  condition_registry_->register_condition("EnterRange", std::make_shared<EnterRangeEvaluator>());
-  condition_registry_->register_condition("LeaveRange", std::make_shared<LeaveRangeEvaluator>());
+  register_builtin_conditions(*condition_registry_);
 
   auto triggers_enabled = get_parameter("triggers.enabled").as_bool();
   if (triggers_enabled) {
-    auto storage_path = get_parameter("triggers.storage.path").as_string();
-    if (storage_path.empty()) {
-      trigger_store_ = std::make_unique<SqliteTriggerStore>(":memory:");
-    } else {
-      trigger_store_ = std::make_unique<SqliteTriggerStore>(storage_path);
-    }
-
-    TriggerConfig trigger_config;
-    trigger_config.max_triggers = static_cast<int>(get_parameter("triggers.max_triggers").as_int());
+    TriggerHostConfig trigger_config;
+    trigger_config.max_triggers = get_parameter("triggers.max_triggers").as_int();
     trigger_config.on_restart_behavior = get_parameter("triggers.on_restart_behavior").as_string();
+    trigger_config.storage_path = get_parameter("triggers.storage.path").as_string();
 
     // Subscribe to data topics for data triggers. The adapter is created
     // before the trigger manager because the manager takes the transport
@@ -981,38 +970,28 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     trigger_topic_subscriber_ = std::make_unique<TriggerTopicSubscriber>(this);
     trigger_topic_transport_ = std::make_shared<ros2::Ros2TopicSubscriptionTransport>(trigger_topic_subscriber_.get());
 
-    trigger_mgr_ = std::make_unique<TriggerManager>(*resource_change_notifier_, *condition_registry_, *trigger_store_,
-                                                    trigger_config, trigger_topic_transport_);
-
-    // Set entity hierarchy resolver using thread-safe cache
-    trigger_mgr_->set_entity_children_fn(
-        [this](const std::string & entity_id, const std::string & entity_type) -> std::vector<std::string> {
-          const auto & cache = get_thread_safe_cache();
-          if (entity_type == "components") {
-            return cache.get_apps_for_component(entity_id);
-          } else if (entity_type == "areas") {
-            auto comps = cache.get_components_for_area(entity_id);
-            std::vector<std::string> all_apps;
-            for (const auto & comp_id : comps) {
-              auto apps = cache.get_apps_for_component(comp_id);
-              all_apps.insert(all_apps.end(), apps.begin(), apps.end());
-            }
-            return all_apps;
-          } else if (entity_type == "functions") {
-            return cache.get_apps_for_function(entity_id);
-          }
-          return {};
-        });
-
-    // Set entity existence checker for orphan sweep
-    trigger_mgr_->set_entity_exists_fn(
-        [this](const std::string & entity_id, const std::string & /*entity_type*/) -> bool {
-          const auto & cache = get_thread_safe_cache();
-          return cache.find_entity(entity_id).has_value();
-        });
-
-    // Load persistent triggers
-    trigger_mgr_->load_persistent_triggers();
+    // The deferred-resolution budget must outlive at least one full discovery
+    // refresh: plugin-declared topics only reach the entity cache on a refresh
+    // pass, and refresh_interval_ms is configurable up to 60 s - equal to the
+    // old fixed budget, which made "resolves on a later tick" false at the
+    // extreme. Two refresh cycles keeps the reasoning true for every allowed
+    // configuration.
+    TriggerHostWiring trigger_wiring;
+    trigger_wiring.cache = &get_thread_safe_cache();
+    trigger_wiring.topic_transport = trigger_topic_transport_;
+    trigger_wiring.log_manager = log_mgr_.get();
+    trigger_wiring.warn = [this](const std::string & message) {
+      RCLCPP_WARN(get_logger(), "%s", message.c_str());
+    };
+    trigger_wiring.unresolved_timeout =
+        std::max(std::chrono::seconds(60), std::chrono::seconds(2 * refresh_interval_ms_ / 1000));
+    trigger_host_ = make_trigger_host(trigger_config, *resource_change_notifier_, *condition_registry_, trigger_wiring);
+    // Persistent triggers are restored once, inside make_trigger_host. A trigger the store holds but that pass does not
+    // put back stays absent until the next restart, so the count is worth having in the log of every start that asked
+    // for a restore.
+    if (trigger_config.on_restart_behavior == "restore") {
+      RCLCPP_INFO(get_logger(), "Restored %zu persistent trigger(s) from the trigger store", trigger_host_.restored);
+    }
 
     // Wire notifier to managers so they emit events for trigger evaluation
     if (update_mgr_) {
@@ -1022,31 +1001,14 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
 
     // Wire LogManager <-> TriggerManager for log_settings integration
     if (log_mgr_) {
-      trigger_mgr_->set_log_manager(log_mgr_.get());
       log_mgr_->set_notifier(resource_change_notifier_.get());
     }
 
     // Subscribe to fault events and forward to notifier
     trigger_fault_subscriber_ = std::make_unique<TriggerFaultSubscriber>(this, *resource_change_notifier_);
 
-    // Wire deferred topic resolution: when a trigger's resource_path couldn't
-    // be resolved to a ROS 2 topic at creation time, retry periodically using
-    // the entity cache to find matching topics.
-    trigger_mgr_->set_resolve_topic_fn([this](const std::string & entity_id,
-                                              const std::string & resource_path) -> std::string {
-      const auto & cache = get_thread_safe_cache();
-      auto aggregated = cache.get_entity_data(entity_id);
-      for (const auto & topic : aggregated.topics) {
-        if (topic.name == resource_path ||
-            (topic.name.size() > resource_path.size() &&
-             topic.name.compare(topic.name.size() - resource_path.size(), resource_path.size(), resource_path) == 0)) {
-          return topic.name;
-        }
-      }
-      return "";
-    });
     trigger_topic_subscriber_->set_retry_callback([this]() {
-      trigger_mgr_->retry_unresolved_triggers();
+      trigger_host_.manager->retry_unresolved_triggers();
     });
 
     // Wire node-to-entity resolver for trigger notifications (#305).
@@ -1054,18 +1016,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     // mapping (populated from linking result). Captures 'this' - the lambda is
     // called from ROS subscription callbacks on the same node's executor.
     auto node_resolver = [this](const std::string & ros_fqn) -> std::string {
-      auto result = thread_safe_cache_.resolve_node_to_app(ros_fqn);
-      if (!result.empty()) {
-        return result;
-      }
-      // Try with normalized FQN (strip leading /)
-      if (!ros_fqn.empty() && ros_fqn[0] == '/') {
-        result = thread_safe_cache_.resolve_node_to_app(ros_fqn.substr(1));
-        if (!result.empty()) {
-          return result;
-        }
-      }
-      return "";
+      return resolve_trigger_entity(thread_safe_cache_, ros_fqn);
     };
 
     if (trigger_fault_subscriber_) {
@@ -1075,8 +1026,8 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
       log_mgr_->set_node_to_entity_resolver(node_resolver);
     }
 
-    RCLCPP_INFO(get_logger(), "Trigger subsystem: enabled (max=%d, storage=%s)", trigger_config.max_triggers,
-                storage_path.empty() ? ":memory:" : storage_path.c_str());
+    RCLCPP_INFO(get_logger(), "Trigger subsystem: enabled (max=%d, storage=%s)", trigger_host_.max_triggers,
+                trigger_config.storage_path.empty() ? ":memory:" : trigger_config.storage_path.c_str());
   } else {
     RCLCPP_INFO(get_logger(), "Trigger subsystem: disabled");
   }
@@ -1085,11 +1036,39 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   if (get_parameter("aggregation.enabled").as_bool()) {
     AggregationConfig agg_config;
     agg_config.enabled = true;
-    agg_config.timeout_ms = static_cast<int>(get_parameter("aggregation.timeout_ms").as_int());
+    // Documented range 100-600000 ms for all three budgets. A ROS parameter is
+    // int64 and `declare_parameter<int>` narrows silently, so a value above
+    // INT_MAX wraps back into the legal band and passes any check made after
+    // the narrowing - clamp on the int64 first, narrow second.
+    auto clamp_budget_ms = [this](const char * key) {
+      constexpr int64_t kMinBudgetMs = 100;
+      constexpr int64_t kMaxBudgetMs = 600000;
+      const int64_t raw = get_parameter(key).as_int();
+      const int64_t used = std::clamp<int64_t>(raw, kMinBudgetMs, kMaxBudgetMs);
+      if (used != raw) {
+        RCLCPP_WARN(get_logger(), "%s %" PRId64 " clamped to %" PRId64, key, raw, used);
+      }
+      return static_cast<int>(used);
+    };
+    agg_config.timeout_ms = clamp_budget_ms("aggregation.timeout_ms");
+    agg_config.forward_timeout_ms = clamp_budget_ms("aggregation.forward_timeout_ms");
+    agg_config.write_timeout_ms = clamp_budget_ms("aggregation.write_timeout_ms");
+    // A forward budget below the metadata budget inverts what the split is for:
+    // the path carrying the peer's real work would be cut off before the path
+    // that only reads its description. Report it rather than serve it, because
+    // the symptom is an operation failing while a listing of it succeeds.
+    if (agg_config.forward_timeout_ms < agg_config.timeout_ms) {
+      RCLCPP_WARN(get_logger(),
+                  "aggregation.forward_timeout_ms %d is below aggregation.timeout_ms %d; raised to %d so a forwarded "
+                  "request is not cut off sooner than a metadata read",
+                  agg_config.forward_timeout_ms, agg_config.timeout_ms, agg_config.timeout_ms);
+      agg_config.forward_timeout_ms = agg_config.timeout_ms;
+    }
     agg_config.announce = get_parameter("aggregation.announce").as_bool();
     agg_config.discover = get_parameter("aggregation.discover").as_bool();
     agg_config.mdns_service = get_parameter("aggregation.mdns_service").as_string();
     agg_config.forward_auth = get_parameter("aggregation.forward_auth").as_bool();
+    agg_config.peer_auth_header = get_parameter("aggregation.peer_auth_header").as_string();
     agg_config.require_tls = get_parameter("aggregation.require_tls").as_bool();
     agg_config.peer_scheme = get_parameter("aggregation.peer_scheme").as_string();
     if (agg_config.peer_scheme != "http" && agg_config.peer_scheme != "https") {
@@ -1099,7 +1078,15 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
                    agg_config.peer_scheme.c_str());
       agg_config.peer_scheme = "http";
     }
-    agg_config.max_discovered_peers = static_cast<size_t>(get_parameter("aggregation.max_discovered_peers").as_int());
+    // Documented range 1-1000. Unchecked, a negative wraps to a huge size_t and
+    // the cap that exists to stop rogue mDNS announcements stops existing.
+    const int64_t max_peers_raw = get_parameter("aggregation.max_discovered_peers").as_int();
+    const int64_t max_peers_used = std::clamp<int64_t>(max_peers_raw, 1, 1000);
+    if (max_peers_used != max_peers_raw) {
+      RCLCPP_WARN(get_logger(), "aggregation.max_discovered_peers %" PRId64 " clamped to %" PRId64, max_peers_raw,
+                  max_peers_used);
+    }
+    agg_config.max_discovered_peers = static_cast<size_t>(max_peers_used);
 
     // Parse static peers from parallel arrays
     auto peer_urls = get_parameter("aggregation.peer_urls").as_string_array();
@@ -1119,352 +1106,15 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
       }
     }
 
-    if (agg_config.peers.empty() && !agg_config.announce && !agg_config.discover) {
-      RCLCPP_WARN(get_logger(),
-                  "Aggregation enabled but no static peers and mDNS disabled. "
-                  "No peer communication will occur.");
-    }
-
-    // Security warning: forwarding auth tokens over cleartext is dangerous
-    if (agg_config.forward_auth && !agg_config.require_tls) {
-      RCLCPP_WARN(get_logger(),
-                  "Aggregation: forward_auth is enabled but require_tls is false. "
-                  "Authorization tokens may be sent to peers over cleartext HTTP. "
-                  "Set aggregation.require_tls=true for production deployments.");
-    }
-
-    auto logger = get_logger();
-    aggregation_mgr_ = std::make_unique<AggregationManager>(agg_config, &logger);
-
-    // mDNS discovery/announcement
-    if (agg_config.announce || agg_config.discover) {
-      MdnsDiscovery::Config mdns_config;
-      mdns_config.announce = agg_config.announce;
-      mdns_config.discover = agg_config.discover;
-      mdns_config.service = agg_config.mdns_service;
-      mdns_config.port = server_port_;
-      mdns_config.peer_scheme = agg_config.peer_scheme;
-      // mDNS instance name must be unique per gateway instance.
-      // Defaults to hostname via MdnsDiscovery constructor when empty.
-      // Operators should set aggregation.mdns_name for multi-gateway-per-host deployments.
-      mdns_config.name = get_parameter("aggregation.mdns_name").as_string();
-      mdns_config.on_error = [this](const std::string & msg) {
-        RCLCPP_ERROR(get_logger(), "mDNS: %s", msg.c_str());
-      };
-      mdns_config.on_log = [this](const std::string & msg) {
-        RCLCPP_DEBUG(get_logger(), "mDNS: %s", msg.c_str());
-      };
-      mdns_discovery_ = std::make_unique<MdnsDiscovery>(mdns_config);
-      // Get the actual mDNS instance name for self-discovery filtering.
-      // MdnsDiscovery constructor resolves empty name to gethostname().
-      // Sanitize it the same way browse_callback sanitizes discovered peer names.
-      const std::string self_mdns_name = HostInfoProvider::sanitize_entity_id(mdns_discovery_->instance_name());
-
-      // Collect local interface addresses for IP-based self-discovery filtering.
-      // Name-only checks are insufficient: an attacker can send mDNS responses with
-      // a different name but our own IP:port, creating forwarding loops.
-      // The address set is refreshed periodically (every 60s) to pick up network
-      // changes (new interfaces, DHCP renewals) without stale data.
-      auto local_addrs = std::make_shared<std::unordered_set<std::string>>(collect_local_addresses());
-      auto last_addr_refresh =
-          std::make_shared<std::chrono::steady_clock::time_point>(std::chrono::steady_clock::now());
-      auto addr_mutex = std::make_shared<std::mutex>();
-      const int self_port = server_port_;
-
-      mdns_discovery_->start(
-          [this, self_mdns_name, local_addrs, last_addr_refresh, addr_mutex, self_port](const std::string & url,
-                                                                                        const std::string & name) {
-            if (name == self_mdns_name) {
-              return;  // Skip self-discovery (name match)
-            }
-
-            // Refresh local addresses periodically (every 60s) to handle network changes.
-            // collect_local_addresses() is cheap (getifaddrs syscall), safe to call often.
-            {
-              std::lock_guard<std::mutex> lock(*addr_mutex);
-              auto now = std::chrono::steady_clock::now();
-              if (std::chrono::duration_cast<std::chrono::seconds>(now - *last_addr_refresh).count() >= 60) {
-                *local_addrs = collect_local_addresses();
-                *last_addr_refresh = now;
-              }
-            }
-
-            // Also reject peers whose resolved IP:port matches our own listen address.
-            // Prevents forwarding loops from spoofed mDNS responses.
-            auto [peer_host, peer_port] = parse_url_host_port(url);
-            if (peer_port == self_port && local_addrs->count(peer_host) > 0) {
-              RCLCPP_WARN(get_logger(),
-                          "mDNS: rejecting peer '%s' at %s - resolves to local address with our port "
-                          "(possible spoofed mDNS response)",
-                          name.c_str(), url.c_str());
-              return;
-            }
-            aggregation_mgr_->add_discovered_peer(url, name);
-          },
-          [this](const std::string & name) {
-            aggregation_mgr_->remove_discovered_peer(name);
-          });
-    }
-
-    RCLCPP_INFO(get_logger(),
-                "Aggregation: enabled (timeout=%dms, announce=%s, discover=%s, "
-                "forward_auth=%s, require_tls=%s, peer_scheme=%s, max_discovered_peers=%zu)",
-                agg_config.timeout_ms, agg_config.announce ? "true" : "false", agg_config.discover ? "true" : "false",
-                agg_config.forward_auth ? "true" : "false", agg_config.require_tls ? "true" : "false",
-                agg_config.peer_scheme.c_str(), agg_config.max_discovered_peers);
+    aggregation_host_ =
+        std::make_unique<AggregationHost>(agg_config, server_port_, get_parameter("aggregation.mdns_name").as_string(),
+                                          log::Logger(get_logger().get_name()));
   } else {
     RCLCPP_INFO(get_logger(), "Aggregation: disabled");
   }
 
   // Register built-in resource samplers
-  sampler_registry_->register_sampler(
-      "data",
-      [this](const std::string & /*entity_id*/,
-             const std::string & resource_path) -> tl::expected<nlohmann::json, std::string> {
-        auto * dam = get_data_access_manager();
-        if (!dam) {
-          return tl::make_unexpected(std::string("DataAccessManager not available"));
-        }
-        auto * provider = dam->get_topic_data_provider();
-        if (!provider) {
-          return tl::make_unexpected(std::string("TopicDataProvider not configured"));
-        }
-        const auto timeout_ms = std::chrono::milliseconds{
-            static_cast<std::int64_t>(std::max(dam->get_topic_sample_timeout(), 0.0) * 1000.0)};
-        auto r = provider->sample(resource_path, timeout_ms);
-        if (!r) {
-          return tl::make_unexpected(std::string{"Topic sample failed: "} + r.error().message);
-        }
-        TopicSampleResult sample = *r;
-        if (sample.has_data && sample.data.has_value()) {
-          nlohmann::json payload;
-          payload["id"] = resource_path;
-          payload["data"] = *sample.data;
-          return payload;
-        }
-        return tl::make_unexpected("Topic data not available: " + resource_path);
-      },
-      true);
-
-  sampler_registry_->register_sampler(
-      "faults",
-      [this](const std::string & entity_id,
-             const std::string & /*resource_path*/) -> tl::expected<nlohmann::json, std::string> {
-        auto * fault_mgr = get_fault_manager();
-        if (!fault_mgr) {
-          return tl::make_unexpected(std::string("FaultManager not available"));
-        }
-        // Determine fault filtering based on entity type (mirrors fault_handlers.cpp logic)
-        const auto & cache = get_thread_safe_cache();
-        auto entity_ref = cache.find_entity(entity_id);
-        if (!entity_ref) {
-          return tl::make_unexpected("Entity not found: " + entity_id);
-        }
-
-        if (entity_ref->type == SovdEntityType::FUNCTION) {
-          // FUNCTION: get all faults, filter by host app FQNs
-          auto result = fault_mgr->list_faults("");
-          if (!result.success) {
-            return tl::make_unexpected(result.error_message);
-          }
-          auto func = cache.get_function(entity_id);
-          if (!func || func->hosts.empty()) {
-            nlohmann::json empty_result = {{"faults", nlohmann::json::array()}, {"count", 0}};
-            return empty_result;
-          }
-          std::set<std::string> host_fqns;
-          for (const auto & app_id : func->hosts) {
-            auto app = cache.get_app(app_id);
-            if (app) {
-              auto fqn = app->effective_fqn();
-              if (!fqn.empty()) {
-                host_fqns.insert(std::move(fqn));
-              }
-            }
-          }
-          auto filtered = filter_faults_by_fqns(result.data, host_fqns);
-          result.data["faults"] = filtered;
-          result.data["count"] = filtered.size();
-          return result.data;
-        }
-
-        if (entity_ref->type == SovdEntityType::COMPONENT) {
-          // COMPONENT: get all faults, filter by hosted app FQNs
-          auto result = fault_mgr->list_faults("");
-          if (!result.success) {
-            return tl::make_unexpected(result.error_message);
-          }
-          auto app_ids = cache.get_apps_for_component(entity_id);
-          std::set<std::string> app_fqns;
-          for (const auto & app_id : app_ids) {
-            auto app = cache.get_app(app_id);
-            if (app) {
-              auto fqn = app->effective_fqn();
-              if (!fqn.empty()) {
-                app_fqns.insert(std::move(fqn));
-              }
-            }
-          }
-          auto filtered = filter_faults_by_fqns(result.data, app_fqns);
-          result.data["faults"] = filtered;
-          result.data["count"] = filtered.size();
-          return result.data;
-        }
-
-        // APP: use effective_fqn with prefix matching via list_faults
-        // AREA: use namespace_path with prefix matching via list_faults
-        std::string source_id;
-        if (entity_ref->type == SovdEntityType::APP) {
-          auto app = cache.get_app(entity_id);
-          if (app) {
-            source_id = app->effective_fqn();
-          }
-        } else if (entity_ref->type == SovdEntityType::AREA) {
-          auto area = cache.get_area(entity_id);
-          if (area) {
-            source_id = area->namespace_path;
-          }
-        }
-        if (source_id.empty()) {
-          return tl::make_unexpected("Entity no longer available: " + entity_id);
-        }
-        auto result = fault_mgr->list_faults(source_id);
-        if (!result.success) {
-          return tl::make_unexpected(result.error_message);
-        }
-        return result.data;
-      },
-      true);
-
-  sampler_registry_->register_sampler(
-      "configurations",
-      [this](const std::string & entity_id,
-             const std::string & /*resource_path*/) -> tl::expected<nlohmann::json, std::string> {
-        auto * config_mgr = get_configuration_manager();
-        if (!config_mgr) {
-          return tl::make_unexpected(std::string("ConfigurationManager not available"));
-        }
-        const auto & cache = get_thread_safe_cache();
-        auto entity_configs = cache.get_entity_configurations(entity_id);
-        nlohmann::json items = nlohmann::json::array();
-        for (const auto & node : entity_configs.nodes) {
-          auto result = config_mgr->list_parameters(node.node_fqn);
-          if (result.success && result.data.is_array()) {
-            for (auto & param : result.data) {
-              items.push_back(std::move(param));
-            }
-          }
-        }
-        nlohmann::json payload;
-        payload["items"] = std::move(items);
-        return payload;
-      },
-      true);
-
-  sampler_registry_->register_sampler(
-      "logs",
-      [this](const std::string & entity_id,
-             const std::string & /*resource_path*/) -> tl::expected<nlohmann::json, std::string> {
-        auto * log_mgr = get_log_manager();
-        if (!log_mgr) {
-          return tl::make_unexpected(std::string("LogManager not available"));
-        }
-        // Match log_handlers.cpp scoping logic:
-        // AREA/COMPONENT: entity fqn (namespace_path) with prefix_match=true
-        // FUNCTION: host app FQNs with prefix_match=false (exact)
-        // APP: entity fqn (effective_fqn) with prefix_match=false (exact)
-        const auto & cache = get_thread_safe_cache();
-        auto entity_ref = cache.find_entity(entity_id);
-        if (!entity_ref) {
-          return tl::make_unexpected("Entity not found: " + entity_id);
-        }
-
-        if (entity_ref->type == SovdEntityType::FUNCTION) {
-          // Aggregate logs from all hosted apps (exact match)
-          auto func = cache.get_function(entity_id);
-          if (!func || func->hosts.empty()) {
-            nlohmann::json payload;
-            payload["items"] = nlohmann::json::array();
-            return payload;
-          }
-          std::vector<std::string> host_fqns;
-          for (const auto & app_id : func->hosts) {
-            auto app = cache.get_app(app_id);
-            if (app) {
-              auto fqn = app->effective_fqn();
-              if (!fqn.empty()) {
-                host_fqns.push_back(std::move(fqn));
-              }
-            }
-          }
-          if (host_fqns.empty()) {
-            nlohmann::json payload;
-            payload["items"] = nlohmann::json::array();
-            return payload;
-          }
-          auto result = log_mgr->get_logs(host_fqns, false, "", "", entity_id);
-          if (!result.has_value()) {
-            return tl::make_unexpected(result.error());
-          }
-          nlohmann::json payload;
-          payload["items"] = std::move(*result);
-          return payload;
-        }
-
-        // AREA and COMPONENT: use namespace_path/fqn with prefix matching
-        // APP: use effective_fqn with exact matching
-        std::string fqn;
-        bool prefix_match = false;
-        if (entity_ref->type == SovdEntityType::AREA) {
-          auto area = cache.get_area(entity_id);
-          if (area) {
-            fqn = area->namespace_path;
-          }
-          prefix_match = true;
-        } else if (entity_ref->type == SovdEntityType::COMPONENT) {
-          auto comp = cache.get_component(entity_id);
-          if (comp) {
-            fqn = comp->fqn;
-          }
-          prefix_match = true;
-        } else if (entity_ref->type == SovdEntityType::APP) {
-          auto app = cache.get_app(entity_id);
-          if (app) {
-            fqn = app->effective_fqn();
-          }
-        }
-
-        if (fqn.empty()) {
-          return tl::make_unexpected("Entity no longer available: " + entity_id);
-        }
-        auto result = log_mgr->get_logs({fqn}, prefix_match, "", "", entity_id);
-        if (!result.has_value()) {
-          return tl::make_unexpected(result.error());
-        }
-        nlohmann::json payload;
-        payload["items"] = std::move(*result);
-        return payload;
-      },
-      true);
-
-  // Register update status sampler (server-level, uses UpdateManager)
-  if (update_mgr_) {
-    sampler_registry_->register_sampler(
-        "updates",
-        [this](const std::string & /*entity_id*/,
-               const std::string & resource_path) -> tl::expected<nlohmann::json, std::string> {
-          auto * mgr = get_update_manager();
-          if (!mgr || !mgr->has_backend()) {
-            return tl::make_unexpected(std::string("Update backend not available"));
-          }
-          auto result = mgr->get_status(resource_path);
-          if (!result) {
-            return tl::make_unexpected(result.error().message);
-          }
-          return update_status_to_json(*result);
-        },
-        true);
-  }
+  register_builtin_samplers(*this);
 
   RCLCPP_INFO(get_logger(), "Registered built-in resource samplers: data, faults, configurations, logs%s",
               update_mgr_ ? ", updates" : "");
@@ -1484,7 +1134,7 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   discovery_mgr_->set_topic_data_provider(data_access_mgr_->get_topic_data_provider());
 
   // Connect type introspection for operation schema enrichment
-  discovery_mgr_->set_type_introspection(data_access_mgr_->get_type_introspection());
+  discovery_mgr_->set_type_introspection(type_schemas_->introspection());
 
   // Initial discovery
   refresh_cache();
@@ -1545,8 +1195,8 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
     refresh_cache();
 
     // Sweep triggers whose entities disappeared from discovery
-    if (trigger_mgr_) {
-      trigger_mgr_->sweep_orphaned_triggers();
+    if (trigger_host_.manager) {
+      trigger_host_.manager->sweep_orphaned_triggers();
     }
   });
 
@@ -1564,17 +1214,29 @@ GatewayNode::GatewayNode(const rclcpp::NodeOptions & options) : Node("ros2_medki
   });
 
   // Start REST server with configured host, port, CORS, auth, and TLS
-  rest_server_ = std::make_unique<RESTServer>(this, server_host_, server_port_, cors_config_, auth_config_,
-                                              rate_limit_config_, tls_config_);
+  RestConfig rest_config;
+  rest_config.http_thread_pool_size = get_parameter("server.http_thread_pool_size").as_int();
+  rest_config.keep_alive_timeout_sec = get_parameter("server.keep_alive_timeout_sec").as_int();
+  rest_config.sse_keepalive_interval_sec = get_parameter("sse.keepalive_interval_sec").as_int();
+  rest_config.sse_max_duration_sec = get_parameter("sse.max_duration_sec").as_int();
+  rest_config.docs_enabled = get_parameter("docs.enabled").as_bool();
+  rest_config.server_host = server_host_;
+  rest_config.server_port = server_port_;
+  fault_event_source_ = std::make_unique<Ros2FaultEventSource>(*this, build_fault_manager_events_topic(this));
+  rest_config.logger_name = get_logger().get_name();
+
+  rest_server_ =
+      std::make_unique<RESTServer>(*this, std::make_shared<Ros2LifecycleStateReader>(this), server_host_, server_port_,
+                                   cors_config_, auth_config_, rate_limit_config_, rest_config, tls_config_);
 
   // Wire trigger handlers into REST server
-  if (trigger_mgr_) {
-    rest_server_->set_trigger_handlers(*trigger_mgr_);
+  if (trigger_host_.manager) {
+    rest_server_->set_trigger_handlers(*trigger_host_.manager);
   }
 
   // Wire aggregation manager into REST server handler context
-  if (aggregation_mgr_) {
-    rest_server_->set_aggregation_manager(aggregation_mgr_.get());
+  if (aggregation_host_) {
+    rest_server_->set_aggregation_manager(&aggregation_host_->manager());
   }
 
   start_rest_server();
@@ -1598,17 +1260,15 @@ size_t GatewayNode::count_peer_nodes(const std::vector<std::pair<std::string, st
   size_t count = 0;
   for (const auto & [name, ns] : nodes_and_namespaces) {
     if (!name.empty() && name.front() == '_') {
-      continue;  // hidden node (name part starts with '_')
+      continue;  // hidden node, including the gateway's own helper nodes
     }
     std::string fqn = ns;
     if (ns != "/") {
       fqn += "/";
     }
     fqn += name;
-    // Exclude the gateway's own nodes by exact FQN: the main node and its known
-    // internal helpers. A plain prefix match would also drop a genuine peer whose
-    // name starts with the gateway name (e.g. "<fqn>_monitor" or "<fqn>2").
-    if (fqn == self_fqn || fqn == self_fqn + "_sub" || fqn == self_fqn + "_fault_clients") {
+    // Exact match: a peer named "<fqn>_monitor" or "<fqn>2" is still a peer.
+    if (fqn == self_fqn) {
       continue;
     }
     ++count;
@@ -1642,8 +1302,8 @@ void GatewayNode::log_startup_summary() {
         ++topic_count;
       }
     }
-    peer_node_count =
-        count_peer_nodes(get_node_graph_interface()->get_node_names_and_namespaces(), get_fully_qualified_name());
+    // Read through discovery's own reader, so a leftover discovery leaves out is not a peer either.
+    peer_node_count = count_peer_nodes(discovery_mgr_->read_graph_nodes().nodes, get_fully_qualified_name());
   } catch (const std::exception & e) {
     RCLCPP_DEBUG(get_logger(), "Startup summary: graph query failed: %s", e.what());
   }
@@ -1674,22 +1334,21 @@ void GatewayNode::log_startup_summary() {
 
 GatewayNode::~GatewayNode() {
   RCLCPP_INFO(get_logger(), "Shutting down ROS 2 Medkit Gateway...");
-  // 0. Stop mDNS discovery first (prevents new peer additions during shutdown)
-  if (mdns_discovery_) {
-    mdns_discovery_->stop();
+  // 0. Stop the lock reaper: it removes subscriptions through the transports shut down below.
+  if (lock_reaper_) {
+    lock_reaper_->stop();
   }
-  // 0b. Cancel in-flight peer HTTP calls so REST worker threads that are
-  //     mid-forward unblock promptly. Without this, stop_rest_server() below
-  //     waits for those workers to finish their full peer read timeout,
-  //     which under TSan / heavy load exceeds the launch_test SIGINT grace
-  //     window and forces a SIGKILL with non-zero exit. The handlers still
-  //     hold references to aggregation_mgr_, so we do not destroy it here
-  //     - only cancel its outbound calls.
-  if (aggregation_mgr_) {
-    aggregation_mgr_->shutdown();
+  // 0b. Stop mDNS discovery (prevents new peer additions during shutdown) and cancel in-flight
+  //     peer HTTP calls so REST worker threads that are mid-forward unblock promptly. Without
+  //     this, stop_rest_server() below waits for those workers to finish their full peer read
+  //     timeout, which under TSan / heavy load exceeds the launch_test SIGINT grace window and
+  //     forces a SIGKILL with non-zero exit. The handlers still hold references to the
+  //     aggregation manager, so it is not destroyed here - only its outbound calls are cancelled.
+  if (aggregation_host_) {
+    aggregation_host_->shutdown();
   }
   // 1. Stop REST server (kills HTTP connections, SSE streams exit)
-  //    Handlers may reference aggregation_mgr_, so it must outlive the server.
+  //    Handlers may reference the aggregation manager, so it must outlive the server.
   stop_rest_server();
   // 2. Shutdown subscriptions via transport registry (calls sub_mgr.shutdown(),
   //    which triggers on_removed -> transport->stop() for each active subscription)
@@ -1701,14 +1360,34 @@ GatewayNode::~GatewayNode() {
     trigger_topic_subscriber_->shutdown();
   }
   // 4. Shutdown trigger subsystem (wakes SSE trigger streams)
-  if (trigger_mgr_) {
-    trigger_mgr_->shutdown();
+  if (trigger_host_.manager) {
+    trigger_host_.manager->shutdown();
+  }
+  // 4b. Drain in-flight update tasks BEFORE the notifier is shut down and
+  //     freed. Update tasks run on their own std::async threads (not the
+  //     executor), and each calls ResourceChangeNotifier::notify() once the
+  //     backend returns. ~UpdateManager is what joins them, but update_mgr_ is
+  //     declared before resource_change_notifier_, so reverse member
+  //     destruction frees the notifier FIRST - a task still inside prepare()
+  //     then wrote to freed memory (ASan heap-use-after-free in notify()).
+  //     Draining here makes the join order explicit instead of a consequence of
+  //     declaration order.
+  if (update_mgr_) {
+    update_mgr_->shutdown();
   }
   // 5. Shutdown resource change notifier (stops worker thread)
   if (resource_change_notifier_) {
     resource_change_notifier_->shutdown();
   }
-  // 6. Shutdown plugins
+  // 5b. Stop the fault-trigger evaluation loop BEFORE plugin/fault shutdown:
+  //     it resolves into plugin routes and the FaultManager, neither of which
+  //     may be used once shutdown_all() has run.
+  fault_trigger_host_.reset();
+  // 6. Drop the entity freeze-frame capture BEFORE plugin shutdown: its
+  //    capture thread (joined here) resolves into plugin DataProviders and
+  //    routes, which must not be reachable once shutdown_all() has run.
+  entity_freeze_frame_capture_.reset();
+  //    Shutdown plugins
   if (plugin_mgr_) {
     plugin_mgr_->shutdown_all();
   }
@@ -1819,6 +1498,118 @@ PluginManager * GatewayNode::get_plugin_manager() const {
   return plugin_mgr_.get();
 }
 
+void GatewayNode::init_entity_freeze_frame_capture(ros2_common::Ros2SubscriptionExecutor & exec) {
+  // Snapshot the faulting entity's current data values when its fault confirms.
+  // Only useful when a plugin can own entities, so gated on loaded plugins.
+  if (!get_parameter("entity_freeze_frame.enabled").as_bool() || !plugin_mgr_ || !plugin_mgr_->has_plugins()) {
+    return;
+  }
+  entity_freeze_frame_capture_ = std::make_unique<EntityFreezeFrameCapture>(
+      this, exec,
+      [this](const std::string & entity_id) {
+        return plugin_mgr_ ? plugin_mgr_->get_data_provider_for_entity(entity_id) : nullptr;
+      },
+      // Plugins without a DataProvider (the commercial PLC bridges) serve live
+      // values only through their own x-plc-data route - dispatch it in-process
+      // as the capture fallback.
+      [this](const std::string & entity_id) -> std::optional<nlohmann::json> {
+        return plugin_mgr_ ? plugin_mgr_->fetch_entity_data_via_route(entity_id) : std::nullopt;
+      },
+      256,  // retained-frame bound (constructor default)
+      // Plugins start polling - and reporting - while this object is still
+      // being wired, and a device that is in fault when the box boots confirms
+      // immediately, to nobody. The capture asks for those on its own thread,
+      // which it joins on destruction; should_abort lets that join interrupt
+      // the service wait.
+      [this](const std::function<bool()> & should_abort) {
+        std::vector<EntityFreezeFrameCapture::StandingFault> standing;
+        if (!fault_service_transport_) {
+          RCLCPP_WARN(get_logger(), "Standing-fault freeze-frame catch-up skipped: fault transport not initialised");
+          return standing;
+        }
+        // One deadline for the whole wait, polled in slices so shutdown can
+        // abort it (wait_for_services itself shares the slice across clients).
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        const auto context = get_node_base_interface()->get_context();
+        bool ready = false;
+        while (!ready && !should_abort()) {
+          // After rclcpp::shutdown() every wait returns at once, so the loop would spin.
+          if (!rclcpp::ok(context)) {
+            RCLCPP_INFO(get_logger(), "Standing-fault freeze-frame catch-up skipped: rclcpp is shutting down");
+            return standing;
+          }
+          const std::chrono::duration<double> remaining = deadline - std::chrono::steady_clock::now();
+          if (remaining <= std::chrono::duration<double>::zero()) {
+            break;
+          }
+          ready = fault_service_transport_->wait_for_services(std::min(std::chrono::duration<double>(0.5), remaining));
+        }
+        if (!ready) {
+          if (!should_abort()) {
+            RCLCPP_WARN(get_logger(),
+                        "Standing-fault freeze-frame catch-up skipped: fault services not available within 10s");
+          }
+          return standing;
+        }
+        auto result = fault_service_transport_->list_faults("", false, true, false, false, false, false);
+        if (!result.success) {
+          RCLCPP_WARN(get_logger(), "Standing-fault freeze-frame catch-up skipped: ListFaults failed: %s",
+                      result.error_message.c_str());
+          return standing;
+        }
+        auto parsed = EntityFreezeFrameCapture::standing_faults_from_list_reply(result.data);
+        if (!parsed) {
+          RCLCPP_WARN(get_logger(), "Standing-fault freeze-frame catch-up skipped: malformed ListFaults reply");
+          return standing;
+        }
+        if (parsed->empty()) {
+          RCLCPP_INFO(get_logger(), "Standing-fault freeze-frame catch-up: no confirmed faults at startup");
+        }
+        return std::move(*parsed);
+      });
+}
+
+EntityFreezeFrameCapture * GatewayNode::get_entity_freeze_frame_capture() const {
+  return entity_freeze_frame_capture_.get();
+}
+
+void GatewayNode::set_trigger_subscription_executor(ros2_common::Ros2SubscriptionExecutor & exec) {
+  if (trigger_topic_subscriber_) {
+    trigger_topic_subscriber_->set_subscription_executor(&exec);
+  }
+}
+
+void GatewayNode::shutdown_trigger_subscriber() {
+  if (trigger_topic_subscriber_) {
+    trigger_topic_subscriber_->shutdown();
+  }
+}
+
+void GatewayNode::init_fault_trigger_engine() {
+  if (!plugin_mgr_) {
+    return;
+  }
+  FaultTriggerHostConfig config;
+  config.enabled = get_parameter("fault_triggers.enabled").as_bool();
+  config.storage_path = get_parameter("fault_triggers.storage.path").as_string();
+  config.poll_interval_ms = get_parameter("fault_triggers.poll_interval_ms").as_int();
+  FaultTriggerHostWiring wiring;
+  wiring.cache = &thread_safe_cache_;
+  wiring.plugins = plugin_mgr_.get();
+  wiring.faults = fault_mgr_.get();
+  wiring.log = [this](const std::string & message) {
+    RCLCPP_INFO(get_logger(), "%s", message.c_str());
+  };
+  wiring.warn = [this](const std::string & message) {
+    RCLCPP_WARN(get_logger(), "%s", message.c_str());
+  };
+  fault_trigger_host_ = make_fault_trigger_host(config, wiring);
+}
+
+FaultTriggerEngine * GatewayNode::get_fault_trigger_engine() const {
+  return fault_trigger_host_ ? &fault_trigger_host_->engine() : nullptr;
+}
+
 ResourceSamplerRegistry * GatewayNode::get_sampler_registry() const {
   return sampler_registry_.get();
 }
@@ -1836,7 +1627,7 @@ ResourceChangeNotifier * GatewayNode::get_resource_change_notifier() const {
 }
 
 TriggerManager * GatewayNode::get_trigger_manager() const {
-  return trigger_mgr_.get();
+  return trigger_host_.manager.get();
 }
 
 ConditionRegistry * GatewayNode::get_condition_registry() const {
@@ -1844,7 +1635,7 @@ ConditionRegistry * GatewayNode::get_condition_registry() const {
 }
 
 AggregationManager * GatewayNode::get_aggregation_manager() const {
-  return aggregation_mgr_.get();
+  return aggregation_host_ ? &aggregation_host_->manager() : nullptr;
 }
 
 namespace {
@@ -1936,6 +1727,12 @@ void GatewayNode::handle_entity_change_notification(const EntityChangeScope & sc
           RCLCPP_WARN(get_logger(),
                       "notify_entities_changed: manifest reload failed (see validation errors); "
                       "continuing refresh against the previously loaded manifest");
+        } else {
+          // The reloaded manifest may carry a different discovery
+          // configuration. /health reads it live, so without this the served
+          // unmanifested_policy would describe a policy the orphan filter is
+          // not running.
+          discovery_mgr_->refresh_manifest_config();
         }
       }
     }
@@ -1961,6 +1758,33 @@ void GatewayNode::trigger_reentrant_notification_for_testing(const EntityChangeS
     ResetGuard & operator=(ResetGuard &&) = delete;
   } reset_guard;
   handle_entity_change_notification(scope);
+}
+
+void GatewayNode::stop_discovery_refresh_for_testing() {
+  // Cancel the refresh drivers and drop the graph event so no further
+  // refresh_cache() pass can clobber a test-injected entity cache. Safe to
+  // call right after construction (the constructor already ran one refresh).
+  //
+  // Mirror the destructor's teardown order: cancel AND reset all three timers
+  // before releasing graph_event_. The racing party is rclcpp's graph-listener
+  // thread (started by get_graph_event() in the constructor, independent of the
+  // executor), which may concurrently iterate the registered graph events.
+  // Resetting the timers first drops their [this]-captured graph_event_ copies,
+  // so the reset below shrinks the window on the Event control block exactly as
+  // ~GatewayNode does.
+  if (graph_check_timer_) {
+    graph_check_timer_->cancel();
+    graph_check_timer_.reset();
+  }
+  if (backstop_timer_) {
+    backstop_timer_->cancel();
+    backstop_timer_.reset();
+  }
+  if (startup_summary_timer_) {
+    startup_summary_timer_->cancel();
+    startup_summary_timer_.reset();
+  }
+  graph_event_.reset();
 }
 
 void GatewayNode::refresh_cache() {
@@ -1990,6 +1814,9 @@ void GatewayNode::refresh_cache() {
     auto areas = discovery_mgr_->discover_areas();
     auto apps = discovery_mgr_->discover_apps();
     auto functions = discovery_mgr_->discover_functions(apps);
+    // Functions only runtime introspection created. A peer or a plugin that
+    // contributes the same id below removes it.
+    auto introspection_only_ids = discovery_mgr_->introspection_only_function_ids(functions);
 
     // In RUNTIME_ONLY mode: HostInfoProvider component or empty.
     // In HYBRID/MANIFEST_ONLY: pipeline-merged or manifest components.
@@ -2013,53 +1840,18 @@ void GatewayNode::refresh_cache() {
     // Merge remote peer entities if aggregation is active.
     // Keep the routing table accessible for the internal-node filter below.
     std::unordered_map<std::string, std::string> peer_routing_table;
-    if (aggregation_mgr_ && aggregation_mgr_->peer_count() > 0) {
-      aggregation_mgr_->check_all_health();
-      auto logger = get_logger();
-      auto merged =
-          aggregation_mgr_->fetch_and_merge_peer_entities(areas, all_components, apps, functions, 10000, &logger);
-      areas = std::move(merged.areas);
-      all_components = std::move(merged.components);
-      apps = std::move(merged.apps);
-      functions = std::move(merged.functions);
-      peer_routing_table = std::move(merged.routing_table);
-      aggregation_mgr_->update_routing_table(peer_routing_table);
-      aggregation_mgr_->set_leaf_warnings(std::move(merged.leaf_warnings));
-
-      // Track per-entity peer contributors: entity id -> list of peer
-      // names that host or contribute to it. Covers both routed leaves
-      // (also tracked via routing_table) and merged / hierarchical entities
-      // (Areas, Functions, parent Components). Fan-out helpers use this map
-      // to target per-entity collection requests at the peers that actually
-      // own the entity, avoiding spurious 404s from non-contributing peers.
-      //
-      // The "peer:" prefix is stripped from the contributors list produced
-      // by EntityMerger. Entries starting with anything else (including
-      // "local") are ignored.
-      std::unordered_map<std::string, std::vector<std::string>> peer_contributors;
-      static constexpr std::string_view kPeerPrefix = "peer:";
-      auto collect_contributors = [&peer_contributors](const auto & entities) {
-        for (const auto & e : entities) {
-          for (const auto & c : e.contributors) {
-            if (c.rfind(kPeerPrefix, 0) != 0) {
-              continue;
-            }
-            std::string peer_name = c.substr(kPeerPrefix.size());
-            if (peer_name.empty()) {
-              continue;
-            }
-            auto & list = peer_contributors[e.id];
-            if (std::find(list.begin(), list.end(), peer_name) == list.end()) {
-              list.push_back(std::move(peer_name));
+    if (aggregation_host_) {
+      if (auto routing_table = aggregation_host_->merge_peers(areas, all_components, apps, functions)) {
+        peer_routing_table = std::move(*routing_table);
+        for (const auto & func : functions) {
+          for (const auto & contributor : func.contributors) {
+            if (contributor.rfind("peer:", 0) == 0) {
+              introspection_only_ids.erase(func.id);
+              break;
             }
           }
         }
-      };
-      collect_contributors(areas);
-      collect_contributors(all_components);
-      collect_contributors(apps);
-      collect_contributors(functions);
-      aggregation_mgr_->update_peer_contributors(std::move(peer_contributors));
+      }
     }
 
     // Inject plugin entities (non-hybrid) and refresh entity ownership (all modes).
@@ -2089,7 +1881,9 @@ void GatewayNode::refresh_cache() {
               continue;
             }
             entity_ids.push_back(area.id);
-            area.source = "plugin";
+            if (area.source.empty()) {
+              area.source = "plugin";
+            }
             areas.push_back(std::move(area));
           }
           for (auto & comp : result.new_entities.components) {
@@ -2099,7 +1893,9 @@ void GatewayNode::refresh_cache() {
               continue;
             }
             entity_ids.push_back(comp.id);
-            comp.source = "plugin";
+            if (comp.source.empty()) {
+              comp.source = "plugin";
+            }
             all_components.push_back(std::move(comp));
           }
           for (auto & app : result.new_entities.apps) {
@@ -2108,7 +1904,9 @@ void GatewayNode::refresh_cache() {
               continue;
             }
             entity_ids.push_back(app.id);
-            app.source = "plugin";
+            if (app.source.empty()) {
+              app.source = "plugin";
+            }
             apps.push_back(std::move(app));
           }
           for (auto & func : result.new_entities.functions) {
@@ -2118,7 +1916,10 @@ void GatewayNode::refresh_cache() {
               continue;
             }
             entity_ids.push_back(func.id);
-            func.source = "plugin";
+            introspection_only_ids.erase(func.id);
+            if (func.source.empty()) {
+              func.source = "plugin";
+            }
             functions.push_back(std::move(func));
           }
         } else {
@@ -2152,16 +1953,37 @@ void GatewayNode::refresh_cache() {
       }
     }
 
-    // Filter ROS 2 internal nodes (underscore prefix convention).
+    // Filter ROS 2 internal nodes (underscore prefix convention) and this
+    // gateway's own helper nodes.
     // Controlled by discovery.runtime.filter_internal_nodes parameter (default: true).
     // Covers local heuristic apps (which bypass the merge pipeline orphan filter
     // in runtime_only mode) and any peer apps that slipped through fetch_entities.
     if (filter_internal_nodes_) {
-      auto removed = filter_internal_node_apps(apps, peer_routing_table);
+      std::vector<std::string> dropped_declared_apps;
+      auto removed =
+          filter_internal_node_apps(apps, peer_routing_table, get_fully_qualified_name(), &dropped_declared_apps);
       if (removed > 0) {
-        RCLCPP_DEBUG(get_logger(), "Filtered %zu internal node apps (_ prefix)", removed);
+        RCLCPP_DEBUG(get_logger(), "Filtered %zu internal node apps (_ prefix or own helper node)", removed);
+      }
+      // Warn on the set, not on the refresh. The condition is a static
+      // misconfiguration - an app declared against a helper node stays declared
+      // - while this function runs on every graph event and again on the
+      // backstop cadence, which the integration fixtures set to one second. The
+      // same one-shot discipline as the entity-cache WARN below, widened to
+      // re-fire when the set of offending apps actually changes.
+      if (remember_dropped_declared_apps(dropped_declared_apps, warned_helper_bound_apps_)) {
+        for (const auto & dropped : dropped_declared_apps) {
+          RCLCPP_WARN(get_logger(),
+                      "Declared app '%s' is bound to one of this gateway's own in-process helper nodes and is not "
+                      "served. Those nodes carry no parameters, services or actions to diagnose. Bind the app to the "
+                      "node you meant, or drop the declaration.",
+                      dropped.c_str());
+        }
       }
     }
+
+    // Every filter and merge has run: a Function hosts only what is served.
+    keep_served_function_hosts(functions, apps, all_components, introspection_only_ids);
 
     // Capture sizes for logging
     const size_t area_count = areas.size();
@@ -2255,22 +2077,81 @@ void GatewayNode::stop_rest_server() {
   }
 }
 
+void keep_served_function_hosts(std::vector<Function> & functions, const std::vector<App> & apps,
+                                const std::vector<Component> & components,
+                                const std::unordered_set<std::string> & introspection_only_ids) {
+  std::unordered_set<std::string> served_ids;
+  for (const auto & app : apps) {
+    served_ids.insert(app.id);
+  }
+  for (const auto & comp : components) {
+    served_ids.insert(comp.id);
+  }
+  std::vector<Function> kept;
+  kept.reserve(functions.size());
+  for (auto & func : functions) {
+    func.hosts.erase(std::remove_if(func.hosts.begin(), func.hosts.end(),
+                                    [&served_ids](const std::string & host) {
+                                      return served_ids.count(host) == 0;
+                                    }),
+                     func.hosts.end());
+    // Introspection creates a Function only for a namespace that holds apps.
+    // A Function anything else contributed to stays without hosts.
+    if (func.hosts.empty() && introspection_only_ids.count(func.id) > 0) {
+      continue;
+    }
+    kept.push_back(std::move(func));
+  }
+  functions = std::move(kept);
+}
+
+bool remember_dropped_declared_apps(const std::vector<std::string> & dropped, std::set<std::string> & remembered) {
+  std::set<std::string> current(dropped.begin(), dropped.end());
+  if (current == remembered) {
+    return false;
+  }
+  remembered = std::move(current);
+  // An empty set is remembered so the condition clearing and coming back warns
+  // again, but there is nothing to say about no apps at all.
+  return !remembered.empty();
+}
+
 size_t filter_internal_node_apps(std::vector<App> & apps,
-                                 const std::unordered_map<std::string, std::string> & peer_routing_table) {
+                                 const std::unordered_map<std::string, std::string> & peer_routing_table,
+                                 const std::string & self_fqn, std::vector<std::string> * dropped_declared_apps) {
   auto before = apps.size();
-  auto end = std::remove_if(apps.begin(), apps.end(), [&peer_routing_table](const App & app) {
-    std::string original_id = app.id;
-    auto rt_it = peer_routing_table.find(app.id);
-    if (rt_it != peer_routing_table.end()) {
-      // Known remote entity: strip "peer_name__" prefix if present
-      const std::string & peer_name = rt_it->second;
-      std::string prefix = peer_name + "__";
-      if (original_id.size() > prefix.size() && original_id.compare(0, prefix.size(), prefix) == 0) {
-        original_id = original_id.substr(prefix.size());
+  auto end = std::remove_if(apps.begin(), apps.end(), [&](const App & app) {
+    // A peer filtered its own Apps by its own rules and configuration.
+    if (peer_routing_table.count(app.id) > 0) {
+      return false;
+    }
+    const std::string node_fqn = app.effective_fqn();
+    if (is_own_gateway_helper_node(node_fqn, self_fqn)) {
+      // A local app bound to one of this gateway's own helper nodes. The
+      // underscore rule below reads a declared app's id, which need not start
+      // with '_', so only the FQN test catches every app on a helper node.
+      // The gateway's own node is deliberately not covered: its ROS parameters
+      // are served as that App's configurations, so callers reach them at
+      // /apps/<gateway>/configurations.
+      //
+      // Dropping a runtime-discovered app is the whole point and stays quiet.
+      // Any other app was declared by a manifest or a plugin, and dropping it
+      // overrides that declaration. The caller owns the logger and reports it.
+      if (dropped_declared_apps != nullptr && app.source != discovery::kRuntimeAppSource) {
+        dropped_declared_apps->push_back(app.id + " -> " + node_fqn);
+      }
+      return true;
+    }
+    // ROS 2 internal nodes use the '_' prefix convention on the node name. A
+    // runtime app is judged by its node name only, because a name collision
+    // prefixes its id with the namespace. Every other app is judged by its id.
+    if (app.source == discovery::kRuntimeAppSource) {
+      const auto last_slash = node_fqn.rfind('/');
+      if (last_slash != std::string::npos && last_slash + 1 < node_fqn.size()) {
+        return node_fqn[last_slash + 1] == '_';
       }
     }
-    // ROS 2 internal nodes use _ prefix convention
-    return !original_id.empty() && original_id[0] == '_';
+    return !app.id.empty() && app.id[0] == '_';
   });
   apps.erase(end, apps.end());
   return before - apps.size();
