@@ -1,207 +1,106 @@
-<!-- The logo, header and diagram live in the selfpatch/.github repository (profile/design/ros2_medkit.html), so this repository carries no image binaries. Change them there, and keep each image's alt text here in step with its words. -->
+# ros2_medkit_fault_detection
 
-<a href="https://selfpatch.ai"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/logo-dark.png"><img src="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/logo-light.png" alt="selfpatch.ai" height="30"></picture></a>
+Shared, protocol-agnostic fault-detection model for medkit gateway plugins.
+A single evaluator maps a raw value read from any source (OPC UA, S7, Modbus,
+ADS, ...) to the set of faults it implies, so every protocol plugin detects
+faults the same way.
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/header-dark.png"><img src="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/header-light.png" alt="ros2_medkit: see what broke on any ROS 2 robot, from one REST API." width="100%"></picture>
+## Detection modes
 
-[![CI](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml/badge.svg)](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/selfpatch/ros2_medkit/branch/main/graph/badge.svg)](https://codecov.io/gh/selfpatch/ros2_medkit)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selfpatch.github.io/ros2_medkit/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![ROS 2 Jazzy | Humble | Lyrical](https://img.shields.io/badge/ROS%202-Jazzy%20%7C%20Humble%20%7C%20Lyrical-blue)](https://docs.ros.org/en/jazzy/)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/6CXPMApAyq)
+Composable per mapped point in a plugin's node map:
 
-ros2_medkit gives your ROS 2 robot a diagnostics REST API. It finds every node, topic, service and
-action by itself, and turns failures - error logs, failed actions, `/diagnostics` - into clear
-faults: what broke, where, how bad, with a snapshot and a rosbag of the moment it happened.
-No changes to your code.
+- **threshold** (`ThresholdRule`) - numeric above/below a setpoint. A boolean
+  point is alarm-on-true.
+- **status word** (`StatusWordRule`) - decode named bits of an integer status
+  register; one fault per configured bit.
+- **fault enum** (`EnumMapRule`) - map a fault-code register value to a fault
+  code + text; one fault per configured code, with an `ok_value` meaning
+  "no fault".
 
-<a name="run-it-in-5-minutes"></a>
+## API
 
-## Quick start
+```cpp
+#include "ros2_medkit_fault_detection/fault_detection.hpp"
+namespace fd = ros2_medkit::fault_detection;
 
-1. Get [Docker](https://docs.docker.com/get-started/get-docker/), if you don't have it yet.
+// Pure evaluator: value + rule -> set of (active/inactive) fault signals.
+std::vector<fd::FaultSignal> signals = fd::evaluate(value, rule);
 
-2. While your robot is running, start ros2_medkit on its computer:
-
-   ```bash
-   docker run --rm --network host --ipc host \
-     -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \
-     -e RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}" \
-     ghcr.io/selfpatch/ros2_medkit-jazzy:latest \
-     ros2 launch ros2_medkit_gateway bringup.launch.py
-   ```
-
-   On Humble or Lyrical, change `jazzy` to `humble` or `lyrical`.
-
-3. See what it found:
-
-   ```bash
-   curl localhost:8080/api/v1/apps     # every node on your robot
-   curl localhost:8080/api/v1/faults   # everything that has failed
-   ```
-
-   Or browse the whole API at [localhost:8080/api/v1/docs](http://localhost:8080/api/v1/docs).
-
-> [!TIP]
-> That's it. ros2_medkit is now watching your robot, and every new failure shows up as a fault.
-
-**No robot at hand?** The sensor demo runs on any laptop and lets you break things on purpose
-(it needs `curl` and `jq`):
-
-```bash
-git clone https://github.com/selfpatch/selfpatch_demos.git
-cd selfpatch_demos/demos/sensor_diagnostics
-./run-demo.sh     # web UI on http://localhost:3000
-./inject-nan.sh   # break a sensor, then watch the fault appear
+// Stateful raise/clear edge detector over successive evaluations.
+fd::FaultTransitionTracker tracker;
+std::vector<fd::FaultSignal> transitions = tracker.apply(signals);  // raises + clears
 ```
 
-<details>
-<summary>What a fault looks like</summary>
+`evaluate` reports the full set of faults a rule governs (each flagged active
+or inactive). `FaultTransitionTracker` keeps the last-known state per
+`fault_code` and emits only the raise/clear edges, which a plugin forwards to
+the fault manager as report/clear.
 
-<br>
+## Waiting before a raise
 
-After a Nav2 goal is aborted:
+One bad reading is enough for `evaluate` to call a fault active. A bridge that
+reports on that edge sends one `EVENT_FAILED`, which the fault manager's debounce
+cannot filter, so the filter has to sit where the samples are. A
+`RaiseQualifier` makes a rule wait: the condition must be seen on `min_samples`
+new samples in a row and must hold for `min_duration` without a break (both,
+when both are set). The default raises on the first sample, as before.
 
-```jsonc
-// GET /api/v1/faults
-{
-  "items": [
-    { "fault_code": "ACTION_NAVIGATE_TO_POSE_ABORTED",
-      "severity_label": "ERROR", "status": "CONFIRMED",
-      "reporting_sources": ["/bt_navigator"] }
-  ],
-  "x-medkit": { "count": 1 }
-}
+```cpp
+fd::RaiseQualifier q;
+q.min_samples = 3;
+q.min_duration = std::chrono::milliseconds(2000);
+
+fd::RaiseQualifierFilter filter;  // between evaluate and the tracker
+auto edges = tracker.apply(filter.apply(fd::evaluate(value, rule), q, now, fresh));
 ```
 
-Each fault also keeps a snapshot of the moment it happened and a rosbag of the seconds around it:
+- A fault that is still waiting goes out as inactive, so nothing is raised.
+- Only the raise waits. The first inactive sample clears at once and the next
+  raise has to qualify again.
+- `fresh` says whether the call carries a new sample. Only fresh samples count
+  toward `min_samples`. A call that is not fresh can still complete
+  `min_duration`, so a source that reports changes only can be re-checked on a
+  timer. Do not pass a value that could not be read: that is unknown, not
+  unchanged.
+- An undecidable value (no signal) keeps the wait as it is.
+- `reset_pending()` drops faults that are still waiting, for example when the
+  connection is lost. Faults already raised stay raised. `has_pending()` tells a
+  change-driven caller whether it needs to call again on a timer.
+- A source that reports changes only has no samples to count. Use
+  `q.for_change_notifications(period)` there: `min_samples` samples `period`
+  apart become a wait of `(min_samples - 1) x period`, or `min_duration` when
+  that is longer. Then pass `fresh = true` for a change of the point and
+  `fresh = false` for a timer call.
 
-```bash
-curl localhost:8080/api/v1/apps/bt_navigator/faults/ACTION_NAVIGATE_TO_POSE_ABORTED
-curl -O -J localhost:8080/api/v1/apps/bt_navigator/bulk-data/rosbags/ACTION_NAVIGATE_TO_POSE_ABORTED
-```
+## Shared fault types
 
-</details>
+`fault_types.hpp` holds the std-only types that the ROS-free fault reporter core and fault manager core
+exchange: `ReportKind`, `FaultReport`, `FaultRecord`, `FaultEventRecord`, and the
+constants for severity, fault status and fault event type. They mirror `Fault.msg`, `FaultEvent.msg`
+and `ReportFault.srv` in `ros2_medkit_msgs`. Times are `int64_t` nanoseconds since the Unix epoch;
+0 means never. The ROS adapters of both packages convert to and from the messages at their edge.
 
-<details>
-<summary>Watch faults live, or add the web UI</summary>
+`cmake/fault_reporter_core.cmake` and `cmake/fault_manager_core.cmake` define an INTERFACE target
+`ros2_medkit_fault_detection` for `include/` of this package when the ament target is absent. That lets
+the cores build with plain CMake. See the READMEs of `ros2_medkit_fault_reporter` and
+`ros2_medkit_fault_manager`.
 
-<br>
+## Placement and packaging
 
-```bash
-# Faults as they happen
-curl -N localhost:8080/api/v1/faults/stream
+This is a **header-only INTERFACE package**: the detection logic is compiled
+directly into each consuming plugin. Protocol plugins are built as MODULE
+libraries that resolve gateway symbols from the host process at load time
+(`-Wl,--unresolved-symbols=ignore-all`); a separately linked shared library
+would not be present in that host, so the logic is compiled in instead. The
+header has no ROS or protocol dependencies, which keeps the evaluator a pure,
+trivially unit-testable function.
 
-# A dashboard in the browser: open http://localhost:3000, click Connect, enter http://localhost:8080
-docker run -p 3000:80 ghcr.io/selfpatch/ros2_medkit_web_ui:latest
-```
+It lives in the open `ros2_medkit` repo so both the open OPC UA plugin
+(`ros2_medkit_opcua`) and future protocol plugins can depend on it.
 
-The browser calls the gateway from a different origin, so the gateway must allow that origin via
-CORS. The Docker image and `bringup.launch.py` allow `http://localhost:3000` and
-`http://localhost:5173`. The origin must match exactly: `http://127.0.0.1:3000` is not
-`http://localhost:3000`. To allow other origins, pass the full list, for example
-`cors_allowed_origins:=http://localhost:3000,http://127.0.0.1:3000` (it replaces the defaults).
+## Consumers
 
-See the [web UI tutorial](https://selfpatch.github.io/ros2_medkit/tutorials/web-ui.html) and the
-[Postman collection](postman/).
-
-</details>
-
-<details>
-<summary>Install without Docker</summary>
-
-<br>
-
-ros2_medkit is on its way into the official ROS packages. Once it reaches your distro:
-
-```bash
-sudo apt install ros-jazzy-ros2-medkit-gateway   # or ros-humble- / ros-lyrical-
-ros2 launch ros2_medkit_gateway bringup.launch.py
-```
-
-To build from source or use Pixi, follow the
-[installation guide](https://selfpatch.github.io/ros2_medkit/installation.html).
-
-</details>
-
-<details>
-<summary>Troubleshooting</summary>
-
-<br>
-
-- Robot missing? Run ros2_medkit on the robot's computer, or one on the same network, from a
-  terminal where your ROS 2 setup works.
-- Opening it from another computer? Add `server_host:=0.0.0.0` to the end of the command in
-  step 2, on a network you trust, and use the robot's IP address instead of `localhost`.
-- Running it in a container without `--network host`? `bringup.launch.py` binds the REST API to
-  `127.0.0.1`, which is then the container's own loopback, and the published port answers with
-  `Connection reset by peer` or an empty reply. Add `server_host:=0.0.0.0` and publish the port as
-  `-p 127.0.0.1:8080:8080`, which keeps the API, unauthenticated by default, off the LAN.
-- No faults from `/diagnostics`? Add `enable_diagnostic_bridge:=true` to the end of the command
-  in step 2.
-- Still stuck? See [troubleshooting](https://selfpatch.github.io/ros2_medkit/troubleshooting.html)
-  or ask on [Discord](https://discord.gg/6CXPMApAyq).
-
-</details>
-
-## How it works
-
-<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/how-it-works-dark.png"><img src="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/how-it-works-light.png" alt="How it works. Your robot: error logs, failed actions, /diagnostics, and your own nodes through FaultReporter. ros2_medkit listens to logs, actions and diagnostics, records each fault with its history, a snapshot and a rosbag, and serves it all on one REST API, with every node it found. You read it from a browser, curl, the web UI or an AI assistant." width="100%"></picture>
-
-ros2_medkit listens to what your robot already publishes, so it works without code changes. For
-more control, report faults from your own nodes with the
-[`FaultReporter`](src/ros2_medkit_fault_reporter) client, see the
-[integration tutorial](https://selfpatch.github.io/ros2_medkit/tutorials/integration.html).
-The API follows SOVD (ISO 17978), the diagnostics standard from the automotive world.
-
-## Features
-
-- Finds every node, topic, service and action, with no config
-- Turns error logs, failed actions and `/diagnostics` into faults
-- Confirms each fault, keeps its history and clears it once it's fixed
-- Saves a snapshot and a rosbag of the moment each fault happened
-- Reads any topic as JSON, calls services and actions, and reads and sets parameters
-- Streams faults as they happen
-- Software updates through a plugin, and sign-in with per-user permissions
-- Rosbags open in whatever tool you already use to browse robot data
-
-<a name="vs-standard-ros-2-diagnostics"></a>
-
-## Compared with standard ROS 2 diagnostics
-
-ros2_medkit builds on them. It reads `/diagnostics` too, so keep your `diagnostic_updater` code.
-
-| | Standard ROS 2 diagnostics | ros2_medkit |
-|---|---|---|
-| Where you see it | A desktop app next to the robot | A REST API, from anywhere |
-| Code changes | Each node reports its own health | None needed |
-| What you get | OK, WARN, ERROR or STALE, right now | A fault that is confirmed, tracked and cleared once fixed |
-| When it breaks | Nothing is saved | A snapshot and a rosbag |
-| History | None | Saved, so you can look back |
-| Covers | ROS only | ROS today, PLCs and vehicle controllers through the same API |
-| AI assistants | No | Yes, through MCP |
-
-## Ecosystem
-
-- [ros2_medkit_web_ui](https://github.com/selfpatch/ros2_medkit_web_ui) - see your robot and its faults in the browser
-- [ros2_medkit_mcp](https://github.com/selfpatch/ros2_medkit_mcp) - let an AI assistant look into your robot
-- [ros2_medkit_clients](https://github.com/selfpatch/ros2_medkit_clients) - Python and TypeScript clients
-- [selfpatch_demos](https://github.com/selfpatch/selfpatch_demos) - ready-made demo robots, from a mobile robot to an arm
-
-## Documentation
-
-- [Documentation](https://selfpatch.github.io/ros2_medkit/) and the [step-by-step tutorial](https://selfpatch.github.io/ros2_medkit/getting_started.html)
-- [REST API reference](https://selfpatch.github.io/ros2_medkit/api/rest.html) and the [Postman collection](postman/)
-
-## Contributing
-
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), pick a
-[good first issue](https://github.com/selfpatch/ros2_medkit/labels/good%20first%20issue), or ask on
-[Discord](https://discord.gg/6CXPMApAyq) and in [Discussions](https://github.com/selfpatch/ros2_medkit/discussions).
-Report security issues privately, see [SECURITY.md](SECURITY.md).
-
-## License
-
-Apache License 2.0, see [LICENSE](LICENSE). ros2_medkit is built and maintained by
-[selfpatch.ai](https://selfpatch.ai).
+`ros2_medkit_opcua` lowers its `alarm:`, `status_bits:` and `fault_enum:`
+node-map blocks onto `DetectionRule` and evaluates them through this module.
+Its `raise_after_samples` / `raise_after_ms` keys set the point's
+`RaiseQualifier`.
