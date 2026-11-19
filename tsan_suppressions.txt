@@ -1,0 +1,173 @@
+# TSan suppression file for ros2_medkit
+# Suppresses known issues in third-party code (DDS, rclcpp, httplib).
+# This file is referenced by TSAN_OPTIONS in CI.
+#
+# RULE: Never suppress ros2_medkit code. If TSan finds a race in our
+# code, fix it. Suppressions are only for libraries we don't control.
+
+# FastDDS internal thread pool and transport layer
+race:eprosima::fastdds::*
+race:eprosima::fastrtps::*
+# FastCDR serialize/deserialize races on TopicPayloadPool buffer during
+# intra-process communication. Write by publisher thread via serialize_array
+# races against read by subscriber thread via deserialize_array on the same
+# payload allocation from eprosima::fastrtps::rtps::TopicPayloadPool::do_get_payload.
+# Upstream tracking: https://github.com/eProsima/Fast-DDS/issues/6340 (open).
+# Narrowed to the exact symbols on the reported TSan stack so future races
+# introduced by our own FastCDR misuse (e.g. sharing a Cdr across threads)
+# would still be reported.
+race:eprosima::fastcdr::Cdr::serialize*
+race:eprosima::fastcdr::Cdr::deserialize*
+
+# rclcpp signal handler (writes to global atomic from signal context)
+race:rclcpp::SignalHandler*
+race:rclcpp::signal_handler
+
+# rcl/rcutils logging lazy initialization (benign one-time race)
+race:rcl_logging_*
+race:rcutils_logging_*
+
+# open62541 (vendored) UA_DateTime_localTimeUtcOffset calls glibc mktime(),
+# whose first-call tzset() lazily initialises the process-global timezone
+# cache without synchronisation. When the OPC UA poller thread and another
+# thread (a second client, or the in-process test server) issue their first
+# mktime() concurrently, TSan reports a write-write race on the libc tz
+# globals. Benign one-time lazy init in third-party code (same class as the
+# rcl/rcutils logging suppression above); the racing write is inside
+# open62541/glibc, not our code.
+race:UA_DateTime_localTimeUtcOffset
+
+# cpp-httplib: data race in Server::stop() and create_server_socket()
+# on internal socket fd between listen and stop threads.
+# System-packaged libcpp-httplib.so, not our code. The .so is shipped
+# stripped, so TSan stacks point at <null> in libcpp-httplib.so.0.14
+# instead of demangled httplib:: symbols; match by library name as well
+# so the stripped frames are also covered.
+race:httplib::*
+called_from_lib:libcpp-httplib.so.0.14
+called_from_lib:libcpp-httplib.so
+
+# rclcpp/glibc: unlock-of-unlocked-mutex in __gthread_mutex_unlock during
+# test teardown when executor threads race with node destruction.
+mutex:__gthread_mutex_unlock
+
+# rclcpp: NodeGraph::notify_graph_change() iterates the per-context vector
+# of graph events (held as Event::WeakPtr) from the graph listener thread
+# while a node is being destroyed in another thread, racing on the Event's
+# shared_ptr control block. Triggered by TestGatewayNode where many nodes
+# are created/destroyed in sequence while the per-process GraphListener
+# keeps running. We already reset graph_event_ before automatic member
+# destruction (see ~GatewayNode); this suppression covers the remaining
+# library-side window we cannot tighten without changing rclcpp.
+race:rclcpp::node_interfaces::NodeGraph::notify_graph_change
+
+
+# rclcpp: lock-order-inversion in Context::add_on_shutdown_callback
+# during test TearDownTestSuite when rclcpp::shutdown() races with
+# executor threads still calling context methods.
+deadlock:rclcpp::Context*
+
+# rclcpp GenericClient: std::future shared state racing between the
+# executor thread that fulfils the response promise (_M_do_set ->
+# unique_ptr::swap) and the caller thread reading via future::get().
+# The setter runs under libstdc++'s call_once and then release-stores
+# _State_baseV2::_M_status; wait() synchronises against that with an
+# acquire load on the same atomic. TSan does model call_once and atomic
+# acquire/release, but for GenericClient the setter chain
+# (handle_response -> promise::set_value -> _M_set_result) is compiled
+# into librclcpp, so the release store is uninstrumented and that side
+# of the edge is invisible to it - the race lives in the rclcpp/glibc
+# internal synchronisation, not in our handlers. rclcpp::Client<T>'s own
+# handle_response is a header template instantiated in our binaries,
+# where the same store IS instrumented, so these reports do not arise
+# there. Suppress the standard-library frames that surface the
+# GenericClient case.
+race:std::__future_base::_State_baseV2*
+race:std::__uniq_ptr_impl*_Result_base*
+race:std::unique_ptr*_Result_base*
+# Same shared state, its _Result object rather than the state itself. The
+# executor thread drops the last reference to a client future's shared
+# state, and the report shows the freeing frame unsymbolized inside
+# librclcpp. TSan intercepts the operator delete, since that is instrumented
+# in the allocator, but never saw the acquire on the shared_ptr refcount
+# that would have ordered it after the caller's read, so it pairs the free
+# with the caller's read of _Result_base::_M_error inside _M_get_result.
+# Anchored on rclcpp::detail::FutureAndRequestId::get() (client.hpp): it is
+# the read side of this report, and of any get() through the wrapper, it is
+# header code compiled into our binaries so it is always symbolized, and it
+# names exactly the class - a future rclcpp handed us for a client request -
+# without matching any std::future the gateway builds itself (run_sync, the
+# aggregation and configuration fan-outs, the topic sampler). The pattern is
+# anchored on ::get() rather than left open at the end: the wrapper's other
+# members (the destructor, wait_for) are deliberately not matched here - a
+# report on them would be a different report and gets its own line with its
+# own evidence. A module pattern such as race:librclcpp.so would also match
+# the unsymbolized frame - TSan matches function, file and module name as an
+# unanchored substring - but it would suppress every report with any
+# librclcpp frame on either stack, ours or not.
+race:rclcpp::detail::FutureAndRequestId*::get()
+# On Humble, rclcpp::GenericClient does not exist (Iron+ only); the
+# gateway's own compat::GenericServiceClient stands in for it
+# (generic_client_compat.hpp), and its FutureAndRequestId::get() is the
+# same read through the same library state as the pattern above. Named
+# explicitly rather than left to the general rule above - the same
+# narrow, named exception to the "never suppress our code" rule as the
+# OperationManager::call_service suppression below.
+race:ros2_medkit_gateway::compat::GenericServiceClient::FutureAndRequestId::get()
+
+# rclcpp GenericClient response staging: the executor thread fills the
+# generic response via rclcpp::GenericClient::create_response() before
+# satisfying the promise, while the caller thread reads it after
+# future::get(). dynmsg (the vendored ROS introspection serialiser used
+# inside our JsonSerializer::to_json) and yaml-cpp 0.8 both reach into
+# the staged response buffer; TSan reports races on yaml-cpp's
+# Node::Assign / inner_encode and on dynmsg's basic_value_to_yaml and
+# get_vector_size because libstdc++ future synchronisation is invisible
+# to TSan (see suppression above). Suppress the library/vendored frames
+# rather than the call sites in our code, so any race we introduce in
+# our own JSON path still gets reported.
+race:YAML::Node::Assign*
+race:YAML::conversion::inner_encode*
+race:YAML::detail::node_data::set_scalar*
+called_from_lib:libyaml-cpp.so.0.8
+race:dynmsg::cpp::impl::basic_value_to_yaml*
+race:dynmsg::cpp::impl::member_to_yaml*
+race:dynmsg::get_vector_size*
+# Same staging race on the response buffer's own lifetime rather than its
+# contents: the executor thread allocates the shared response inside
+# rclcpp::GenericClient::create_response(), and the caller thread releases
+# the last shared_ptr reference (control-block refcount decrement and the
+# subsequent operator delete) after future::get() returns. libstdc++
+# future synchronisation is invisible to TSan (see above), so it reports a
+# race between create_response()'s new and the caller's ~shared_ptr on the
+# same block. Match the rclcpp allocation frame, which is on every one of
+# these reports, so a genuine refcount race in our own shared_ptr use is
+# still surfaced.
+race:rclcpp::GenericClient::create_response*
+# Same benign GenericClient response-staging race as create_response above,
+# matched on our own frame instead of the rclcpp one. In test_operation_handlers
+# under load, TSan reports the executor thread staging the response
+# (rclcpp::GenericClient::create_response + the response std::string copies)
+# racing the caller thread that consumes/frees it after future::get(). All the
+# racing WRITES live in rclcpp/libstdc++ (create_response, std::string mutate);
+# our OperationManager::call_service frame is only the consumer of a value the
+# std::future contract hands us once the promise is satisfied - the
+# release-store side of that handoff runs inside uninstrumented librclcpp,
+# so TSan never sees it and pairs the write with our read instead.
+# We must match on this frame because the adjacent librclcpp create_response
+# frame is frequently UNSYMBOLIZED (<null> at librclcpp.so+0x14xxxx), so the
+# create_response symbol line above does not catch those reports. A library
+# scope (called_from_lib:librclcpp.so) does NOT catch them either: TSan reports
+# this race with our call_service stack as the primary, where librclcpp is not a
+# caller, so the library filter misses it and the race resurfaces - verified, it
+# fails sanitizer-tsan with the child exiting 66. Matching our own frame is the
+# only reliable option: a deliberate, narrow exception to the "never suppress
+# our code" rule, scoped to the service-call path only. The race itself is
+# entirely a library one; we are on the stack only as the caller of the client.
+race:ros2_medkit_gateway::OperationManager::call_service*
+# The same response handoff on the action send_goal path. The executor thread drops
+# its copy of the SendGoal response in uninstrumented librclcpp
+# (Executor::execute_client) and can free it there after our ~shared_ptr in
+# send_goal. No create_response frame is on these reports, so the entries above
+# do not match them.
+race:ros2_medkit_gateway::ros2::Ros2ActionTransport::send_goal*
