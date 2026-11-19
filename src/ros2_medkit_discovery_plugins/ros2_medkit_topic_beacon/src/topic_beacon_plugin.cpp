@@ -1,0 +1,274 @@
+// Copyright 2026 bburda
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "ros2_medkit_topic_beacon/topic_beacon_plugin.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+
+#include "ros2_medkit_beacon_common/beacon_response_builder.hpp"
+
+using ros2_medkit_beacon::BeaconEntityMapper;
+using ros2_medkit_beacon::BeaconHint;
+using ros2_medkit_beacon::BeaconHintStore;
+using ros2_medkit_beacon::validate_beacon_hint;
+using ros2_medkit_beacon::ValidationLimits;
+using ros2_medkit_gateway::GatewayPlugin;
+using ros2_medkit_gateway::IntrospectionInput;
+using ros2_medkit_gateway::IntrospectionProvider;
+using ros2_medkit_gateway::IntrospectionResult;
+using ros2_medkit_gateway::PLUGIN_API_VERSION;
+using ros2_medkit_gateway::PluginContext;
+using ros2_medkit_gateway::SovdEntityType;
+
+TopicBeaconPlugin::~TopicBeaconPlugin() noexcept {
+  shutdown();
+}
+
+std::string TopicBeaconPlugin::name() const {
+  return "topic_beacon";
+}
+
+void TopicBeaconPlugin::configure(const nlohmann::json & config) {
+  topic_ = config.value("topic", std::string("/ros2_medkit/discovery"));
+
+  BeaconHintStore::Config store_config;
+  auto beacon_ttl = config.value("beacon_ttl_sec", 10.0);
+  auto beacon_expiry = config.value("beacon_expiry_sec", 300.0);
+  auto max_mps = config.value("max_messages_per_second", 100.0);
+
+  // max_hints is checked as int64 before it narrows. An integer outside 1 to kMaxHints becomes the nearer
+  // bound. Any other value, a double included, is rejected and the default stays.
+  auto read_max_hints = [this, &config]() -> std::size_t {
+    const auto it = config.find("max_hints");
+    if (it == config.end()) {
+      return kDefaultMaxHints;
+    }
+    if (!it->is_number_integer()) {
+      std::ostringstream message;
+      message << std::setprecision(12) << "max_hints ";
+      if (it->is_number_float()) {
+        message << it->get<double>();
+      } else {
+        message << it->dump();
+      }
+      message << " is not an integer, using " << kDefaultMaxHints;
+      log_warn(message.str());
+      return kDefaultMaxHints;
+    }
+    // Only an unsigned JSON integer can exceed int64; it is above kMaxHints either way.
+    constexpr auto kInt64Max = std::numeric_limits<std::int64_t>::max();
+    const bool beyond_int64 =
+        it->is_number_unsigned() && it->get<std::uint64_t>() > static_cast<std::uint64_t>(kInt64Max);
+    const std::int64_t value = beyond_int64 ? kInt64Max : it->get<std::int64_t>();
+    const std::int64_t clamped = std::clamp<std::int64_t>(value, 1, kMaxHints);
+    if (clamped != value) {
+      log_warn("max_hints clamped from " + it->dump() + " to " + std::to_string(clamped));
+    }
+    return static_cast<std::size_t>(clamped);
+  };
+  const std::size_t max_hints = read_max_hints();
+
+  // A value above its maximum, +inf included, becomes the maximum. NaN and a value below the minimum
+  // become the minimum.
+  auto clamp = [this](const char * key, double value, double minimum, double maximum) {
+    // In-range test negated so NaN fails it. Do not apply clang-tidy's De Morgan rewrite: it lets NaN through.
+    // NOLINTNEXTLINE(readability-simplify-boolean-expr)
+    if (!(std::isfinite(value) && value >= minimum && value <= maximum)) {
+      const double clamped = value > maximum ? maximum : minimum;
+      std::ostringstream message;
+      message << std::setprecision(12) << key << " clamped from " << value << " to " << clamped;
+      log_warn(message.str());
+      return clamped;
+    }
+    return value;
+  };
+  beacon_ttl = clamp("beacon_ttl_sec", beacon_ttl, 0.1, kMaxSeconds);
+  beacon_expiry = clamp("beacon_expiry_sec", beacon_expiry, 1.0, kMaxSeconds);
+  max_mps = clamp("max_messages_per_second", max_mps, 1.0, kMaxMessagesPerSecond);
+
+  store_config.beacon_ttl_sec = beacon_ttl;
+  store_config.beacon_expiry_sec = beacon_expiry;
+  store_config.max_hints = max_hints;
+  store_ = std::make_unique<BeaconHintStore>(store_config);
+
+  BeaconEntityMapper::Config mapper_config;
+  mapper_config.allow_new_entities = config.value("allow_new_entities", false);
+  mapper_ = BeaconEntityMapper(mapper_config);
+
+  rate_limiter_.reset(max_mps);
+
+  // Note: field group policy overrides are handled by PluginLayer via
+  // apply_layer_policy_overrides() in discovery_manager.cpp, not here.
+  // Plugin config only needs to provide values in gateway_params.yaml
+  // under plugins.topic_beacon.policies.{identity,hierarchy,metadata}.
+}
+
+void TopicBeaconPlugin::set_context(PluginContext & context) {
+  ctx_ = as_ros_plugin_context(context);
+  auto node = ctx_->node();
+
+  // Ensure store_ exists even if configure() was not called
+  if (!store_) {
+    store_ = std::make_unique<BeaconHintStore>();
+  }
+
+  // Create subscription on configured topic
+  subscription_ = node->create_subscription<ros2_medkit_msgs::msg::MedkitDiscoveryHint>(
+      topic_, rclcpp::QoS(100).reliable(),
+      [this](const ros2_medkit_msgs::msg::MedkitDiscoveryHint::ConstSharedPtr & msg) {
+        on_beacon(msg);
+      });
+
+  // Register vendor extension capability
+  ctx_->register_capability(SovdEntityType::APP, "x-medkit-topic-beacon");
+  ctx_->register_capability(SovdEntityType::COMPONENT, "x-medkit-topic-beacon");
+
+  RCLCPP_INFO(node->get_logger(), "TopicBeaconPlugin: subscribed to '%s'", topic_.c_str());
+}
+
+void TopicBeaconPlugin::shutdown() {
+  if (shutdown_requested_.exchange(true)) {
+    return;
+  }
+  // The callback captures this. A callback the executor already took returns early in on_beacon().
+  subscription_.reset();
+}
+
+std::vector<GatewayPlugin::PluginRoute> TopicBeaconPlugin::get_routes() {
+  std::vector<GatewayPlugin::PluginRoute> routes;
+  // Register beacon metadata endpoint for apps and components
+  for (const auto * entity_type : {"apps", "components"}) {
+    std::string pattern = std::string(entity_type) + R"(/([^/]+)/x-medkit-topic-beacon)";
+    routes.push_back(
+        {"GET", pattern,
+         [this](const ros2_medkit_gateway::PluginRequest & req, ros2_medkit_gateway::PluginResponse & res) {
+           auto entity_id = req.path_param(1);
+
+           auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
+           if (!entity) {
+             return;
+           }
+
+           auto stored = store_->get(entity_id);
+           if (!stored) {
+             res.send_error(404, "x-medkit-beacon-not-found", "No beacon data for entity");
+             return;
+           }
+
+           res.send_json(ros2_medkit_beacon::build_beacon_response(entity_id, *stored));
+         }});
+  }
+  return routes;
+}
+
+IntrospectionResult TopicBeaconPlugin::introspect(const IntrospectionInput & input) {
+  auto snapshot = store_->evict_and_snapshot();
+  auto result = mapper_.map(snapshot, input);
+
+  {
+    std::lock_guard<std::mutex> lock(skipped_mutex_);
+    for (const auto & stored : snapshot) {
+      if (result.metadata.find(stored.hint.entity_id) == result.metadata.end()) {
+        if (logged_skipped_entities_.size() >= 1000) {
+          logged_skipped_entities_.clear();
+        }
+        if (logged_skipped_entities_.insert(stored.hint.entity_id).second) {
+          log_info("Beacon entity '" + stored.hint.entity_id +
+                   "' not in known entities (allow_new_entities=false), skipped");
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+void TopicBeaconPlugin::on_beacon(const ros2_medkit_msgs::msg::MedkitDiscoveryHint::ConstSharedPtr & msg) {
+  if (shutdown_requested_.load()) {
+    return;
+  }
+  // Rate limiting
+  if (!rate_limiter_.try_consume()) {
+    return;  // drop silently
+  }
+
+  // Convert ROS message to internal BeaconHint
+  BeaconHint hint;
+  hint.entity_id = msg->entity_id;
+  hint.stable_id = msg->stable_id;
+  hint.display_name = msg->display_name;
+  hint.function_ids = msg->function_ids;
+  hint.depends_on = msg->depends_on;
+  hint.component_id = msg->component_id;
+  hint.transport_type = msg->transport_type;
+  hint.negotiated_format = msg->negotiated_format;
+  hint.process_id = msg->process_id;
+  hint.process_name = msg->process_name;
+  hint.hostname = msg->hostname;
+  // Use message stamp for TTL if non-zero; otherwise fall back to steady_clock::now().
+  if (msg->stamp.sec != 0 || msg->stamp.nanosec != 0) {
+    auto now_wall = rclcpp::Clock(RCL_SYSTEM_TIME).now();
+    auto msg_age = now_wall - rclcpp::Time(msg->stamp.sec, msg->stamp.nanosec, RCL_SYSTEM_TIME);
+    if (msg_age.nanoseconds() > 0) {
+      hint.received_at = std::chrono::steady_clock::now() - std::chrono::nanoseconds(msg_age.nanoseconds());
+    } else {
+      // Stamp is in the future (clock skew) - treat as just-received.
+      hint.received_at = std::chrono::steady_clock::now();
+    }
+  } else {
+    hint.received_at = std::chrono::steady_clock::now();
+  }
+
+  // Convert KeyValue[] to map
+  for (const auto & kv : msg->metadata) {
+    hint.metadata[kv.key] = kv.value;
+  }
+
+  // Validate
+  auto validation = validate_beacon_hint(hint, limits_);
+  if (!validation.valid) {
+    log_warn("Beacon hint rejected for '" + hint.entity_id + "': " + validation.reason);
+    return;
+  }
+
+  // Store
+  if (!store_->update(hint)) {
+    if (!capacity_warned_) {
+      log_warn("BeaconHintStore capacity reached (max_hints=" + std::to_string(store_->size()) +
+               "). New entities will not be tracked.");
+      capacity_warned_ = true;
+    }
+  }
+}
+
+// --- Plugin exports ---
+
+extern "C" GATEWAY_PLUGIN_EXPORT int plugin_api_version() {
+  return PLUGIN_API_VERSION;
+}
+
+extern "C" GATEWAY_PLUGIN_EXPORT GatewayPlugin * create_plugin() {
+  return new TopicBeaconPlugin();
+}
+
+extern "C" GATEWAY_PLUGIN_EXPORT IntrospectionProvider * get_introspection_provider(GatewayPlugin * plugin) {
+  return static_cast<TopicBeaconPlugin *>(plugin);
+}
