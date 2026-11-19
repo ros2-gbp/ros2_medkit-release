@@ -1,0 +1,27 @@
+log_bridge:
+  ros__parameters:
+    # Topic carrying aggregated node logs.
+    rosout_topic: "/rosout"
+    # Minimum rcl_interfaces/msg/Log level promoted to a fault.
+    # 10=DEBUG 20=INFO 30=WARN 40=ERROR 50=FATAL. Default WARN.
+    # Raise to 40 (ERROR) on chatty / resource-constrained targets.
+    severity_floor: 30
+    # Prefix for auto-generated fault codes (<PREFIX>_<NODE>_<HASH>).
+    code_prefix: "LOG"
+    # Originating-node FQN substrings to skip (e.g. noisy debug nodes).
+    # Defaults to empty; uncomment with a non-empty list to enable, e.g.:
+    # exclude_nodes: ["/debug_node"]
+    # If non-empty, ONLY promote logs from nodes matching these substrings.
+    # Defaults to empty; uncomment with a non-empty list to enable, e.g.:
+    # include_only_nodes: ["/safety_monitor"]
+    # Cap on per-node FaultReporters; least-recently-used nodes are evicted
+    # past this to bound memory under transient-node churn.
+    max_tracked_nodes: 512
+    # Per-fault_code forward debounce (seconds). First occurrence of a code is
+    # forwarded immediately; the same code within the window is suppressed.
+    # 0.0 disables. Tames ERROR/FATAL floods, which bypass the per-node filter.
+    report_cooldown_sec: 5.0
+    # Skip the medkit stack's own infrastructure nodes (fault_manager, gateway,
+    # the other bridges). Their /rosout lines would otherwise feed back as
+    # faults about medkit itself. Set false only to debug medkit's own logs.
+    exclude_medkit_stack: true
