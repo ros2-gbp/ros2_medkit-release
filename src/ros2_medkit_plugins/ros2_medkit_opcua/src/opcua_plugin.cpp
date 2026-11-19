@@ -1,0 +1,3312 @@
+// Copyright 2026 mfaferek93
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "ros2_medkit_opcua/opcua_plugin.hpp"
+
+#include "ros2_medkit_opcua/device_identity.hpp"
+
+#include <rclcpp/rclcpp.hpp>
+// create_client() takes its callback group with a rclcpp::QoS from rclcpp 28
+// (Jazzy) on; earlier releases offer the rmw_qos_profile_t form. Humble ships
+// no <rclcpp/version.h>, so the header's absence identifies it.
+#if defined(__has_include)
+#if __has_include(<rclcpp/version.h>)
+#include <rclcpp/version.h>
+#endif
+#endif
+#include <rcutils/logging.h>
+#include <ros2_medkit_msgs/msg/fault.hpp>
+#include <ros2_medkit_msgs/srv/clear_fault.hpp>
+#include <ros2_medkit_msgs/srv/report_fault.hpp>
+
+#include <ros2_medkit_gateway/core/http/error_codes.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cerrno>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
+#include <signal.h>
+#include <unistd.h>
+
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <shared_mutex>
+#include <sstream>
+#include <stdexcept>
+#include <system_error>
+#include <thread>
+
+namespace ros2_medkit_gateway {
+
+namespace {
+
+// gateway_node blocks SIGINT and SIGTERM until startup ends, so a stop sent during the startup
+// sweep is pending and rclcpp::ok() stays true. sigpending() reports it on any thread.
+bool shutdown_signal_pending() {
+  sigset_t pending;
+  if (sigpending(&pending) != 0) {
+    return false;
+  }
+  return sigismember(&pending, SIGINT) == 1 || sigismember(&pending, SIGTERM) == 1;
+}
+
+// Flush one path's data to the device. Returns the reason on failure.
+std::string fsync_path(const std::string & path, bool is_directory) {
+  const int fd = ::open(path.c_str(), is_directory ? (O_RDONLY | O_DIRECTORY) : O_WRONLY);
+  if (fd < 0) {
+    return "cannot open " + path + " to flush it: " + std::strerror(errno);
+  }
+  const int rc = ::fsync(fd);
+  const int saved = errno;
+  ::close(fd);
+  if (rc != 0) {
+    return "flushing " + path + " failed: " + std::strerror(saved);
+  }
+  return {};
+}
+
+// Named logger so per-operation traces respect ROS log level filtering
+// (bburda review on PR #387). Quiet at INFO; ``--log-level
+// opcua.plugin:=debug`` re-enables for diagnostics.
+inline rclcpp::Logger opcua_plugin_logger() {
+  static auto logger = rclcpp::get_logger("opcua.plugin");
+  return logger;
+}
+
+inline bool plugin_debug_enabled() {
+  // rcutils API for Humble compatibility; Jazzy+ adds rclcpp::Logger::
+  // get_effective_level but Humble does not.
+  return rcutils_logging_logger_is_enabled_for("opcua.plugin", RCUTILS_LOG_SEVERITY_DEBUG);
+}
+
+// Security-config parse wrappers. An unrecognized value must NOT silently fall
+// back to the insecure default (SecurityPolicy::None / SecurityMode::None /
+// anonymous auth): a typo would quietly downgrade a hardened link. Fail loud and
+// refuse - the thrown exception disables the plugin in PluginManager::configure_plugins.
+SecurityPolicy require_security_policy(const std::string & value) {
+  bool ok = true;
+  const auto parsed = OpcuaClient::parse_security_policy(value, &ok);
+  if (!ok) {
+    RCLCPP_ERROR(opcua_plugin_logger(),
+                 "Unrecognized OPC-UA security_policy '%s'; refusing to start with an insecure fallback",
+                 value.c_str());
+    throw std::invalid_argument("opcua: unrecognized security_policy '" + value + "'");
+  }
+  return parsed;
+}
+
+SecurityMode require_security_mode(const std::string & value) {
+  bool ok = true;
+  const auto parsed = OpcuaClient::parse_security_mode(value, &ok);
+  if (!ok) {
+    RCLCPP_ERROR(opcua_plugin_logger(),
+                 "Unrecognized OPC-UA security_mode '%s'; refusing to start with an insecure fallback", value.c_str());
+    throw std::invalid_argument("opcua: unrecognized security_mode '" + value + "'");
+  }
+  return parsed;
+}
+
+UserAuthMode require_user_auth_mode(const std::string & value) {
+  bool ok = true;
+  const auto parsed = OpcuaClient::parse_user_auth_mode(value, &ok);
+  if (!ok) {
+    RCLCPP_ERROR(opcua_plugin_logger(),
+                 "Unrecognized OPC-UA user_auth_mode '%s'; refusing to start with an insecure fallback", value.c_str());
+    throw std::invalid_argument("opcua: unrecognized user_auth_mode '" + value + "'");
+  }
+  return parsed;
+}
+
+#if MEDKIT_OPCUA_READ_ONLY
+/// One sentence for every refusal on the value-write path. It names the build
+/// property rather than a permission, because that is the difference an
+/// operator reading the HTTP body needs: no credential and no configuration
+/// change makes this binary write to a controller.
+constexpr const char * kReadOnlyBuildRefusal =
+    "This OPC UA plugin was built read-only (MEDKIT_OPCUA_READ_ONLY=ON) and contains no controller write path; "
+    "rebuild with -DMEDKIT_OPCUA_READ_ONLY=OFF for a write-capable plugin";
+
+/// SOVD reserves 403 for a valid token with insufficient permissions, which is
+/// the one thing this is not: no credential and no role reaches a write path
+/// that is not in the binary. 501 is the status the SOVD catalogue uses for an
+/// operation the entity does not support (fault deletion, data lists,
+/// subscriptions and triggers all spell it that way), and that is what this is.
+constexpr int kReadOnlyBuildStatus = 501;
+#else
+/// Parse a JSON "value" field, coerce to the node's declared data_type, and
+/// validate against the optional min/max range. Shared by handle_plc_operations,
+/// DataProvider::write_data, and OperationProvider::execute_operation to keep
+/// the three write paths in sync.
+tl::expected<OpcuaValue, std::string> parse_coerce_validate(const nlohmann::json & json_value,
+                                                            const NodeMapEntry & entry) {
+  OpcuaValue val;
+  try {
+    if (entry.data_type == "bool") {
+      val = json_value.get<bool>();
+    } else if (entry.data_type == "int") {
+      val = json_value.get<int32_t>();
+    } else if (entry.data_type == "string") {
+      val = json_value.get<std::string>();
+    } else {
+      val = json_value.get<double>();
+    }
+  } catch (const nlohmann::json::type_error &) {
+    return tl::make_unexpected("Value type mismatch for data_type: " + entry.data_type);
+  }
+
+  if (entry.has_range()) {
+    double v = std::visit(
+        [](auto && x) -> double {
+          using T = std::decay_t<decltype(x)>;
+          if constexpr (std::is_arithmetic_v<T>) {
+            return static_cast<double>(x);
+          }
+          return 0.0;
+        },
+        val);
+    if (v < *entry.min_value || v > *entry.max_value) {
+      return tl::make_unexpected("Value " + std::to_string(v) + " out of range [" + std::to_string(*entry.min_value) +
+                                 ", " + std::to_string(*entry.max_value) + "]");
+    }
+  }
+
+  return val;
+}
+#endif  // MEDKIT_OPCUA_READ_ONLY
+
+bool is_valid_path_segment(const std::string & s) {
+  if (s.empty() || s.size() > 256) {
+    return false;
+  }
+  return std::all_of(s.begin(), s.end(), [](unsigned char c) {
+    return std::isalnum(c) || c == '_' || c == '-';
+  });
+}
+
+// Parse a JSON array of namespace indices for auto_browse's
+// namespace_allow/namespace_deny knobs. Out-of-range or non-integer entries
+// are skipped with a warning rather than aborting the whole config.
+std::vector<uint16_t> parse_json_ns_list(const nlohmann::json & arr, const char * field,
+                                         const std::function<void(const std::string &)> & warn) {
+  std::vector<uint16_t> out;
+  if (!arr.is_array()) {
+    warn(std::string("plugins.opcua.auto_browse.") + field + " must be an array - ignoring");
+    return out;
+  }
+  for (const auto & v : arr) {
+    if (!v.is_number_integer()) {
+      warn(std::string("plugins.opcua.auto_browse.") + field + ": non-integer namespace index - skipping");
+      continue;
+    }
+    const auto n = v.get<int64_t>();
+    if (n < 0 || n > 65535) {
+      warn(std::string("plugins.opcua.auto_browse.") + field + ": namespace index out of range [0,65535] - skipping");
+      continue;
+    }
+    out.push_back(static_cast<uint16_t>(n));
+  }
+  return out;
+}
+}  // namespace
+
+namespace {
+
+/// create_client() with an explicit callback group, in the form the linked
+/// rclcpp wants.
+template <typename ServiceT>
+typename rclcpp::Client<ServiceT>::SharedPtr create_client_in_group(rclcpp::Node * node, const std::string & name,
+                                                                    const rclcpp::CallbackGroup::SharedPtr & group) {
+#if defined(RCLCPP_VERSION_MAJOR) && RCLCPP_VERSION_MAJOR >= 28
+  return node->create_client<ServiceT>(name, rclcpp::ServicesQoS(), group);
+#else
+  return node->create_client<ServiceT>(name, rmw_qos_profile_services_default, group);
+#endif
+}
+
+/// How long one pass of the client executor waits for work before it re-reads
+/// the stop flag. Bounds shutdown latency only: a response wakes the wait.
+constexpr std::chrono::milliseconds kFaultExecutorWait{100};
+
+}  // namespace
+
+struct OpcuaPlugin::FaultClients {
+  rclcpp::Client<ros2_medkit_msgs::srv::ReportFault>::SharedPtr report;
+  rclcpp::Client<ros2_medkit_msgs::srv::ClearFault>::SharedPtr clear;
+  /// Read side of the store, used by nothing but the link-state clear gate:
+  /// PLC_COMMS_LOST is keyed by code alone, so before clearing it this asks who
+  /// reported it (see link_state_clear_permitted).
+  rclcpp::Client<ros2_medkit_msgs::srv::GetFault>::SharedPtr get_fault;
+};
+
+OpcuaPlugin::OpcuaPlugin()
+  : client_(std::make_unique<OpcuaClient>()), fault_clients_(std::make_unique<FaultClients>()) {
+}
+
+OpcuaPlugin::~OpcuaPlugin() {
+  shutdown();
+}
+
+void OpcuaPlugin::configure(const nlohmann::json & config) {
+  if (config.contains("endpoint_url")) {
+    const std::string endpoint_url = config["endpoint_url"].get<std::string>();
+    if (!endpoint_url.empty()) {
+      client_config_.endpoint_url = endpoint_url;
+      endpoint_configured_ = true;
+    }
+  }
+
+  // OPC-UA SecureChannel security + user identity. All opt-in; defaults keep
+  // the legacy anonymous + SecurityPolicy=None behaviour.
+  if (config.contains("security_policy")) {
+    client_config_.security_policy = require_security_policy(config["security_policy"].get<std::string>());
+  }
+  if (config.contains("security_mode") || config.contains("message_security_mode")) {
+    const std::string mode_str = config.contains("security_mode") ? config["security_mode"].get<std::string>()
+                                                                  : config["message_security_mode"].get<std::string>();
+    client_config_.security_mode = require_security_mode(mode_str);
+  }
+  if (config.contains("client_cert_path")) {
+    client_config_.client_cert_path = config["client_cert_path"].get<std::string>();
+  }
+  if (config.contains("client_key_path")) {
+    client_config_.client_key_path = config["client_key_path"].get<std::string>();
+  }
+  if (config.contains("application_uri")) {
+    client_config_.application_uri = config["application_uri"].get<std::string>();
+  }
+  if (config.contains("trust_list_paths") && config["trust_list_paths"].is_array()) {
+    client_config_.trust_list_paths.clear();
+    for (const auto & p : config["trust_list_paths"]) {
+      if (p.is_string() && !p.get<std::string>().empty()) {
+        client_config_.trust_list_paths.push_back(p.get<std::string>());
+      }
+    }
+  }
+  if (config.contains("reject_untrusted")) {
+    client_config_.reject_untrusted = config["reject_untrusted"].get<bool>();
+  }
+  if (config.contains("user_auth_mode")) {
+    client_config_.user_auth_mode = require_user_auth_mode(config["user_auth_mode"].get<std::string>());
+  }
+  if (config.contains("username")) {
+    client_config_.username = config["username"].get<std::string>();
+  }
+  if (config.contains("password")) {
+    client_config_.password = config["password"].get<std::string>();
+  }
+  if (config.contains("user_cert_path")) {
+    client_config_.user_cert_path = config["user_cert_path"].get<std::string>();
+  }
+
+  if (config.contains("node_map_path")) {
+    node_map_path_ = config["node_map_path"].get<std::string>();
+  }
+
+  if (config.contains("prefer_subscriptions")) {
+    poller_config_.prefer_subscriptions = config["prefer_subscriptions"].get<bool>();
+  }
+  if (config.contains("subscription_interval_ms")) {
+    poller_config_.subscription_interval_ms = config["subscription_interval_ms"].get<double>();
+  }
+  if (config.contains("poll_interval_ms")) {
+    auto ms = std::clamp(config["poll_interval_ms"].get<int>(), 100, 60000);
+    poller_config_.poll_interval = std::chrono::milliseconds(ms);
+  }
+  if (config.contains("condition_replay_strategy")) {
+    poller_config_.condition_replay_strategy =
+        OpcuaPoller::parse_replay_strategy(config["condition_replay_strategy"].get<std::string>());
+  }
+  if (auto * env = std::getenv("OPCUA_CONDITION_REPLAY")) {
+    poller_config_.condition_replay_strategy = OpcuaPoller::parse_replay_strategy(env);
+  }
+  // Issue #478: drop the Confirm gate for servers that do not implement the
+  // optional Confirm transition (e.g. Siemens S7-1500) so alarms clear on
+  // Acknowledge alone. Default true keeps the spec-strict behaviour.
+  if (config.contains("require_confirm_for_clear")) {
+    poller_config_.require_confirm_for_clear = config["require_confirm_for_clear"].get<bool>();
+  }
+  if (auto * env = std::getenv("OPCUA_REQUIRE_CONFIRM_FOR_CLEAR")) {
+    const std::string v = env;
+    poller_config_.require_confirm_for_clear = !(v == "0" || v == "false" || v == "no" || v == "off");
+  }
+
+  // Issue #496: comms-lost fault knobs.
+  if (config.contains("comms_lost_fault_enabled")) {
+    poller_config_.comms_lost_fault_enabled = config["comms_lost_fault_enabled"].get<bool>();
+  }
+  if (auto * env = std::getenv("OPCUA_COMMS_LOST_ENABLED")) {
+    const std::string v = env;
+    poller_config_.comms_lost_fault_enabled = !(v == "0" || v == "false" || v == "no" || v == "off");
+  }
+  // Clamp the comms-lost debounce to [0, 1h], shared by the YAML and env paths.
+  // Without an upper bound an overflowing or huge value pushes the gate so far
+  // out it never fires, silently disabling the fault; 0 keeps the immediate
+  // report behaviour.
+  constexpr long kMaxCommsLostDebounceMs = 3600000;  // 1 hour
+  const auto clamp_debounce_ms = [](long long ms) -> long {
+    if (ms < 0) {
+      return 0;
+    }
+    if (ms > kMaxCommsLostDebounceMs) {
+      return kMaxCommsLostDebounceMs;
+    }
+    return static_cast<long>(ms);
+  };
+  if (config.contains("comms_lost_debounce_ms")) {
+    const long long ms = config["comms_lost_debounce_ms"].get<long long>();
+    const long clamped = clamp_debounce_ms(ms);
+    if (static_cast<long long>(clamped) != ms) {
+      log_warn("plugins.opcua.comms_lost_debounce_ms=" + std::to_string(ms) + " is outside [0, " +
+               std::to_string(kMaxCommsLostDebounceMs) + "] ms - using " + std::to_string(clamped) + " ms");
+    }
+    poller_config_.comms_lost_debounce = std::chrono::milliseconds(clamped);
+  }
+  if (auto * env = std::getenv("OPCUA_COMMS_LOST_DEBOUNCE_MS")) {
+    // Keep the existing value on a non-numeric / out-of-range / negative
+    // override so a typo does not silently disable the debounce (atoi would
+    // parse it as 0). errno + ERANGE rejects an overflowing run of digits that
+    // strtol would otherwise saturate to LONG_MAX and slip past the >= 0 guard.
+    errno = 0;
+    char * end = nullptr;
+    const long ms = std::strtol(env, &end, 10);
+    if (end != env && *end == '\0' && errno != ERANGE && ms >= 0) {
+      const long clamped = clamp_debounce_ms(ms);
+      if (clamped != ms) {
+        log_warn(std::string("OPCUA_COMMS_LOST_DEBOUNCE_MS=") + env + " is outside [0, " +
+                 std::to_string(kMaxCommsLostDebounceMs) + "] ms - using " + std::to_string(clamped) + " ms");
+      }
+      poller_config_.comms_lost_debounce = std::chrono::milliseconds(clamped);
+    } else {
+      log_warn(std::string("Ignoring invalid OPCUA_COMMS_LOST_DEBOUNCE_MS='") + env +
+               "' (want a non-negative integer <= 3600000 ms)");
+    }
+  }
+  if (config.contains("fault_service_timeout_ms")) {
+    const auto & raw = config["fault_service_timeout_ms"];
+    if (raw.is_number_integer()) {
+      const int64_t ms = raw.get<int64_t>();
+      if (ms >= 100 && ms <= 600000) {
+        fault_service_timeout_ = std::chrono::milliseconds(ms);
+      } else {
+        log_warn("plugins.opcua.fault_service_timeout_ms out of range [100, 600000] - keeping " +
+                 std::to_string(fault_service_timeout_.count()) + " ms");
+      }
+    } else {
+      log_warn("plugins.opcua.fault_service_timeout_ms is not an integer - keeping " +
+               std::to_string(fault_service_timeout_.count()) + " ms");
+    }
+  }
+
+  if (config.contains("comms_lost_severity")) {
+    poller_config_.comms_lost_severity = config["comms_lost_severity"].get<std::string>();
+  }
+  {
+    // Validate against the SOVD severity buckets and default to ERROR on a typo,
+    // so the comms-lost fault is not silently downgraded to INFO by the severity
+    // map (same guard as the node-map severity validation).
+    const std::string & s = poller_config_.comms_lost_severity;
+    if (s != "INFO" && s != "WARNING" && s != "ERROR" && s != "CRITICAL") {
+      log_warn("Unknown comms_lost_severity '" + s + "' - defaulting to ERROR");
+      poller_config_.comms_lost_severity = "ERROR";
+    }
+  }
+
+  // Environment variables override YAML config (for Docker)
+  if (auto * env = std::getenv("OPCUA_ENDPOINT_URL"); env != nullptr && *env != '\0') {
+    client_config_.endpoint_url = env;
+    endpoint_configured_ = true;
+  }
+  if (auto * env = std::getenv("OPCUA_NODE_MAP_PATH")) {
+    node_map_path_ = env;
+  }
+  // Security env overrides (for Docker / appliance deployments).
+  if (auto * env = std::getenv("OPCUA_SECURITY_POLICY")) {
+    client_config_.security_policy = require_security_policy(env);
+  }
+  if (auto * env = std::getenv("OPCUA_SECURITY_MODE")) {
+    client_config_.security_mode = require_security_mode(env);
+  }
+  if (auto * env = std::getenv("OPCUA_CLIENT_CERT")) {
+    client_config_.client_cert_path = env;
+  }
+  if (auto * env = std::getenv("OPCUA_CLIENT_KEY")) {
+    client_config_.client_key_path = env;
+  }
+  if (auto * env = std::getenv("OPCUA_APPLICATION_URI")) {
+    client_config_.application_uri = env;
+  }
+  if (auto * env = std::getenv("OPCUA_TRUST_LIST")) {
+    // Colon-separated list of DER trust-store paths.
+    client_config_.trust_list_paths.clear();
+    std::string list = env;
+    size_t start = 0;
+    while (start <= list.size()) {
+      size_t sep = list.find(':', start);
+      std::string path = list.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+      if (!path.empty()) {
+        client_config_.trust_list_paths.push_back(path);
+      }
+      if (sep == std::string::npos) {
+        break;
+      }
+      start = sep + 1;
+    }
+  }
+  if (auto * env = std::getenv("OPCUA_REJECT_UNTRUSTED")) {
+    std::string v = env;
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+      return static_cast<char>(std::tolower(c));
+    });
+    client_config_.reject_untrusted = !(v == "0" || v == "false" || v == "no");
+  }
+  if (auto * env = std::getenv("OPCUA_USER_AUTH")) {
+    client_config_.user_auth_mode = require_user_auth_mode(env);
+  }
+  if (auto * env = std::getenv("OPCUA_USERNAME")) {
+    client_config_.username = env;
+  }
+  if (auto * env = std::getenv("OPCUA_PASSWORD")) {
+    client_config_.password = env;
+  }
+  if (auto * env = std::getenv("OPCUA_USER_CERT")) {
+    client_config_.user_cert_path = env;
+  }
+
+  // Read-only PLC/OPC-UA network discovery (opt-in). Parsed + validated with
+  // unknown-key warnings; env overrides follow for Docker/appliance deploys.
+  if (config.contains("discovery")) {
+    discovery_config_ = parse_discovery_config(config["discovery"], [this](const std::string & m) {
+      log_warn(m);
+    });
+  }
+  if (auto * env = std::getenv("OPCUA_DISCOVERY_ENABLED")) {
+    const std::string v = env;
+    discovery_config_.enabled = !(v == "0" || v == "false" || v == "no" || v == "off");
+  }
+  if (auto * env = std::getenv("OPCUA_DISCOVERY_SUBNETS")) {
+    // Comma-separated CIDR list.
+    discovery_config_.subnets.clear();
+    std::string list = env;
+    size_t start = 0;
+    while (start <= list.size()) {
+      const size_t sep = list.find(',', start);
+      std::string cidr = list.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+      if (!cidr.empty()) {
+        discovery_config_.subnets.push_back(cidr);
+      }
+      if (sep == std::string::npos) {
+        break;
+      }
+      start = sep + 1;
+    }
+  }
+  if (auto * env = std::getenv("OPCUA_DISCOVERY_INTERVAL_S")) {
+    errno = 0;
+    char * end = nullptr;
+    const long v = std::strtol(env, &end, 10);
+    if (end != env && *end == '\0' && errno != ERANGE && v >= 0) {
+      discovery_config_.interval_s = static_cast<int>(v);
+    } else {
+      log_warn(std::string("Ignoring invalid OPCUA_DISCOVERY_INTERVAL_S='") + env + "' (want a non-negative integer)");
+    }
+  }
+
+  if (auto * env = std::getenv("OPCUA_DISCOVERY_BINDING_FILE")) {
+    discovery_config_.binding_file = env;
+  }
+  // Before the startup sweep, which the binding steers: a process that was
+  // bound when it stopped looks for that server and no other.
+  // Discovery's binding, and only discovery's: an operator who pinned
+  // endpoint_url has already said which server this is, and re-pointing it at a
+  // replacement is the whole gesture. A file left behind by an earlier
+  // config-less run must not refuse the server the operator named.
+  if (!endpoint_configured_) {
+    bound_application_uri_ = read_persisted_binding(discovery_config_.binding_file);
+    if (!bound_application_uri_.empty()) {
+      log_info("OPC-UA: bound to uri='" + bound_application_uri_ + "' from " + discovery_config_.binding_file +
+               ". Remove that file and restart to bind to a different server.");
+    }
+  }
+
+  // Default the discovery I/O to the real probes; test builds override these
+  // before set_context() to exercise the auto-endpoint path offline.
+  if (!discovery_scan_fn_) {
+    discovery_scan_fn_ = &tcp_connect_probe;
+  }
+  if (!discovery_identify_fn_) {
+    discovery_identify_fn_ = &opcua_getendpoints_identify;
+  }
+
+  if (!node_map_path_.empty()) {
+    if (!node_map_.load(node_map_path_)) {
+      // FATAL: a node map that fails to load or validate (duplicate/colliding
+      // fault codes, conflicting detection modes, oversized file, ...) must
+      // NOT run. The global fault-code uniqueness that prevents raise/clear
+      // flapping is only enforced at load, so starting the poller against a
+      // rejected map would defeat it. Throw so PluginManager disables the
+      // plugin instead of proceeding to set_context()/starting the poller.
+      log_error("Failed to load node map from: " + node_map_path_);
+      throw std::runtime_error("OPC-UA node map failed to load or validate: " + node_map_path_ +
+                               " (see preceding log line for the specific rejection)");
+    }
+    log_info("Loaded node map with " + std::to_string(node_map_.entries().size()) + " entries from: " + node_map_path_);
+  }
+
+  // plugins.opcua.auto_browse (ROS param / JSON config). Overlays on top of
+  // whatever the node-map YAML's `auto_browse:` block set (or the all-default
+  // AutoBrowseConfig when there is no node map at all) - the same
+  // "JSON/env wins over file" precedence the rest of this function uses.
+  // This is what makes zero-config discovery possible: no node_map_path,
+  // just `endpoint_url` (from discovery, PR #509) + `auto_browse: true`.
+  if (config.contains("auto_browse")) {
+    auto warn = [this](const std::string & msg) {
+      log_warn(msg);
+    };
+    auto & ab_cfg = node_map_.mutable_auto_browse_config();
+    const auto & ab = config["auto_browse"];
+    if (ab.is_boolean()) {
+      ab_cfg.enabled = ab.get<bool>();
+    } else if (ab.is_object()) {
+      ab_cfg.enabled = ab.value("enabled", true);
+      if (ab.contains("root_nodes")) {
+        if (ab["root_nodes"].is_array()) {
+          ab_cfg.root_node_ids.clear();
+          for (const auto & r : ab["root_nodes"]) {
+            if (r.is_string()) {
+              ab_cfg.root_node_ids.push_back(r.get<std::string>());
+            } else {
+              warn("plugins.opcua.auto_browse.root_nodes: non-string entry - skipping");
+            }
+          }
+        } else {
+          warn("plugins.opcua.auto_browse.root_nodes must be an array - ignoring");
+        }
+      }
+      if (ab.contains("max_depth")) {
+        if (!ab["max_depth"].is_number_integer()) {
+          warn("plugins.opcua.auto_browse.max_depth must be an integer - keeping current value");
+        } else {
+          const auto d = ab["max_depth"].get<int64_t>();
+          if (d >= 1 && d <= 64) {
+            ab_cfg.max_depth = static_cast<int>(d);
+          } else {
+            warn("plugins.opcua.auto_browse.max_depth out of range [1,64] - keeping current value");
+          }
+        }
+      }
+      if (ab.contains("max_nodes")) {
+        if (!ab["max_nodes"].is_number_integer()) {
+          warn("plugins.opcua.auto_browse.max_nodes must be an integer - keeping current value");
+        } else {
+          const auto n = ab["max_nodes"].get<int64_t>();
+          if (n >= 1 && n <= 200000) {
+            ab_cfg.max_nodes = static_cast<size_t>(n);
+          } else {
+            warn("plugins.opcua.auto_browse.max_nodes out of range [1,200000] - keeping current value");
+          }
+        }
+      }
+      if (ab.contains("namespace_allow")) {
+        ab_cfg.namespace_allow = parse_json_ns_list(ab["namespace_allow"], "namespace_allow", warn);
+      }
+      if (ab.contains("namespace_deny")) {
+        ab_cfg.namespace_deny = parse_json_ns_list(ab["namespace_deny"], "namespace_deny", warn);
+      }
+      if (ab.contains("read_initial_values")) {
+        if (ab["read_initial_values"].is_boolean()) {
+          ab_cfg.read_initial_values = ab["read_initial_values"].get<bool>();
+        } else {
+          warn("plugins.opcua.auto_browse.read_initial_values must be a boolean - keeping current value");
+        }
+      }
+      if (ab.contains("infer_writable")) {
+        if (ab["infer_writable"].is_boolean()) {
+          ab_cfg.infer_writable = ab["infer_writable"].get<bool>();
+          ab_cfg.infer_writable_source = "plugins.opcua.auto_browse.infer_writable";
+        } else {
+          warn("plugins.opcua.auto_browse.infer_writable must be a boolean - keeping current value");
+        }
+      }
+      static const std::array<const char *, 6> kKnownKeys{"enabled",   "root_nodes",      "max_depth",
+                                                          "max_nodes", "namespace_allow", "namespace_deny"};
+      for (const auto & [key, value] : ab.items()) {
+        (void)value;
+        if (key == "read_initial_values" || key == "infer_writable") {
+          continue;
+        }
+        if (std::find_if(kKnownKeys.begin(), kKnownKeys.end(), [&key](const char * k) {
+              return key == k;
+            }) == kKnownKeys.end()) {
+          warn("plugins.opcua.auto_browse: unknown key '" + key + "' - ignored");
+        }
+      }
+    } else {
+      log_warn("plugins.opcua.auto_browse must be a boolean or an object - ignoring");
+    }
+  }
+
+  // plugins.opcua.auto_alarms (ROS param / JSON config). Overlays on top of
+  // whatever the node-map YAML's ``auto_alarms:`` block set (or the default
+  // AutoAlarmsConfig when there is no node map at all) - the same "JSON/env
+  // wins over file" precedence the rest of this function uses. This is what
+  // makes zero-config native A&C possible with no node_map_path: just an
+  // ``endpoint_url`` (from discovery) + ``auto_alarms: true``. Explicit
+  // ``event_alarms:`` mappings still take precedence over auto-derivation at
+  // the poller (see OpcuaPoller::effective_alarm_sources) regardless.
+  if (config.contains("auto_alarms")) {
+    auto_alarms_configured_ = true;
+    apply_auto_alarms_param(config["auto_alarms"], node_map_.mutable_auto_alarms(), [this](const std::string & msg) {
+      log_warn(msg);
+    });
+    // Re-derive the fields load() fills in (default entity, parsed source
+    // NodeId) and rebuild entity_defs so a param-only deployment still
+    // surfaces the alarms App over SOVD. Non-fatal on an invalid overlay:
+    // finalize_auto_alarms_overlay disables auto_alarms and logs rather than
+    // taking the whole plugin down over one bad param.
+    node_map_.finalize_auto_alarms_overlay();
+    if (node_map_.auto_alarms().enabled) {
+      log_info("auto_alarms enabled via plugins.opcua.auto_alarms param (source " +
+               node_map_.auto_alarms().source_node_id_str + ", entity " + node_map_.auto_alarms().entity_id + ")");
+    }
+  }
+  start_endpoint_url_ = client_config_.endpoint_url;
+}
+
+void OpcuaPlugin::set_context(PluginContext & context) {
+  ctx_ = as_ros_plugin_context(context);
+
+  // NOTE: capabilities (x-plc-data, x-plc-operations, x-plc-status) are
+  // registered per entity in introspect() rather than type-level here, so
+  // that only PLC-backed entities advertise them. Type-level registration
+  // would leak the capabilities onto every ROS 2 app/component in the SOVD
+  // entity tree, misleading clients into calling endpoints that return 404.
+
+  auto * node = ctx_->node();
+  if (node) {
+    // The clients live in a group the gateway's executor never collects and are
+    // pumped by a thread this plugin owns, so every reference to them stays on
+    // this plugin's threads (see fault_client_group_).
+    fault_client_group_ = node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive,
+                                                      /*automatically_add_to_executor_with_node=*/false);
+    // On the gateway's context: a host that runs the gateway on a private context never
+    // initialises the default one.
+    rclcpp::ExecutorOptions executor_options;
+    executor_options.context = node->get_node_base_interface()->get_context();
+    fault_executor_ = std::make_unique<rclcpp::executors::SingleThreadedExecutor>(executor_options);
+    fault_executor_->add_callback_group(fault_client_group_, node->get_node_base_interface());
+    fault_clients_->report = create_client_in_group<ros2_medkit_msgs::srv::ReportFault>(
+        node, "/fault_manager/report_fault", fault_client_group_);
+    fault_clients_->clear = create_client_in_group<ros2_medkit_msgs::srv::ClearFault>(
+        node, "/fault_manager/clear_fault", fault_client_group_);
+    fault_clients_->get_fault =
+        create_client_in_group<ros2_medkit_msgs::srv::GetFault>(node, "/fault_manager/get_fault", fault_client_group_);
+    context_ = node->get_node_base_interface()->get_context();
+    start_fault_executor();
+  }
+
+  run_startup_discovery();
+
+  log_security_profile();
+
+#if MEDKIT_OPCUA_READ_ONLY
+  // One line, once, and only when someone asked for the inference: the setting
+  // defaults to true, so warning on the default would tell every auto_browse
+  // deployment about a key nobody wrote. An explicit request is different - it
+  // has no effect here, and the message names the setting so it can be found.
+  const auto & ab_cfg = node_map_.auto_browse_config();
+  if (ab_cfg.enabled && ab_cfg.infer_writable && !ab_cfg.infer_writable_source.empty()) {
+    log_warn(ab_cfg.infer_writable_source +
+             " is ignored: this plugin was built with MEDKIT_OPCUA_READ_ONLY=ON and carries no write path, so "
+             "every discovered data point stays read-only. Rebuild with -DMEDKIT_OPCUA_READ_ONLY=OFF for a "
+             "write-capable plugin.");
+  }
+#endif
+
+  // The session is checked against the binding, which on the discovery path may
+  // already have been read from discovery.binding_file, and establishes it when
+  // there is none. A session that reached a different server is dropped here.
+  const bool connected = client_->connect(client_config_) && bind_or_drop_session();
+  if (connected) {
+    log_info("Connected to OPC-UA server: " + client_config_.endpoint_url);
+  } else {
+    log_warn("Failed to connect to OPC-UA server: " + client_config_.endpoint_url);
+  }
+
+  // Config-less discovery: name the SOVD component from the device's OWN read
+  // identity, never a hardcoded product string. DI nameplate (Siemens AG /
+  // CPU 1505SP F) wins, else BuildInfo ApplicationName/ProductName, else the
+  // neutral endpoint fallback opcua-<host>. Runs before the node map is
+  // consumed (auto_alarms finalize + auto_browse below both rebuild
+  // entity_defs off component_id_), so every derived reference stays
+  // consistent. Only in config-less mode: an explicit node map owns the name.
+  if (node_map_path_.empty()) {
+    const OpcuaClient::DeviceInfo info = connected ? client_->read_device_info() : OpcuaClient::DeviceInfo{};
+    const bool has_nameplate = component_identity_has_nameplate(info);
+    const ComponentIdentity ci = derive_component_identity(info, client_config_.endpoint_url);
+    if (!ci.id.empty()) {
+      if (!has_nameplate) {
+        // A stand-in: the device said nothing, so the id names the endpoint.
+        // Recording it is what lets a fault reported under it be recognised as
+        // this bridge's once the device does name itself.
+        remember_placeholder_id(ci.id);
+      }
+      node_map_.set_component_identity(ci.id, ci.name);
+      log_info("Component identity derived from device: id='" + ci.id + "', name='" + ci.name + "'");
+    }
+    // Which session this identity speaks for. Stamped only by a read that
+    // produced a nameplate, on the same rule the poll path follows, so a first
+    // session whose address space was still coming up is asked again rather
+    // than serving the stand-in until the next session.
+    if (connected && has_nameplate) {
+      component_identity_generation_ = client_->connection_generation();
+    }
+    if (connected) {
+      component_identity_read_generation_ = client_->connection_generation();
+      component_identity_poll_reads_ = 0;
+    }
+
+    // Zero-config native A&C: with no node map and no explicit auto_alarms
+    // block, subscribe the Server EventNotifier by default so discovered
+    // Alarms & Conditions surface on /api/v1/faults with a fault_code derived
+    // from the ConditionName/source. Finalize picks up the component id set
+    // above for the ``<component_id>_alarms`` fallback entity.
+    if (!auto_alarms_configured_) {
+      node_map_.mutable_auto_alarms().enabled = true;
+      node_map_.finalize_auto_alarms_overlay();
+      if (node_map_.auto_alarms().enabled) {
+        log_info("auto_alarms auto-enabled (config-less native A&C, source " +
+                 node_map_.auto_alarms().source_node_id_str + ", entity " + node_map_.auto_alarms().entity_id + ")");
+      }
+    }
+  }
+
+  // A session is up, so a link-state decision about PLC_COMMS_LOST is due. The
+  // decision itself waits for the poll thread, which owns the component ids the
+  // gate compares against.
+  if (connected) {
+    owe_comms_lost_decision();
+  }
+
+  if (connected && node_map_.auto_browse_config().enabled) {
+    // auto_browse needs a live session to walk the address space, so it can
+    // only run here - after connect(), before the node map is consumed to
+    // build publishers/poller below.
+    run_auto_browse();
+  }
+
+  // Publisher creation moved here (was originally before connect()) so that
+  // any entries auto_browse just merged into node_map_ also get a publisher.
+  create_value_publishers();
+
+  poller_ = std::make_unique<OpcuaPoller>(*client_, node_map_);
+  poller_->set_alarm_callback(
+      [this](const std::string & entity_id, const ros2_medkit::fault_detection::FaultSignal & signal) {
+        on_alarm_change(entity_id, signal);
+      });
+  poller_->set_event_alarm_callback([this](const AlarmEventDelivery & delivery) {
+    on_event_alarm(delivery);
+  });
+  poller_->set_poll_callback([this](const PollSnapshot & snap) {
+    publish_values(snap);
+  });
+  // Plumb operator-visible warnings out of the poll thread into the ROS log.
+  // Without this, ``ConditionRefresh rejected`` etc. only land in the
+  // container's stderr, invisible to anyone watching /rosout or rclpp logs.
+  poller_config_.log_warn = [this](const std::string & msg) {
+    log_warn(msg);
+  };
+
+  // Do not block startup on the fault sink. OPC-UA AlarmCondition notifications
+  // are one-shot (reported once on the inactive->active transition) and
+  // ReportFault is fire-and-forget, so a report raised before fault_manager is
+  // DDS-matched would be lost. send_report_fault/send_clear_fault buffer the
+  // dispatch and flush_pending_reports (run on every poll) drains it once the
+  // service appears, so a late sink still receives the alarm - without stalling
+  // startup or capping recovery at a fixed timeout.
+  // Issue #496: on top of that, gate the comms-lost latch on the fault sink
+  // being discovered, so the raised flag is not set before the report can land.
+  poller_config_.report_sink_ready = [this]() {
+    return fault_clients_->report && fault_clients_->report->service_is_ready();
+  };
+  // Fired once per session, before the poller (re)subscribes and before the
+  // server replays a single condition. The config-less rename has to be settled
+  // by then: apply_condition_state pins a fault's entity at the first sighting
+  // of its ConditionId, so a rename afterwards would strand the replayed faults
+  // under the entity it drops. The poller takes its own copy of the alarm
+  // routing at subscribe time, i.e. straight after this returns, so the copy
+  // already carries the new name.
+  poller_config_.on_connected = [this]() {
+    // The session is checked against the binding before anything is derived
+    // from it. A session that reached a different server is dropped here, and
+    // the poller is told so, which keeps the standing outage and the endpoint
+    // exactly where they were.
+    if (!bind_or_drop_session()) {
+      return false;
+    }
+    maybe_rederive_component_identity(kIdentityConnectRetries);
+    return true;
+  };
+  // Config-less discovery with no configured endpoint: let the poller's
+  // reconnect arm ask for a fresh scan while it is down. Without this the
+  // startup scan is the only one that ever runs, so a gateway that scanned
+  // while its PLC was still booting retries the fallback endpoint forever and
+  // only a restart finds the PLC.
+  const int rescan_interval_s = effective_rescan_interval_s(discovery_config_, endpoint_configured_);
+  if (rescan_interval_s > 0) {
+    poller_config_.rediscover_endpoint = [this]() {
+      return rescan_endpoint_for_reconnect();
+    };
+    // The rescan is consulted once per reconnect attempt, so the real adoption
+    // cadence is max(interval_s, backoff). Cap the backoff at the cadence so
+    // the documented "re-scan every interval_s while down" is the true one.
+    poller_config_.max_reconnect_interval = effective_max_reconnect_wait(
+        poller_config_.reconnect_interval, poller_config_.max_reconnect_interval, rescan_interval_s);
+  }
+  poller_->start(poller_config_);
+  log_info("OPC-UA poller started (mode: " + std::string(poller_->using_subscriptions() ? "subscription" : "poll") +
+           ")");
+}
+
+std::vector<GatewayPlugin::PluginRoute> OpcuaPlugin::get_routes() {
+  return {
+      {"GET", R"(apps/([^/]+)/x-plc-data)",
+       [this](const PluginRequest & req, PluginResponse & res) {
+         handle_plc_data(req, res);
+       }},
+      {"GET", R"(apps/([^/]+)/x-plc-data/([^/]+))",
+       [this](const PluginRequest & req, PluginResponse & res) {
+         handle_plc_data_single(req, res);
+       }},
+#if !MEDKIT_OPCUA_READ_ONLY
+      {"POST", R"(apps/([^/]+)/x-plc-operations/([^/]+))",
+       [this](const PluginRequest & req, PluginResponse & res) {
+         handle_plc_operations(req, res);
+       }},
+#endif
+      {"GET", R"(components/([^/]+)/x-plc-status)",
+       [this](const PluginRequest & req, PluginResponse & res) {
+         handle_plc_status(req, res);
+       }},
+  };
+}
+
+void OpcuaPlugin::shutdown() {
+  if (shutdown_requested_.exchange(true)) {
+    return;
+  }
+  log_info("Shutting down OPC-UA plugin...");
+  if (poller_) {
+    poller_->stop();
+  }
+  // The poll thread is joined, so nothing drives the decision; the client
+  // executor thread is joined next, so no response callback of ours runs after
+  // this returns and the clients can be dropped on this thread. The generation
+  // bump keeps an answer that was parked before the join from being read by a
+  // later probe, and the weak_ptr the callback holds is what makes a callback
+  // outlive-safe should the state block go before the client does.
+  stop_fault_executor();
+  comms_lost_decision_owed_.store(false);
+  comms_lost_probe_in_flight_ = false;
+  {
+    std::lock_guard<std::mutex> lock(comms_lost_probe_state_->mutex);
+    ++comms_lost_probe_state_->generation;
+    comms_lost_probe_state_->answered = false;
+    comms_lost_probe_state_->sources.clear();
+  }
+  // Dropping a client takes its outstanding requests out of its pending map.
+  // All three go here, on the thread that called shutdown(), so ~Client never
+  // runs on an executor thread against a node another plugin may be creating an
+  // entity on.
+  if (fault_clients_) {
+    if (fault_clients_->get_fault) {
+      fault_clients_->get_fault->remove_pending_request(comms_lost_probe_request_id_);
+    }
+    fault_clients_->get_fault.reset();
+    fault_clients_->clear.reset();
+    fault_clients_->report.reset();
+  }
+  fault_executor_.reset();
+  fault_client_group_.reset();
+  client_->disconnect();
+  log_info("OPC-UA plugin shutdown complete");
+}
+
+void OpcuaPlugin::start_fault_executor() {
+  fault_executor_stop_.store(false);
+  fault_executor_thread_ = std::thread([this]() {
+    // Runs until shutdown() raises the stop flag or the node's context is shut
+    // down, whichever comes first; a context shut down ahead of the plugin
+    // leaves nothing for the clients to dispatch. One wait per pass, bounded,
+    // so a stop requested before a wait began is still seen within
+    // kFaultExecutorWait. An exception out of the executor ends the thread too,
+    // and shutdown() joins it as usual.
+    while (!fault_executor_stop_.load() && rclcpp::ok(context_)) {
+      try {
+        fault_executor_->spin_once(kFaultExecutorWait);
+      } catch (const std::exception & e) {
+        RCLCPP_WARN(opcua_plugin_logger(), "fault-service client executor stopped: %s", e.what());
+        break;
+      } catch (...) {
+        break;
+      }
+    }
+  });
+}
+
+void OpcuaPlugin::stop_fault_executor() {
+  fault_executor_stop_.store(true);
+  if (fault_executor_) {
+    fault_executor_->cancel();
+  }
+  if (fault_executor_thread_.joinable()) {
+    fault_executor_thread_.join();
+  }
+}
+
+bool OpcuaPlugin::fault_services_ready_for_test() const {
+  return fault_clients_ && fault_clients_->report && fault_clients_->clear && fault_clients_->get_fault &&
+         fault_clients_->report->service_is_ready() && fault_clients_->clear->service_is_ready() &&
+         fault_clients_->get_fault->service_is_ready();
+}
+
+// -- IntrospectionProvider --
+
+IntrospectionResult OpcuaPlugin::introspect(const IntrospectionInput & /*input*/) {
+  log_info("introspect() called - generating PLC entities");
+  IntrospectionResult result;
+
+  // Serialize against an auto_browse re-walk (poll thread) rebuilding node_map_.
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+
+  Area area;
+  area.id = node_map_.area_id();
+  area.name = node_map_.area_name();
+  area.namespace_path = "/" + node_map_.area_id();
+  area.source = "plugin";
+  area.description = "PLC systems connected via OPC-UA";
+  result.new_entities.areas.push_back(std::move(area));
+
+  Component comp;
+  comp.id = node_map_.component_id();
+  comp.name = node_map_.component_name();
+  comp.namespace_path = "/" + node_map_.area_id();
+  comp.fqn = "/" + node_map_.area_id() + "/" + node_map_.component_id();
+  comp.area = node_map_.area_id();
+  // Identity authority is gated on channel trust: only an authenticated
+  // session (secured channel + certificate validation) gets the protocol tag
+  // "opcua", which outranks the operator manifest in the identity merge. An
+  // unauthenticated session (None channel or accept-any cert) could be a rogue
+  // server spoofing the nameplate, so it gets the generic "plugin" tag, which
+  // ranks below "manifest" (fills gaps, never overrides). Both tags survive
+  // the plugin layer (it only stamps "plugin" on empty sources); per-field
+  // provenance stays "opcua" for transparency in both cases.
+  comp.source = opcua_identity_trusted(client_config_) ? "opcua" : "plugin";
+  // Fault scope grants bare-id ownership only to external entities; the poller
+  // reports PLC_COMMS_LOST under this component's own id.
+  comp.external = true;
+  // Read the endpoint off the client, not off client_config_: a reconnect
+  // rescan can adopt a different server after startup, and the client is the
+  // one that holds the endpoint actually being connected to.
+  const std::string live_endpoint = client_ ? client_->endpoint_url() : client_config_.endpoint_url;
+  comp.description = "PLC runtime connected at " + live_endpoint;
+
+  // INV2: fill the asset-identity nameplate from the live server's device-info
+  // (ServerStatus/BuildInfo + optional OPC-UA DI nameplate). Read once per
+  // session (it is stable for a connection) and refreshed after a reconnect:
+  // the poller reestablishes the session in the background, and a server that
+  // registers its DI namespace or fills BuildInfo lazily after boot would
+  // otherwise latch whatever the first read got.
+  if (client_ && client_->is_connected()) {
+    const uint64_t session_generation = client_->connection_generation();
+    if (session_generation != device_identity_generation_) {
+      device_identity_ = opcua_device_info_to_identity(client_->read_device_info(), live_endpoint);
+      device_identity_generation_ = session_generation;
+      if (!device_identity_.empty()) {
+        log_info("Populated asset identity from OPC-UA device-info (manufacturer='" + device_identity_.manufacturer +
+                 "', model='" + device_identity_.model + "', orderCode='" + device_identity_.order_code + "')");
+      }
+    }
+  }
+  if (!device_identity_.empty()) {
+    comp.identity = device_identity_;
+  }
+
+  result.new_entities.components.push_back(std::move(comp));
+
+  // Register x-plc-status on the PLC runtime component only, so non-PLC
+  // components in the shared SOVD entity tree do not advertise a
+  // capability they cannot serve.
+  if (ctx_) {
+    ctx_->register_entity_capability(node_map_.component_id(), "x-plc-status");
+  }
+
+  for (const auto & def : node_map_.entity_defs()) {
+    App app;
+    app.id = def.id;
+    app.name = def.name;
+    app.component_id = def.component_id;
+    app.external = true;
+    app.is_online = client_->is_connected();
+    app.source = "plugin";
+    app.description = "PLC application with " + std::to_string(def.data_names.size()) + " data points";
+    // Declare the value-bridge topics on the entity that owns the data points.
+    // Graph discovery attributes them to the gateway node (their publisher),
+    // so without this the entity-scoped topic lookup - what resolves a data
+    // trigger's resource_path - comes up empty and the trigger never fires
+    // (issue #584). entry_has_value_publisher is the same predicate
+    // create_value_publishers() uses, so declaration and publication cannot
+    // drift apart.
+    for (const auto * entry : node_map_.entries_for_entity(def.id)) {
+      if (entry_has_value_publisher(*entry)) {
+        app.topics.publishes.push_back(entry->ros2_topic);
+      }
+    }
+    result.new_entities.apps.push_back(std::move(app));
+
+    // Register capabilities per entity (never type-level): only PLC-backed
+    // apps advertise x-plc-data. The auto_alarms fallback App (and any
+    // event_alarms-only App) has an entity_defs entry to host faults but no
+    // NodeMap entries of its own, so def.data_names stays empty - skip it or
+    // /apps/<id>/x-plc-data 404s despite being advertised. Apps with
+    // writable nodes also get x-plc-operations.
+    if (ctx_) {
+      if (!def.data_names.empty()) {
+        ctx_->register_entity_capability(def.id, "x-plc-data");
+      }
+#if !MEDKIT_OPCUA_READ_ONLY
+      if (!def.writable_names.empty()) {
+        ctx_->register_entity_capability(def.id, "x-plc-operations");
+      }
+#endif
+    }
+  }
+
+  return result;
+}
+
+// -- Route handlers --
+
+void OpcuaPlugin::handle_plc_data(const PluginRequest & req, PluginResponse & res) {
+  if (!ctx_ || !poller_ || shutdown_requested_.load()) {
+    res.send_error(503, ERR_SERVICE_UNAVAILABLE, "OPC-UA plugin not initialized");
+    return;
+  }
+  auto entity_id = req.path_param(1);
+  auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
+  if (!entity) {
+    return;
+  }
+
+  // Held across build_data_response too (it reads node_map_ without locking).
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  auto entries = node_map_.entries_for_entity(entity_id);
+  if (entries.empty()) {
+    res.send_error(404, ERR_RESOURCE_NOT_FOUND, "No PLC data mapped for entity: " + entity_id);
+    return;
+  }
+
+  res.send_json(build_data_response(entity_id));
+}
+
+void OpcuaPlugin::handle_plc_data_single(const PluginRequest & req, PluginResponse & res) {
+  if (!ctx_ || !poller_ || shutdown_requested_.load()) {
+    res.send_error(503, ERR_SERVICE_UNAVAILABLE, "OPC-UA plugin not initialized");
+    return;
+  }
+  auto entity_id = req.path_param(1);
+  auto data_name = req.path_param(2);
+
+  if (!is_valid_path_segment(data_name)) {
+    res.send_error(400, ERR_INVALID_PARAMETER, "Invalid data name");
+    return;
+  }
+
+  auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
+  if (!entity) {
+    return;
+  }
+
+  // Held for as long as ``entry`` (a pointer into node_map_) is dereferenced.
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  auto * entry = node_map_.find_by_data_name(entity_id, data_name);
+  if (!entry) {
+    res.send_error(404, ERR_RESOURCE_NOT_FOUND, "Data point not found: " + data_name + " in entity: " + entity_id);
+    return;
+  }
+
+  auto snap = poller_->snapshot();
+  auto it = snap.values.find(entry->node_id_str);
+
+  nlohmann::json j;
+  j["name"] = entry->data_name;
+  j["display_name"] = entry->display_name;
+  j["node_id"] = entry->node_id_str;
+
+  if (it != snap.values.end()) {
+    std::visit(
+        [&j](auto && v) {
+          j["value"] = v;
+        },
+        it->second);
+  } else {
+    j["value"] = nullptr;
+  }
+
+  if (!entry->unit.empty()) {
+    j["unit"] = entry->unit;
+  }
+  j["data_type"] = entry->data_type;
+  j["writable"] = entry->writable;
+
+  auto ts = std::chrono::system_clock::to_time_t(snap.timestamp);
+  j["timestamp"] = ts;
+
+  res.send_json(j);
+}
+
+#if !MEDKIT_OPCUA_READ_ONLY
+void OpcuaPlugin::handle_plc_operations(const PluginRequest & req, PluginResponse & res) {
+  if (!ctx_ || !poller_ || shutdown_requested_.load()) {
+    res.send_error(503, ERR_SERVICE_UNAVAILABLE, "OPC-UA plugin not initialized");
+    return;
+  }
+  auto entity_id = req.path_param(1);
+  auto op_name = req.path_param(2);
+
+  if (!is_valid_path_segment(op_name)) {
+    res.send_error(400, ERR_INVALID_PARAMETER, "Invalid operation name");
+    return;
+  }
+
+  auto entity = ctx_->validate_entity_for_route(req, res, entity_id);
+  if (!entity) {
+    return;
+  }
+
+  std::string data_name;
+  if (op_name.substr(0, 4) == "set_") {
+    data_name = op_name.substr(4);
+  } else {
+    data_name = op_name;
+  }
+
+  // Held for as long as ``entry`` (a pointer into node_map_) is dereferenced,
+  // including across the OPC-UA write below.
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  auto * entry = node_map_.find_by_data_name(entity_id, data_name);
+  if (!entry) {
+    res.send_error(404, ERR_RESOURCE_NOT_FOUND, "Operation not found: " + op_name + " in entity: " + entity_id);
+    return;
+  }
+
+  if (!entry->writable) {
+    res.send_error(400, ERR_INVALID_REQUEST, "Data point is read-only: " + data_name);
+    return;
+  }
+
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(req.body());
+  } catch (const nlohmann::json::parse_error &) {
+    res.send_error(400, ERR_INVALID_REQUEST, "Invalid JSON body");
+    return;
+  }
+
+  if (!body.contains("value")) {
+    res.send_error(400, ERR_INVALID_REQUEST, "Missing 'value' field");
+    return;
+  }
+
+  auto parsed = parse_coerce_validate(body["value"], *entry);
+  if (!parsed) {
+    res.send_error(400, ERR_INVALID_REQUEST, parsed.error());
+    return;
+  }
+
+  auto write_result = client_->write_value(entry->node_id, *parsed, entry->data_type);
+  if (!write_result) {
+    int status = (write_result.error().code == OpcuaClient::WriteError::NotConnected ||
+                  write_result.error().code == OpcuaClient::WriteError::TransportError)
+                     ? 502
+                     : 400;
+    res.send_error(status, ERR_SERVICE_UNAVAILABLE, write_result.error().message);
+    return;
+  }
+
+  nlohmann::json response;
+  response["status"] = "ok";
+  response["operation"] = op_name;
+  response["node_id"] = entry->node_id_str;
+  std::visit(
+      [&response](auto && v) {
+        response["value_written"] = v;
+      },
+      *parsed);
+
+  res.send_json(response);
+}
+#endif  // !MEDKIT_OPCUA_READ_ONLY
+
+void OpcuaPlugin::handle_plc_status(const PluginRequest & req, PluginResponse & res) {
+  if (!ctx_ || !poller_ || shutdown_requested_.load()) {
+    res.send_error(503, ERR_SERVICE_UNAVAILABLE, "OPC-UA plugin not initialized");
+    return;
+  }
+  auto component_id = req.path_param(1);
+  auto entity = ctx_->validate_entity_for_route(req, res, component_id);
+  if (!entity) {
+    return;
+  }
+
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  auto snap = poller_->snapshot();
+
+  nlohmann::json j;
+  j["component_id"] = component_id;
+  j["connected"] = snap.connected;
+  j["endpoint_url"] = client_->endpoint_url();
+  j["server_description"] = client_->server_description();
+  j["mode"] = poller_->using_subscriptions() ? "subscription" : "poll";
+  // The write surface of the object, not of the configuration. An absent
+  // x-plc-operations capability is also what a write-capable build with no
+  // writable point looks like, so the build itself is reported.
+  j["write_capable"] = MEDKIT_OPCUA_READ_ONLY == 0;
+  j["poll_count"] = snap.poll_count;
+  j["error_count"] = snap.error_count;
+  j["node_count"] = node_map_.entries().size();
+  j["entity_count"] = node_map_.entity_defs().size();
+
+  auto ts = std::chrono::system_clock::to_time_t(snap.timestamp);
+  j["last_update"] = ts;
+
+  nlohmann::json alarms = nlohmann::json::array();
+  for (const auto & [code, active] : snap.alarms) {
+    if (active) {
+      alarms.push_back(code);
+    }
+  }
+  j["active_alarms"] = alarms;
+
+  res.send_json(j);
+}
+
+// -- Fault bridge --
+
+void OpcuaPlugin::on_alarm_change(const std::string & entity_id,
+                                  const ros2_medkit::fault_detection::FaultSignal & signal) {
+  if (shutdown_requested_.load()) {
+    return;
+  }
+
+  if (signal.active) {
+    log_info("Alarm activated: " + signal.fault_code + " on " + entity_id);
+    if (clear_origin_for_signal(signal.fault_code) == ClearOrigin::LinkState) {
+      // A raise of the link-state code. The store can answer a probe from
+      // before it has processed this report, so the decision that follows earns
+      // one more (see comms_lost_raise_since_decision_).
+      comms_lost_raise_since_decision_.store(true);
+    }
+    send_report_fault(entity_id, signal.fault_code, signal.severity, signal.message);
+  } else {
+    log_info("Alarm cleared: " + signal.fault_code + " on " + entity_id);
+    // The poller's comms-lost clear on a successful reconnect is the same
+    // link-state event as the connect-time one and takes the same route: the
+    // poller knows this link came back, not whose PLC_COMMS_LOST is standing in
+    // a store keyed by code alone, so the decision belongs to the poll thread
+    // and the gate. Every other code here is the device reporting its condition
+    // inactive, which is a real resolution and a one-shot edge, so it keeps the
+    // cascade and the buffer treats it as such.
+    if (clear_origin_for_signal(signal.fault_code) == ClearOrigin::LinkState) {
+      owe_comms_lost_decision();
+    } else {
+      send_clear_fault(signal.fault_code, ClearOrigin::DeviceAlarm);
+    }
+  }
+}
+
+std::string OpcuaPlugin::map_severity(uint16_t live_severity, const std::string & severity_override) {
+  // Map raw OPC-UA Severity (1-1000) to SOVD severity bucket.
+  // Selfpatch convention documented in design/index.rst; not from IEC 62682.
+  // The resolved severity_override (mapping- or source-level, issue #389)
+  // wins when set.
+  if (!severity_override.empty()) {
+    return severity_override;
+  }
+  if (live_severity >= 801) {
+    return std::string("CRITICAL");
+  }
+  if (live_severity >= 501) {
+    return std::string("ERROR");
+  }
+  if (live_severity >= 201) {
+    return std::string("WARNING");
+  }
+  return std::string("INFO");
+}
+
+void OpcuaPlugin::apply_auto_alarms_param(const nlohmann::json & value, AutoAlarmsConfig & cfg,
+                                          const std::function<void(const std::string &)> & warn) {
+  // Field-for-field mirror of node_map.cpp's YAML ``auto_alarms:`` loader,
+  // reading nlohmann::json instead of YAML::Node. Only keys actually present
+  // overwrite ``cfg`` so a partial param overlays cleanly on top of whatever
+  // the node-map YAML declared (the JSON param wins on collision).
+  if (value.is_boolean()) {
+    cfg.enabled = value.get<bool>();
+    return;
+  }
+  if (!value.is_object()) {
+    warn("plugins.opcua.auto_alarms must be a boolean or an object - ignoring");
+    return;
+  }
+
+  // Presence of the map itself implies intent to enable (matches the bare
+  // boolean and the YAML map form); ``enabled: false`` still turns it off.
+  cfg.enabled = value.value("enabled", true);
+
+  if (value.contains("source_node_id")) {
+    if (value["source_node_id"].is_string() && !value["source_node_id"].get<std::string>().empty()) {
+      cfg.source_node_id_str = value["source_node_id"].get<std::string>();
+    } else {
+      warn("plugins.opcua.auto_alarms.source_node_id must be a non-empty string - keeping current value");
+    }
+  }
+  if (value.contains("entity_id")) {
+    if (value["entity_id"].is_string() && !value["entity_id"].get<std::string>().empty()) {
+      cfg.entity_id = value["entity_id"].get<std::string>();
+    } else {
+      warn("plugins.opcua.auto_alarms.entity_id must be a non-empty string - keeping current value");
+    }
+  }
+  if (value.contains("auto_clear")) {
+    if (value["auto_clear"].is_boolean()) {
+      cfg.auto_clear = value["auto_clear"].get<bool>();
+    } else {
+      warn("plugins.opcua.auto_alarms.auto_clear must be a boolean - keeping current value");
+    }
+  }
+
+  if (value.contains("severity_bands")) {
+    const auto & bands = value["severity_bands"];
+    if (!bands.is_object()) {
+      warn("plugins.opcua.auto_alarms.severity_bands must be an object - ignoring");
+    } else {
+      auto read_band = [&](const char * key, uint16_t def) -> uint16_t {
+        if (!bands.contains(key)) {
+          return def;
+        }
+        if (!bands[key].is_number_integer()) {
+          warn(std::string("plugins.opcua.auto_alarms.severity_bands.") + key + " must be an integer - using default");
+          return def;
+        }
+        const auto raw = bands[key].get<int64_t>();
+        if (raw < 0 || raw > 1000) {
+          warn(std::string("plugins.opcua.auto_alarms.severity_bands.") + key +
+               " out of range (0..1000) - using default");
+          return def;
+        }
+        return static_cast<uint16_t>(raw);
+      };
+      cfg.severity_bands.critical_min = read_band("critical", cfg.severity_bands.critical_min);
+      cfg.severity_bands.error_min = read_band("error", cfg.severity_bands.error_min);
+      cfg.severity_bands.warning_min = read_band("warning", cfg.severity_bands.warning_min);
+      for (const auto & [key, band_val] : bands.items()) {
+        (void)band_val;
+        if (key != "critical" && key != "error" && key != "warning") {
+          warn("plugins.opcua.auto_alarms.severity_bands: unknown key '" + key + "' - ignored");
+        }
+      }
+      if (cfg.severity_bands.critical_min < cfg.severity_bands.error_min ||
+          cfg.severity_bands.error_min < cfg.severity_bands.warning_min) {
+        warn(
+            "plugins.opcua.auto_alarms.severity_bands must satisfy critical >= error >= warning - "
+            "resetting to the default bands (801/501/201)");
+        cfg.severity_bands = AutoAlarmsSeverityBands{};
+      }
+    }
+  }
+
+  auto read_pattern_list = [&](const char * key) -> std::vector<std::string> {
+    std::vector<std::string> out;
+    if (!value.contains(key)) {
+      return out;
+    }
+    if (!value[key].is_array()) {
+      warn(std::string("plugins.opcua.auto_alarms.") + key + " must be an array of strings - ignoring");
+      return out;
+    }
+    for (const auto & p : value[key]) {
+      if (p.is_string()) {
+        out.push_back(p.get<std::string>());
+      } else {
+        warn(std::string("plugins.opcua.auto_alarms.") + key + ": non-string entry - skipping");
+      }
+    }
+    return out;
+  };
+  // Only replace the pattern lists when the param actually carries them, so a
+  // param that omits include/exclude does not wipe a YAML-declared list.
+  if (value.contains("include")) {
+    cfg.include_patterns = read_pattern_list("include");
+  }
+  if (value.contains("exclude")) {
+    cfg.exclude_patterns = read_pattern_list("exclude");
+  }
+
+  for (const auto & [key, item] : value.items()) {
+    (void)item;
+    if (key != "enabled" && key != "source_node_id" && key != "entity_id" && key != "auto_clear" &&
+        key != "severity_bands" && key != "include" && key != "exclude") {
+      warn("plugins.opcua.auto_alarms: unknown key '" + key + "' - ignored");
+    }
+  }
+}
+
+void OpcuaPlugin::on_event_alarm(const AlarmEventDelivery & delivery) {
+  if (shutdown_requested_.load()) {
+    return;
+  }
+
+  const std::string severity_str = map_severity(delivery.severity, delivery.severity_override);
+
+  switch (delivery.action) {
+    case AlarmAction::ReportConfirmed:
+      log_info("AlarmCondition CONFIRMED: " + delivery.fault_code + " on " + delivery.entity_id +
+               " (severity=" + std::to_string(delivery.severity) + ")");
+      send_report_fault(delivery.entity_id, delivery.fault_code, severity_str, delivery.message);
+      break;
+    case AlarmAction::ReportHealed:
+      // Intentional no-op (Copilot review on PR #387).
+      //
+      // OPC-UA AlarmConditionType HEALED means "alarm physically cleared
+      // (ActiveState=false) but operator workflow incomplete (ack and/or
+      // confirm pending)". Per Part 9 §5.7 the Cleared transition is
+      // operator-driven, not statistical.
+      //
+      // ros2_medkit_msgs/srv/ReportFault has only FAILED/PASSED verbs and
+      // fault_manager treats PASSED through a debounce engine. Sending
+      // EVENT_PASSED on every latch would let fault_manager auto-clear
+      // the fault via healing_threshold debounce, defeating the spec
+      // contract that requires explicit operator Acknowledge + Confirm.
+      // Conversely, healing_enabled=false would silently lose the HEALED
+      // signal entirely.
+      //
+      // Until we add STATUS_LATCHED (or a similar lifecycle-distinguishing
+      // status) to ros2_medkit_msgs/msg/Fault we keep status=CONFIRMED
+      // until the next ClearFault fires. The operator-side gap (cannot
+      // see "physically cleared, awaiting confirm" in the UI) is tracked
+      // separately; see PR #387 review thread.
+      log_info("AlarmCondition HEALED (latched, awaiting ack/confirm): " + delivery.fault_code);
+      break;
+    case AlarmAction::ClearFault:
+      log_info("AlarmCondition CLEARED: " + delivery.fault_code);
+      // The device itself reported the condition cleared (Part 9 lifecycle), so
+      // this IS a resolution at the source and the correlation engine may act on
+      // it. DeviceAlarm is also the default, spelled out here because this is
+      // the one call site where the cascade is deliberately kept.
+      send_clear_fault(delivery.fault_code, ClearOrigin::DeviceAlarm);
+      break;
+    case AlarmAction::NoOp:
+      break;
+  }
+}
+
+void OpcuaPlugin::send_report_fault(const std::string & entity_id, const std::string & fault_code,
+                                    const std::string & severity_str, const std::string & message) {
+  if (!fault_clients_->report) {
+    log_warn("ReportFault service client not available");
+    return;
+  }
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::ReportFault::Request>();
+  request->fault_code = fault_code;
+  request->event_type = ros2_medkit_msgs::srv::ReportFault::Request::EVENT_FAILED;
+  request->description = message;
+  request->source_id = entity_id;
+
+  // Map severity string to uint8 (case-insensitive)
+  std::string sev_lower = severity_str;
+  std::transform(sev_lower.begin(), sev_lower.end(), sev_lower.begin(), [](unsigned char c) {
+    return std::tolower(c);
+  });
+  if (sev_lower == "critical") {
+    request->severity = ros2_medkit_msgs::msg::Fault::SEVERITY_CRITICAL;
+  } else if (sev_lower == "error") {
+    request->severity = ros2_medkit_msgs::msg::Fault::SEVERITY_ERROR;
+  } else if (sev_lower == "warning") {
+    request->severity = ros2_medkit_msgs::msg::Fault::SEVERITY_WARN;
+  } else {
+    request->severity = ros2_medkit_msgs::msg::Fault::SEVERITY_INFO;
+  }
+
+  send_or_buffer({PendingFaultDispatch::Kind::Report, fault_code, /*link_state=*/false, [this, request]() {
+                    fault_clients_->report->async_send_request(request);
+                  }});
+}
+
+ros2_medkit_msgs::srv::ClearFault::Request OpcuaPlugin::make_clear_fault_request(const std::string & fault_code,
+                                                                                 bool skip_correlation_auto_clear) {
+  ros2_medkit_msgs::srv::ClearFault::Request request;
+  request.fault_code = fault_code;
+  request.skip_correlation_auto_clear = skip_correlation_auto_clear;
+  return request;
+}
+
+void OpcuaPlugin::send_clear_fault(const std::string & fault_code, ClearOrigin origin) {
+  if (!fault_clients_->clear) {
+    log_warn("ClearFault service client not available");
+    return;
+  }
+
+  auto request = std::make_shared<ros2_medkit_msgs::srv::ClearFault::Request>(
+      make_clear_fault_request(fault_code, clear_skips_correlation(origin)));
+
+  send_or_buffer({PendingFaultDispatch::Kind::Clear, fault_code, clear_is_link_state(origin), [this, request]() {
+                    fault_clients_->clear->async_send_request(request);
+                  }});
+}
+
+bool OpcuaPlugin::link_state_clear_permitted(bool fault_found, const std::vector<std::string> & reporting_sources,
+                                             const std::unordered_set<std::string> & my_ids) {
+  if (!fault_found || reporting_sources.empty()) {
+    return false;
+  }
+  return std::all_of(reporting_sources.begin(), reporting_sources.end(), [&my_ids](const std::string & source) {
+    return my_ids.count(source) > 0;
+  });
+}
+
+std::unordered_set<std::string> OpcuaPlugin::reporting_ids_of_this_process() const {
+  std::unordered_set<std::string> ids(placeholder_ids_.begin(), placeholder_ids_.end());
+  // A node map that names no component_id reports under the NodeMap default, so
+  // a fault carrying it is this bridge's.
+  ids.insert(NodeMap::kDefaultComponentId);
+  const std::string current = node_map_.component_id();
+  if (!current.empty()) {
+    ids.insert(current);
+  }
+  // A process that never reached its PLC reported under the stand-in of the
+  // endpoint it started on, or of the one it found and never opened a session
+  // on. This process derives both from the same configuration.
+  for (const std::string & endpoint : {start_endpoint_url_, client_ ? client_->endpoint_url() : std::string{}}) {
+    const std::string stand_in = derive_component_identity(OpcuaClient::DeviceInfo{}, endpoint).id;
+    if (!stand_in.empty()) {
+      ids.insert(stand_in);
+    }
+  }
+  return ids;
+}
+
+void OpcuaPlugin::owe_comms_lost_decision() {
+  if (!poller_config_.comms_lost_fault_enabled) {
+    return;
+  }
+  comms_lost_decision_owed_.store(true);
+}
+
+void OpcuaPlugin::apply_comms_lost_answer(bool found, const std::vector<std::string> & reporting_sources) {
+  if (!found) {
+    // No row, so nothing to clear and nothing standing to report.
+    return;
+  }
+  const std::unordered_set<std::string> my_ids = reporting_ids_of_this_process();
+  if (!link_state_clear_permitted(found, reporting_sources, my_ids)) {
+    std::string sources;
+    for (const auto & source : reporting_sources) {
+      if (!sources.empty()) {
+        sources += ", ";
+      }
+      sources += source;
+    }
+    log_info(std::string(kCommsLostFaultCode) + " is held by sources this bridge did not report under [" + sources +
+             "] - leaving it standing. A fault two bridges raised is cleared by an operator; the fault manager has "
+             "no per-source de-assert.");
+    return;
+  }
+  // LinkState: this says the session came back, not that an operator resolved
+  // anything, so a correlation rule naming PLC_COMMS_LOST as a root cause must
+  // not cascade-clear the symptoms the outage produced.
+  log_info(std::string("OPC-UA connection established, clearing this bridge's ") + kCommsLostFaultCode);
+  send_clear_fault(kCommsLostFaultCode, ClearOrigin::LinkState);
+}
+
+void OpcuaPlugin::drive_comms_lost_decision() {
+  if (!poller_config_.comms_lost_fault_enabled || !fault_clients_->get_fault) {
+    return;
+  }
+  const bool connected = client_ && client_->is_connected();
+  const uint64_t live_session = client_ ? client_->connection_generation() : 0;
+
+  // An answer the executor thread parked, and only one belonging to the probe
+  // this thread is waiting for. Consuming it here keeps the gate's inputs - the
+  // component ids - on the thread that renames them.
+  bool found = false;
+  std::vector<std::string> sources;
+  bool have_answer = false;
+  {
+    std::lock_guard<std::mutex> lock(comms_lost_probe_state_->mutex);
+    if (comms_lost_probe_state_->answered && comms_lost_generation_current(comms_lost_probe_state_->answered_generation,
+                                                                           comms_lost_probe_state_->generation)) {
+      found = comms_lost_probe_state_->found;
+      sources.swap(comms_lost_probe_state_->sources);
+      comms_lost_probe_state_->answered = false;
+      have_answer = true;
+    }
+  }
+  if (have_answer) {
+    comms_lost_probe_in_flight_ = false;
+    if (!comms_lost_answer_applicable(connected, /*has_answer=*/true, comms_lost_probe_session_, live_session)) {
+      // The session the probe was sent on is gone. This tick is the first one
+      // after a reconnect, so the link reads as up while the answer describes
+      // the store from before an outage that has since been reported. It is
+      // dropped and the decision is taken again on this session.
+      comms_lost_decision_owed_.store(true);
+      RCLCPP_DEBUG(opcua_plugin_logger(), "%s answer belongs to an earlier session; asking again on this one",
+                   kCommsLostFaultCode);
+      return;
+    }
+    apply_comms_lost_answer(found, sources);
+    // The store may have answered from before a ReportFault this process had
+    // already sent, so a decision with a raise behind it earns one more.
+    if (comms_lost_raise_since_decision_.exchange(false)) {
+      comms_lost_decision_owed_.store(true);
+    }
+    return;
+  }
+
+  // A probe whose answer never came. Dropping the request is what stops the
+  // client's pending map from growing one entry per connect; bumping the
+  // generation is what stops a late answer being read as the next probe's.
+  if (comms_lost_probe_in_flight_) {
+    if (std::chrono::steady_clock::now() - comms_lost_probe_sent_ >= fault_service_timeout_) {
+      fault_clients_->get_fault->remove_pending_request(comms_lost_probe_request_id_);
+      // rclcpp takes the pending entry out before it runs the callback, and
+      // outside the mutex, so a callback that won that race is still on its way
+      // here. Moving the generation on is what makes it park at a stale one and
+      // be dropped.
+      {
+        std::lock_guard<std::mutex> lock(comms_lost_probe_state_->mutex);
+        ++comms_lost_probe_state_->generation;
+        comms_lost_probe_state_->answered = false;
+        comms_lost_probe_state_->sources.clear();
+      }
+      comms_lost_probe_in_flight_ = false;
+      comms_lost_decision_owed_.store(true);
+      log_warn(std::string("fault store did not answer within ") + std::to_string(fault_service_timeout_.count()) +
+               " ms; the " + kCommsLostFaultCode + " decision stays owed");
+    }
+    return;
+  }
+
+  if (!comms_lost_probe_due(comms_lost_decision_owed_.load(), connected, comms_lost_probe_in_flight_,
+                            fault_clients_->get_fault->service_is_ready())) {
+    return;
+  }
+  // Taken BEFORE the send: an owe raised by the REST or event-pump thread while
+  // the request is going out has to survive it, and a store(false) after the
+  // send would swallow it.
+  if (!comms_lost_decision_owed_.exchange(false)) {
+    return;
+  }
+
+  uint64_t generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(comms_lost_probe_state_->mutex);
+    generation = ++comms_lost_probe_state_->generation;
+    comms_lost_probe_state_->answered = false;
+    comms_lost_probe_state_->sources.clear();
+  }
+  std::weak_ptr<CommsLostProbeState> weak_state = comms_lost_probe_state_;
+  auto request = std::make_shared<ros2_medkit_msgs::srv::GetFault::Request>();
+  request->fault_code = kCommsLostFaultCode;
+  // rclcpp selects the response-callback overload of async_send_request only for
+  // a callable whose parameter list is exactly (SharedFuture); a const reference
+  // parameter matches no overload. The future is therefore taken by value.
+  using GetFaultFuture = rclcpp::Client<ros2_medkit_msgs::srv::GetFault>::SharedFuture;
+  try {
+    auto future = fault_clients_->get_fault->async_send_request(
+        request, [weak_state, generation](GetFaultFuture answer) {  // NOLINT(performance-unnecessary-value-param)
+          // The plugin's client executor thread. It parks the answer and nothing
+          // else: the decision reads component ids, which only the poll thread
+          // may do. The state is reached through a weak_ptr, so a callback that
+          // outlives the plugin's state block touches nothing.
+          const auto state = weak_state.lock();
+          if (!state) {
+            return;
+          }
+          try {
+            const auto & response = answer.get();
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->generation != generation) {
+              return;  // answer to a probe that has already been given up on
+            }
+            state->found = response->success;
+            state->sources = response->fault.reporting_sources;
+            state->answered_generation = generation;
+            state->answered = true;
+            ++state->answers;
+          } catch (...) {
+            // A broken promise (the client was reset under us) leaves the
+            // decision owed, which the poll thread resolves on its own terms.
+          }
+        });
+    comms_lost_probe_request_id_ = future.request_id;
+    comms_lost_probe_sent_ = std::chrono::steady_clock::now();
+    comms_lost_probe_session_ = live_session;
+    comms_lost_probe_in_flight_ = true;
+  } catch (const std::exception & e) {
+    // The owe was taken before the send. Nothing went out, so it goes back:
+    // the poll thread has no catch of its own and a lost owe is a fault left
+    // standing for good.
+    comms_lost_decision_owed_.store(true);
+    RCLCPP_WARN(opcua_plugin_logger(), "fault store request failed to go out (%s); the %s decision stays owed",
+                e.what(), kCommsLostFaultCode);
+  }
+}
+
+OpcuaPlugin::PendingEnqueueOutcome OpcuaPlugin::enqueue_pending_dispatch(std::vector<PendingFaultDispatch> & buffer,
+                                                                         size_t max_size, PendingFaultDispatch entry) {
+  const bool is_clear = entry.kind == PendingFaultDispatch::Kind::Clear;
+
+  // At most one pending clear per fault code, and only while nothing has been
+  // reported for that code since. Search from the BACK and stop at the first
+  // entry carrying this code: a Clear there is superseded and moves to the back,
+  // a Report there means the code was raised again and the incoming clear
+  // belongs behind it. Coalescing past that Report would reorder the pair -
+  // Report, Clear, Report, Clear flushed as Report, Report, Clear, leaving the
+  // second raise standing while the device says inactive. Repeated reconnect
+  // clears, which have no report between them, still collapse to one.
+  bool replaced = false;
+  if (is_clear) {
+    for (auto it = buffer.rbegin(); it != buffer.rend(); ++it) {
+      if (it->fault_code != entry.fault_code) {
+        continue;
+      }
+      if (it->kind == PendingFaultDispatch::Kind::Clear) {
+        buffer.erase(std::next(it).base());
+        replaced = true;
+      }
+      break;
+    }
+  }
+
+  PendingEnqueueOutcome outcome = replaced ? PendingEnqueueOutcome::ReplacedClear : PendingEnqueueOutcome::Buffered;
+  if (buffer.size() >= max_size) {
+    // Only a link-state clear is re-derivable: the next reconnect sends it
+    // again. A full buffer gives that up first, and refuses an incoming one, so
+    // every dispatch nothing will re-send stays. Everything else - reports, a
+    // device alarm's inactive edge, an operator's scoped clear - is one-shot and
+    // ages out oldest-first.
+    const auto oldest_link_state = std::find_if(buffer.begin(), buffer.end(), [](const PendingFaultDispatch & pending) {
+      return pending.kind == PendingFaultDispatch::Kind::Clear && pending.link_state;
+    });
+    if (oldest_link_state != buffer.end()) {
+      buffer.erase(oldest_link_state);
+      outcome = PendingEnqueueOutcome::EvictedLinkStateClear;
+    } else if (is_clear && entry.link_state) {
+      return PendingEnqueueOutcome::Refused;
+    } else {
+      buffer.erase(buffer.begin());
+      outcome = PendingEnqueueOutcome::EvictedOldest;
+    }
+  }
+
+  buffer.push_back(std::move(entry));
+  return outcome;
+}
+
+void OpcuaPlugin::send_or_buffer(PendingFaultDispatch entry) {
+  // Bound the buffer so a deployment with no fault_manager cannot grow it
+  // without limit. Reached from the poll thread (alarm and event callbacks, and
+  // the link-state decision in publish_values) and from the REST thread
+  // (FaultProvider::clear_fault), so the vector mutation is serialised by
+  // pending_reports_mutex_.
+  PendingEnqueueOutcome outcome = PendingEnqueueOutcome::Buffered;
+  {
+    std::lock_guard<std::mutex> lock(pending_reports_mutex_);
+    outcome = enqueue_pending_dispatch(pending_reports_, kMaxPendingDispatches, std::move(entry));
+  }
+  if (outcome == PendingEnqueueOutcome::EvictedOldest) {
+    log_warn("pending fault dispatch buffer full (" + std::to_string(kMaxPendingDispatches) +
+             "), dropping the oldest dispatch");
+  } else if (outcome == PendingEnqueueOutcome::EvictedLinkStateClear) {
+    log_warn("pending fault dispatch buffer full (" + std::to_string(kMaxPendingDispatches) +
+             "), dropping a link-state clear the next reconnect re-derives");
+  } else if (outcome == PendingEnqueueOutcome::Refused) {
+    log_warn("pending fault dispatch buffer full of one-shot dispatches (" + std::to_string(kMaxPendingDispatches) +
+             "), dropping this link-state clear instead");
+  }
+  if (outcome == PendingEnqueueOutcome::EvictedLinkStateClear || outcome == PendingEnqueueOutcome::Refused) {
+    // The buffer ranks a link-state clear last on the grounds that the next
+    // reconnect re-derives it, which holds for the poller's reconnect clear and
+    // not for one a successful connect queued. Recording the debt is what
+    // covers the connect case; the poll thread pays it.
+    owe_comms_lost_decision();
+  }
+  // Drains immediately (in order) if the sink is already matched.
+  flush_pending_reports();
+}
+
+void OpcuaPlugin::flush_pending_reports() {
+  // One flush at a time, from the swap to the last dispatch. Flushes run on the
+  // poll thread, the event pump thread and the REST thread; without this, one
+  // thread could swap out an older batch and dispatch it after another thread
+  // dispatched a newer one, so a clear could reach the fault manager before
+  // the raise it answers.
+  std::lock_guard<std::mutex> dispatch_lock(dispatch_mutex_);
+  // Keep the reports buffered until the sink is discoverable (checked outside the
+  // lock; rclcpp client state is thread-safe).
+  if (!fault_clients_->report || !fault_clients_->report->service_is_ready()) {
+    return;
+  }
+  // Move the ready batch out under the lock, then dispatch it OUTSIDE the lock so
+  // the vector is never being reallocated by a concurrent send_or_buffer while it
+  // is iterated here (the use-after-free that corrupted the heap), and so the ROS
+  // service call never runs under the mutex.
+  std::vector<PendingFaultDispatch> batch;
+  {
+    std::lock_guard<std::mutex> lock(pending_reports_mutex_);
+    batch.swap(pending_reports_);
+  }
+  for (auto & entry : batch) {
+    entry.dispatch();
+  }
+}
+
+void OpcuaPlugin::create_value_publishers() {
+  auto * node = ctx_ ? ctx_->node() : nullptr;
+  if (!node) {
+    return;
+  }
+  // Create ROS 2 publishers for numeric PLC values only (skip string-typed entries)
+  for (const auto & entry : node_map_.entries()) {
+    if (publishers_.count(entry.node_id_str) > 0) {
+      continue;  // already created (e.g. a previous call before a reconnect)
+    }
+    if (!entry_has_value_publisher(entry)) {
+      log_info("PLC bridge: skipping non-numeric " + entry.node_id_str + " (data_type=" + entry.data_type + ")");
+      continue;
+    }
+    publishers_[entry.node_id_str] =
+        node->create_publisher<std_msgs::msg::Float32>(entry.ros2_topic, rclcpp::SensorDataQoS());
+    log_info("PLC bridge: " + entry.node_id_str + " -> " + entry.ros2_topic + " (Float32)");
+  }
+}
+
+void OpcuaPlugin::run_auto_browse() {
+  OpcuaClientBrowseSource source(*client_);
+  AutoBrowser browser(source, node_map_.auto_browse_config());
+  // The address-space walk is a series of blocking OPC-UA round-trips - do it
+  // without the lock so it never stalls the REST read handlers.
+  AutoBrowseResult result = browser.browse();
+
+  size_t writable_points = 0;
+  for (const auto & e : result.entries) {
+    if (e.writable) {
+      ++writable_points;
+    }
+  }
+
+  size_t added = 0;
+  size_t entity_count = 0;
+  {
+    // Serialize the mutation (entries / indices / entity_defs rebuild) against
+    // the HTTP read handlers, which take the shared lock.
+    std::unique_lock<std::shared_mutex> lock(node_map_mutex_);
+    added = node_map_.merge_auto_browsed_entries(std::move(result.entries));
+    entity_count = node_map_.entity_defs().size();
+  }
+  // Publishers for any newly merged entries (idempotent via publishers_.count).
+  // Safe without the node_map_ lock: the poll thread is the sole writer and we
+  // are on it (or in single-threaded set_context startup).
+  create_value_publishers();
+  auto_browse_generation_ = client_->connection_generation();
+
+  log_info("auto_browse: walked " + std::to_string(result.nodes_visited) + " address-space nodes, added " +
+           std::to_string(added) + " data points (" + std::to_string(entity_count) + " entities total, " +
+           std::to_string(writable_points) + " server-writable)" +
+           (result.node_cap_hit ? " [node cap reached - tree may be incomplete]" : "") +
+           (result.depth_cap_hit ? " [depth cap reached on at least one branch]" : ""));
+}
+
+std::optional<ComponentIdentity> OpcuaPlugin::rederived_component_identity(const ComponentIdentityState & state,
+                                                                           const OpcuaClient::DeviceInfo & info,
+                                                                           const std::string & endpoint_url) {
+  const ComponentIdentity ci = derive_component_identity(info, endpoint_url);
+  if (ci.id.empty() || ci.id == state.current_id) {
+    return std::nullopt;
+  }
+  if (component_identity_has_nameplate(info)) {
+    // A name the device gave itself takes over from a stand-in. A second
+    // nameplate is a different device answering on the same endpoint: that is a
+    // decision about asset identity, so the served name keeps its place and the
+    // read does not move it.
+    return state.current_is_placeholder ? std::optional<ComponentIdentity>(ci) : std::nullopt;
+  }
+  // No nameplate: the derivation is the neutral opcua-<host> stand-in. It
+  // follows the endpoint from one stand-in to the next, which is the adoption
+  // case, and leaves a device-given name alone - read_device_info() answers
+  // empty or partial on the first read of a session whose address space is
+  // still coming up, and one such read would otherwise move the component URL,
+  // the <id>_alarms entity and every fault filed under them onto a stand-in.
+  return state.current_is_placeholder ? std::optional<ComponentIdentity>(ci) : std::nullopt;
+}
+
+OpcuaPlugin::IdentityReadOutcome
+OpcuaPlugin::identity_reads(int extra_reads, int reads_spent, int max_reads,
+                            const std::function<OpcuaClient::DeviceInfo()> & read_fn,
+                            const std::function<bool(std::chrono::milliseconds)> & pause_fn) {
+  IdentityReadOutcome outcome;
+  outcome.reads_spent = reads_spent;
+  for (int attempt = 0; attempt <= extra_reads; ++attempt) {
+    if (outcome.reads_spent >= max_reads) {
+      return outcome;
+    }
+    if (attempt > 0 && pause_fn && !pause_fn(kIdentityConnectRetryPause)) {
+      outcome.interrupted = true;
+      return outcome;
+    }
+    outcome.info = read_fn();
+    ++outcome.reads_spent;
+    outcome.read_made = true;
+    if (component_identity_has_nameplate(outcome.info)) {
+      return outcome;
+    }
+  }
+  return outcome;
+}
+
+void OpcuaPlugin::maybe_rederive_component_identity(int extra_reads) {
+  // An explicit node map owns the component name. Only the config-less path
+  // derives it from the device.
+  if (!node_map_path_.empty() || !client_ || !client_->is_connected()) {
+    return;
+  }
+  const uint64_t generation = client_->connection_generation();
+  if (generation == component_identity_generation_) {
+    return;  // identity already speaks for this session
+  }
+  if (generation != component_identity_read_generation_) {
+    component_identity_read_generation_ = generation;
+    component_identity_poll_reads_ = 0;
+  }
+
+  const std::string live_endpoint = client_->endpoint_url();
+  // The connect burst carries its own budget (one read plus kIdentityConnectRetries
+  // attempts); the poll path spends kMaxIdentityPollReads across the session.
+  const bool is_connect_burst = extra_reads > 0;
+  const int budget = is_connect_burst ? extra_reads + 1 : kMaxIdentityPollReads;
+  const int spent = is_connect_burst ? 0 : component_identity_poll_reads_;
+  const auto outcome = identity_reads(
+      extra_reads, spent, budget,
+      [this]() {
+        return client_->read_device_info();
+      },
+      [this](std::chrono::milliseconds pause) {
+        // A shutdown must not wait the burst out: the gateway calls shutdown()
+        // once its executor has returned, and the poll thread is what stop()
+        // joins.
+        if (shutdown_requested_.load()) {
+          return false;
+        }
+        std::this_thread::sleep_for(pause);
+        return !shutdown_requested_.load();
+      });
+  if (!is_connect_burst) {
+    component_identity_poll_reads_ = outcome.reads_spent;
+  }
+  if (outcome.interrupted) {
+    // A shutdown ended the burst. Renaming now would take the node-map lock and
+    // re-pin conditions on the way out, for an identity the process is not
+    // going to serve.
+    return;
+  }
+  if (!outcome.read_made) {
+    // The poll budget for this session is spent. Stamping the session stops the
+    // reads; the stand-in stands until the next one, when the question is asked
+    // again.
+    if (!is_connect_burst) {
+      component_identity_generation_ = generation;
+    }
+    return;
+  }
+  const bool has_nameplate = component_identity_has_nameplate(outcome.info);
+
+  ComponentIdentityState state;
+  state.current_id = node_map_.component_id();
+  state.current_is_placeholder =
+      std::find(placeholder_ids_.begin(), placeholder_ids_.end(), state.current_id) != placeholder_ids_.end();
+
+  const auto rederived = rederived_component_identity(state, outcome.info, live_endpoint);
+  if (has_nameplate) {
+    // The device named itself, so this session's identity is settled. A read
+    // with no nameplate leaves the stamp alone: it is the read that is
+    // provisional, not the session, and the address space of a PLC that has
+    // just come up fills in over the following seconds. Stamping it would pin
+    // the stand-in until the NEXT session.
+    component_identity_generation_ = generation;
+  }
+  if (!rederived) {
+    return;
+  }
+
+  const std::string previous_id = state.current_id;
+  const std::string previous_alarms_entity = previous_id + "_alarms";
+  if (!has_nameplate) {
+    // The adopted id is another stand-in, so it joins the list a fault reported
+    // under it is recognised by.
+    remember_placeholder_id(rederived->id);
+  }
+  {
+    // Serialize against the REST read paths, which hold references into
+    // node_map_ (entity_defs) while they answer.
+    std::unique_lock<std::shared_mutex> lock(node_map_mutex_);
+    // The auto_alarms fallback entity is derived from the component id, so a
+    // default-derived one has to follow the rename. An operator-chosen entity_id
+    // does not match the derived form and is left alone.
+    auto & auto_alarms = node_map_.mutable_auto_alarms();
+    if (auto_alarms.entity_id == previous_alarms_entity) {
+      auto_alarms.entity_id.clear();
+    }
+    node_map_.set_component_identity(rederived->id, rederived->name);
+    // Re-derives the fallback entity id and rebuilds entity_defs, so every
+    // reference to the component id moves together.
+    node_map_.finalize_auto_alarms_overlay();
+  }
+  if (poller_) {
+    // Two things in the poller carry the old entity id: the copy of the alarm
+    // config the event path routes new conditions with, and the conditions it
+    // already pinned. Both move here. A condition that changes state between
+    // the pin and this call is reported once under the old entity.
+    poller_->refresh_alarm_routing();
+    poller_->repin_auto_alarms_entity(previous_alarms_entity, node_map_.auto_alarms().entity_id);
+  }
+  log_info("Component identity re-derived from the adopted device at " + live_endpoint + ": id='" + rederived->id +
+           "', name='" + rederived->name + "' (was '" + previous_id + "')");
+  // The PLC_COMMS_LOST gate compares against the component id, so a standing
+  // row may belong to this bridge now.
+  owe_comms_lost_decision();
+}
+
+void OpcuaPlugin::remember_placeholder_id(const std::string & id) {
+  if (std::find(placeholder_ids_.begin(), placeholder_ids_.end(), id) != placeholder_ids_.end()) {
+    return;  // already one of this process's stand-ins; it keeps its place
+  }
+  if (placeholder_ids_.size() >= kMaxPlaceholderIds) {
+    return;  // the first kMaxPlaceholderIds distinct stand-ins are what is kept
+  }
+  placeholder_ids_.push_back(id);
+}
+
+void OpcuaPlugin::maybe_rebrowse_on_reconnect() {
+  if (!node_map_.auto_browse_config().enabled || !client_ || !client_->is_connected()) {
+    return;
+  }
+  const uint64_t generation = client_->connection_generation();
+  if (generation == auto_browse_generation_) {
+    return;  // already walked this session
+  }
+  run_auto_browse();
+}
+
+void OpcuaPlugin::publish_values(const PollSnapshot & snap) {
+  if (shutdown_requested_.load()) {
+    return;
+  }
+  // Poll-thread hook: drain any fault reports buffered before fault_manager was
+  // discovered, so a late sink still receives them.
+  flush_pending_reports();
+  // Poll-thread hook: one step of the owed link-state decision about
+  // PLC_COMMS_LOST. Here, because the gate compares against component ids this
+  // thread is the only writer of.
+  drive_comms_lost_decision();
+  // Poll-thread retry for an identity that is not settled yet. The connect hook
+  // is where the rename normally happens, ahead of the subscribe; this call
+  // covers a device-info read that came back with no nameplate because the PLC's
+  // address space was still filling in. It is a no-op from the moment the device
+  // names itself, and from the moment kMaxIdentityPollReads is spent.
+  maybe_rederive_component_identity(/*extra_reads=*/0);
+  // Poll-thread hook: (re)run auto_browse after a fresh session so a PLC that
+  // came up (or restarted) after the initial connect still gets walked.
+  maybe_rebrowse_on_reconnect();
+  for (const auto & [node_id, value] : snap.values) {
+    auto pub_it = publishers_.find(node_id);
+    if (pub_it == publishers_.end()) {
+      continue;
+    }
+
+    std_msgs::msg::Float32 msg;
+    bool is_numeric = std::visit(
+        [&msg](auto && v) -> bool {
+          using T = std::decay_t<decltype(v)>;
+          if constexpr (std::is_arithmetic_v<T>) {
+            msg.data = static_cast<float>(v);
+            return true;
+          }
+          return false;
+        },
+        value);
+
+    if (!is_numeric) {
+      if (warned_non_numeric_.insert(node_id).second) {
+        log_warn("Skipping non-numeric value for ROS 2 bridging: " + node_id);
+      }
+      continue;
+    }
+
+    if (!std::isfinite(msg.data)) {
+      continue;
+    }
+
+    pub_it->second->publish(msg);
+  }
+}
+
+void OpcuaPlugin::log_security_profile() const {
+  auto policy_name = [](SecurityPolicy p) -> std::string {
+    switch (p) {
+      case SecurityPolicy::None:
+        return "None";
+      case SecurityPolicy::Basic256Sha256:
+        return "Basic256Sha256";
+      case SecurityPolicy::Aes128Sha256RsaOaep:
+        return "Aes128Sha256RsaOaep";
+      case SecurityPolicy::Aes256Sha256RsaPss:
+        return "Aes256Sha256RsaPss";
+    }
+    return "None";
+  };
+  auto mode_name = [](SecurityMode m) -> std::string {
+    switch (m) {
+      case SecurityMode::None:
+        return "None";
+      case SecurityMode::Sign:
+        return "Sign";
+      case SecurityMode::SignAndEncrypt:
+        return "SignAndEncrypt";
+    }
+    return "None";
+  };
+  auto auth_name = [](UserAuthMode a) -> std::string {
+    switch (a) {
+      case UserAuthMode::Anonymous:
+        return "Anonymous";
+      case UserAuthMode::UsernamePassword:
+        return "Username/Password";
+      case UserAuthMode::X509:
+        return "X.509";
+    }
+    return "Anonymous";
+  };
+
+  const std::string profile = "OPC-UA security: SecurityPolicy=" + policy_name(client_config_.security_policy) +
+                              ", MessageSecurityMode=" + mode_name(client_config_.security_mode) +
+                              ", user=" + auth_name(client_config_.user_auth_mode);
+
+  const bool secure_channel = OpcuaClient::requires_secure_channel(client_config_);
+
+  if (OpcuaClient::credentials_sent_in_clear(client_config_)) {
+    // Username/password or X.509 credentials sent without a Sign/SignAndEncrypt
+    // channel travel in the clear and can be intercepted on the wire.
+    log_warn(profile +
+             ". WARNING: user credentials cross an unencrypted OPC-UA channel (MessageSecurityMode=None) - "
+             "they can be intercepted. Use Sign or SignAndEncrypt on an untrusted network.");
+  } else if (!secure_channel) {
+    log_warn(profile + ". Unsecured - not suitable for untrusted networks.");
+  } else if (!client_config_.reject_untrusted) {
+    log_warn(profile + ". WARNING: reject_untrusted=false (accepts any server certificate).");
+  } else {
+    log_info(profile);
+  }
+}
+
+int OpcuaPlugin::effective_rescan_interval_s(const OpcuaDiscoveryConfig & config, bool endpoint_configured) {
+  if (!config.enabled || endpoint_configured) {
+    return 0;
+  }
+  // Unset means "discovery is on but no cadence was stated" - the config-less
+  // deployment, which takes the built-in default. An explicit 0 is an operator
+  // saying "do not re-scan", and is honoured as written.
+  return config.interval_s.value_or(kDefaultRescanIntervalS);
+}
+
+std::chrono::milliseconds OpcuaPlugin::effective_max_reconnect_wait(std::chrono::milliseconds base,
+                                                                    std::chrono::milliseconds default_ceiling,
+                                                                    int rescan_interval_s) {
+  if (rescan_interval_s <= 0) {
+    return default_ceiling;  // no rescan: the plain backoff ceiling applies
+  }
+  const auto cadence = std::chrono::milliseconds(static_cast<int64_t>(rescan_interval_s) * 1000);
+  return std::max(base, std::min(default_ceiling, cadence));
+}
+
+std::optional<std::string> OpcuaPlugin::rescan_step(int interval_s,
+                                                    const std::function<std::chrono::steady_clock::time_point()> & now,
+                                                    std::chrono::steady_clock::time_point * last_scan_end,
+                                                    const std::function<std::optional<std::string>()> & sweep) {
+  if (interval_s <= 0 || !now || last_scan_end == nullptr || !sweep) {
+    return std::nullopt;
+  }
+  if (now() - *last_scan_end < std::chrono::seconds(interval_s)) {
+    return std::nullopt;
+  }
+  // Stamp the END of the sweep: a legal /16 runs for minutes, and stamping its
+  // start would make the next one due the moment this one returned - the poll
+  // thread would sweep back to back and only attempt a reconnect once a sweep.
+  // A sweep that threw still consumed that time, so the stamp is owed either
+  // way, or the next poll iteration would start another one immediately. The
+  // rethrow is what preserves the caller's choice; the poll thread has no try of
+  // its own, so the caller that runs on it is rescan_guarded.
+  try {
+    const auto result = sweep();
+    *last_scan_end = now();
+    return result;
+  } catch (...) {
+    *last_scan_end = now();
+    throw;
+  }
+}
+
+std::optional<std::string>
+OpcuaPlugin::rescan_guarded(int interval_s, const std::function<std::chrono::steady_clock::time_point()> & now,
+                            std::chrono::steady_clock::time_point * last_scan_end,
+                            const std::function<std::optional<std::string>()> & sweep) {
+  // A handler reached by bad_alloc allocates nothing on our side: the log goes
+  // through a fixed format string, and the catch-all arm through a literal.
+  try {
+    return rescan_step(interval_s, now, last_scan_end, sweep);
+  } catch (const std::exception & e) {
+    RCLCPP_WARN(opcua_plugin_logger(), "OPC-UA discovery: rescan sweep failed (%s); the endpoint stands", e.what());
+  } catch (...) {
+    RCLCPP_WARN(opcua_plugin_logger(),
+                "OPC-UA discovery: rescan sweep failed with a non-standard exception; the endpoint stands");
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> OpcuaPlugin::discover_endpoint(const OpcuaDiscoveryConfig & config, bool endpoint_configured,
+                                                          const PortScanFn & scan, const IdentifyFn & identify,
+                                                          const DiscoveryReporter & reporter,
+                                                          const std::function<bool()> & cancelled,
+                                                          std::string * application_uri,
+                                                          const std::string & bound_application_uri) {
+  if (application_uri != nullptr) {
+    application_uri->clear();
+  }
+  if (!config.enabled) {
+    return std::nullopt;
+  }
+  // Never override an explicitly configured endpoint: discovery must not open a
+  // second session on a PLC the operator already targets (and already polls).
+  if (endpoint_configured) {
+    return std::nullopt;
+  }
+
+  // The pass reports through a buffer, because whether the report is
+  // operator-visible or a DEBUG trace depends on the outcome, and the outcome is
+  // only known once the sweep is done. A rescan runs for the life of a
+  // disconnected process, so an unchanged outcome must not repeat its whole
+  // report (a secured-only site would log the same WARN every interval_s).
+  struct ReportLine {
+    bool warning;
+    std::string text;
+  };
+  std::vector<ReportLine> report;
+  std::string outcome;
+  const auto info_line = [&report, &outcome](const std::string & text) {
+    report.push_back({false, text});
+    outcome += text;
+    outcome += '\n';
+  };
+  const auto warn_line = [&report, &outcome](const std::string & text) {
+    report.push_back({true, text});
+    outcome += text;
+    outcome += '\n';
+  };
+  const auto emit = [&report, &outcome, &reporter]() {
+    const bool repeat = reporter.previous_outcome != nullptr && *reporter.previous_outcome == outcome;
+    if (reporter.previous_outcome != nullptr) {
+      *reporter.previous_outcome = outcome;
+    }
+    for (const auto & line : report) {
+      const auto & sink = repeat ? reporter.debug : (line.warning ? reporter.warn : reporter.info);
+      if (sink) {
+        sink(line.text);
+      }
+    }
+  };
+
+  NetworkDiscovery discovery(config, scan, identify);
+
+  const auto subnets = discovery.resolve_subnets();
+  if (subnets.empty()) {
+    warn_line("OPC-UA discovery: no subnet configured and could not derive a local /24, nothing to scan.");
+    emit();
+    return std::nullopt;
+  }
+  std::string subnet_list;
+  for (const auto & s : subnets) {
+    subnet_list += (subnet_list.empty() ? "" : ", ") + s;
+  }
+  // The announcement goes out NOW, ahead of the buffered report: a sweep of a
+  // wide subnet runs for minutes, and an operator watching start-up has to see
+  // that the gateway is scanning. It says what the pass is about to do, which is
+  // known before the outcome is, so it stays out of the outcome digest and is
+  // levelled on its own - the first pass announces at INFO, a rescan at DEBUG so
+  // the recurring sweep does not repeat it every interval.
+  const bool first_pass = reporter.previous_outcome == nullptr || reporter.previous_outcome->empty();
+  const auto & announce_sink = first_pass ? reporter.info : reporter.debug;
+  if (announce_sink) {
+    announce_sink("OPC-UA discovery: read-only active scan of [" + subnet_list + "] on " +
+                  std::to_string(config.ports.size()) + " port(s)...");
+  }
+
+  const std::vector<DiscoveredEndpoint> found = discovery.run(cancelled);
+
+  // Summarize what was found and what was skipped (leads, LDS, secured-only).
+  size_t data_servers = 0;
+  size_t discovery_servers = 0;
+  size_t secured_only = 0;
+  size_t leads = 0;
+  for (const auto & ep : found) {
+    if (ep.protocol != "opcua") {
+      ++leads;
+      continue;
+    }
+    if (!ep.identify_error.empty()) {
+      ++leads;
+      continue;
+    }
+    if (!ep.is_data_server()) {
+      ++discovery_servers;
+      continue;
+    }
+    ++data_servers;
+    if (!ep.anonymous_none_available) {
+      ++secured_only;
+    }
+    info_line("OPC-UA discovery: found data server " + ep.endpoint_url + " (uri='" + ep.application_uri +
+              "', product='" + ep.product_uri + "', None/Anonymous=" + (ep.anonymous_none_available ? "yes" : "no") +
+              ")");
+  }
+  info_line("OPC-UA discovery summary: " + std::to_string(data_servers) + " data server(s), " +
+            std::to_string(discovery_servers) + " discovery server(s)/LDS, " + std::to_string(secured_only) +
+            " secured-only (need credentials), " + std::to_string(leads) + " non-OPC-UA/unidentified lead(s).");
+
+  const DiscoveredEndpoint * chosen =
+      NetworkDiscovery::select_auto_endpoint(found, config.anonymous_none_only, bound_application_uri);
+  if (chosen == nullptr) {
+    if (!bound_application_uri.empty()) {
+      warn_line("OPC-UA discovery: the server this bridge is bound to (uri='" + bound_application_uri +
+                "') is not on the scanned network, leaving the endpoint unchanged.");
+    } else {
+      warn_line(
+          "OPC-UA discovery: no auto-connectable None/Anonymous data server found, leaving the endpoint unchanged. "
+          "Secured-only servers require operator credentials.");
+    }
+    emit();
+    return std::nullopt;
+  }
+
+  info_line("OPC-UA discovery: selected endpoint " + chosen->endpoint_url + " (uri='" + chosen->application_uri + "')");
+  if (chosen->application_uri.empty()) {
+    warn_line("OPC-UA discovery: " + chosen->endpoint_url +
+              " reports no ApplicationUri. This bridge cannot bind to it, so after a drop a re-scan accepts whichever "
+              "server answers.");
+  }
+  emit();
+  if (application_uri != nullptr) {
+    *application_uri = chosen->application_uri;
+  }
+  return chosen->endpoint_url;
+}
+
+void OpcuaPlugin::run_startup_discovery() {
+  if (!discovery_config_.enabled) {
+    return;
+  }
+  if (endpoint_configured_) {
+    log_info("OPC-UA discovery enabled but endpoint_url is explicitly configured (" + client_config_.endpoint_url +
+             "). Skipping auto-discovery to avoid a second session.");
+    return;
+  }
+
+  // The startup scan is the first pass, so its outcome digest is still empty and
+  // the report comes out in full. It is cancellable too, but not by shutdown():
+  // this runs inside set_context(), i.e. during node construction and before the
+  // executor spins, so nothing can call shutdown() until this returns. What ends
+  // it is a SIGINT / SIGTERM - see discovery_cancelled().
+  std::string selected_uri;
+  const auto chosen = discover_endpoint(
+      discovery_config_, endpoint_configured_, discovery_scan_fn_, discovery_identify_fn_,
+      discovery_reporter(&last_discovery_outcome_),
+      [this]() {
+        return discovery_cancelled();
+      },
+      // The binding steers this sweep the way it steers a rescan: a process
+      // that was bound when it stopped looks for that server at whatever
+      // address it now answers on, and selects nothing when it is absent.
+      &selected_uri, bound_application_uri_);
+  static_cast<void>(selected_uri);
+  // Stamp when the sweep FINISHED: the rescan cadence is measured from the end
+  // of the previous sweep, so a long sweep is not immediately followed by
+  // another one.
+  last_discovery_scan_end_ = std::chrono::steady_clock::now();
+
+  if (!chosen) {
+    // The startup scan can legitimately find nothing - a gateway that boots
+    // alongside its PLC routinely scans while the PLC is still coming up. With a
+    // cadence the endpoint stays at its default and the reconnect arm rescans,
+    // so the PLC is still adopted once it answers. With re-scanning switched off
+    // (an explicit interval_s: 0) this scan IS the last one, and the operator
+    // has to be told which of the two they configured.
+    const int startup_interval_s = effective_rescan_interval_s(discovery_config_, endpoint_configured_);
+    if (startup_interval_s > 0) {
+      log_info("OPC-UA discovery: startup scan selected no endpoint. The reconnect loop rescans every " +
+               std::to_string(startup_interval_s) + "s while down.");
+    } else {
+      log_warn(
+          "OPC-UA discovery: startup scan selected no endpoint and re-scanning is off (interval_s: 0). The endpoint "
+          "stays at " +
+          client_config_.endpoint_url + " until the plugin is restarted.");
+    }
+    return;
+  }
+
+  client_config_.endpoint_url = *chosen;
+  log_info("OPC-UA discovery: auto-selected endpoint " + *chosen + " - handing to the connect + introspect path.");
+}
+
+bool OpcuaPlugin::discovery_cancelled() const {
+  // rclcpp::ok() only reads a context's atomic shutdown flag, so it is safe to
+  // call from the set_context thread and the poll thread alike. Which context is
+  // the point: the gateway node's own, not the process-wide default, because a
+  // host that built its node on a private context leaves the default one
+  // uninitialised and every sweep would cancel before it started. The rule
+  // itself, and why both signals are needed, lives in discovery_cancelled_for.
+  return discovery_cancelled_for_context(shutdown_requested_.load(), context_) || shutdown_signal_pending();
+}
+
+OpcuaPlugin::DiscoveryReporter OpcuaPlugin::discovery_reporter(std::string * previous_outcome) const {
+  DiscoveryReporter reporter;
+  reporter.info = [this](const std::string & m) {
+    log_info(m);
+  };
+  reporter.warn = [this](const std::string & m) {
+    log_warn(m);
+  };
+  reporter.debug = [](const std::string & m) {
+    RCLCPP_DEBUG(opcua_plugin_logger(), "%s", m.c_str());
+  };
+  reporter.previous_outcome = previous_outcome;
+  return reporter;
+}
+
+std::string OpcuaPlugin::read_persisted_binding(const std::string & path) {
+  if (path.empty()) {
+    return {};
+  }
+  std::ifstream in(path);
+  if (!in) {
+    return {};
+  }
+  std::string line;
+  if (!std::getline(in, line)) {
+    return {};
+  }
+  // A UTF-8 BOM is what an editor on Windows leaves in front of the URI. It is
+  // invisible in a log, so a binding carrying one shows the refusal as two
+  // identical URIs.
+  static const std::string kUtf8Bom = "\xEF\xBB\xBF";
+  if (line.compare(0, kUtf8Bom.size(), kUtf8Bom) == 0) {
+    line.erase(0, kUtf8Bom.size());
+  }
+  const auto end = line.find_last_not_of(" \t\r\n");
+  if (end == std::string::npos) {
+    return {};
+  }
+  line.erase(end + 1);
+  const auto begin = line.find_first_not_of(" \t");
+  if (begin == std::string::npos) {
+    return {};
+  }
+  line = line.substr(begin);
+  // An ApplicationUri is printable. A NUL or another control character means
+  // the file holds something else - a binary blob, a truncated write - and a
+  // binding read out of it would refuse every server for a reason nobody can
+  // see in a log.
+  const auto control = std::find_if(line.begin(), line.end(), [](char c) {
+    return static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) == 0x7F;
+  });
+  if (control != line.end()) {
+    RCLCPP_WARN(opcua_plugin_logger(),
+                "%s holds a control character where an ApplicationUri belongs; reading it as no binding", path.c_str());
+    return {};
+  }
+  return line;
+}
+
+std::string OpcuaPlugin::write_persisted_binding(const std::string & path, const std::string & application_uri) {
+  if (path.empty() || application_uri.empty()) {
+    return {};
+  }
+  if (application_uri.find_first_of("\r\n") != std::string::npos) {
+    return "the ApplicationUri contains a line break and would read back truncated";
+  }
+  std::error_code ec;
+  // Follow a symlink to what it points at, so the rename below replaces the
+  // target an operator pointed the path at. The link is read first, because a
+  // link whose target does not exist yet is the state before the first bind
+  // and weakly_canonical leaves such a link unresolved; the chain is bounded so
+  // a loop ends in the fallback. weakly_canonical then resolves the components
+  // that exist and leaves the rest.
+  constexpr int kMaxSymlinkHops = 32;
+  std::filesystem::path target(path);
+  for (int hops = 0; hops < kMaxSymlinkHops && std::filesystem::is_symlink(target, ec) && !ec; ++hops) {
+    const std::filesystem::path link_target = std::filesystem::read_symlink(target, ec);
+    if (ec) {
+      break;
+    }
+    target = link_target.is_absolute() ? link_target : target.parent_path() / link_target;
+  }
+  ec.clear();
+  const std::filesystem::path resolved = std::filesystem::weakly_canonical(target, ec);
+  if (!ec && !resolved.empty()) {
+    target = resolved;
+  }
+  ec.clear();
+  const std::filesystem::path parent = target.parent_path();
+  if (!parent.empty()) {
+    std::filesystem::create_directories(parent, ec);
+    std::error_code dir_ec;
+    if (ec && !std::filesystem::is_directory(parent, dir_ec)) {
+      return "cannot create " + parent.string() + ": " + ec.message();
+    }
+    ec.clear();
+  }
+  // Same directory, so the rename below stays within one filesystem.
+  const std::filesystem::path tmp = target.string() + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::trunc);
+    if (!out) {
+      return "cannot open " + tmp.string() + " for writing";
+    }
+    out << application_uri << "\n";
+    out.flush();
+    if (!out) {
+      return "write to " + tmp.string() + " failed";
+    }
+  }
+  // The fsync makes the temporary's bytes durable before the rename publishes
+  // its name, so a power loss after the rename finds the URI on disk. Without
+  // it the name can outlive the bytes, leaving an empty file that reads as
+  // "never bound" and lets the next process adopt whichever server answers.
+  std::string sync_failure = fsync_path(tmp.string(), /*is_directory=*/false);
+  if (!sync_failure.empty()) {
+    std::error_code ignored;
+    std::filesystem::remove(tmp, ignored);
+    return sync_failure;
+  }
+  std::filesystem::rename(tmp, target, ec);
+  if (ec) {
+    std::error_code ignored;
+    std::filesystem::remove(tmp, ignored);
+    return "rename to " + target.string() + " failed: " + ec.message();
+  }
+  // The directory entry the rename created, so the file is findable after a
+  // power loss. Best effort: a filesystem that refuses this has still written
+  // the file.
+  if (!parent.empty()) {
+    static_cast<void>(fsync_path(parent.string(), /*is_directory=*/true));
+  }
+  return {};
+}
+
+bool OpcuaPlugin::note_refused_application_uri(const std::string & uri) {
+  if (std::find(refused_application_uris_.begin(), refused_application_uris_.end(), uri) !=
+      refused_application_uris_.end()) {
+    return false;
+  }
+  refused_application_uris_.push_back(uri);
+  if (refused_application_uris_.size() > kMaxRefusedApplicationUris) {
+    refused_application_uris_.erase(refused_application_uris_.begin());
+  }
+  return true;
+}
+
+bool OpcuaPlugin::bind_or_drop_session() {
+  if (!client_ || !client_->is_connected()) {
+    return false;
+  }
+  const std::string live_uri = client_->read_server_application_uri();
+
+  if (bound_application_uri_.empty()) {
+    // Nothing bound yet: this session names the server every later sweep looks
+    // for, and the next process reads it back from the binding file. A server
+    // that publishes no ApplicationUri leaves the binding empty and stays
+    // unbindable, which the discovery report already says, and nothing is
+    // persisted for it.
+    bound_application_uri_ = live_uri;
+    refused_application_uris_.clear();
+    if (!live_uri.empty() && !endpoint_configured_) {
+      const std::string failure = write_persisted_binding(discovery_config_.binding_file, live_uri);
+      if (failure.empty()) {
+        if (!discovery_config_.binding_file.empty()) {
+          log_info("OPC-UA: bound to uri='" + live_uri + "', kept in " + discovery_config_.binding_file);
+        }
+      } else {
+        log_warn("OPC-UA: bound to uri='" + live_uri + "' but could not keep it in " + discovery_config_.binding_file +
+                 " (" + failure +
+                 "). This session is unaffected; the next process starts unbound and adopts whichever server "
+                 "answers.");
+      }
+    }
+    return true;
+  }
+
+  if (live_uri == bound_application_uri_) {
+    // Bound server reached. A later outage reports a foreign server again.
+    refused_application_uris_.clear();
+    return true;
+  }
+
+  binding_mismatch_disconnects_.fetch_add(1);
+  if (note_refused_application_uri(live_uri)) {
+    // The gesture that rebinds: on the discovery path the file holds the
+    // binding, so the file is what an operator removes; with endpoint_url
+    // pinned, or with persistence off, nothing outlives the process and a
+    // restart against the new server is the whole gesture.
+    const std::string gesture = !endpoint_configured_ && !discovery_config_.binding_file.empty()
+                                    ? "remove " + discovery_config_.binding_file + " and restart"
+                                    : "restart the plugin against the new one";
+    const std::string refusal = "OPC-UA: " + client_->endpoint_url() + " answers as uri='" + live_uri +
+                                "', which is not the server this bridge is bound to (uri='" + bound_application_uri_ +
+                                "'). Dropping the session and keeping the standing outage. Replacing a PLC is a "
+                                "recommissioning: " +
+                                gesture + ".";
+    log_warn(refusal);
+    std::lock_guard<std::mutex> lock(binding_refusal_mutex_);
+    last_binding_refusal_ = refusal;
+  }
+  client_->disconnect();
+  return false;
+}
+
+std::optional<std::string> OpcuaPlugin::rescan_endpoint_for_reconnect() {
+  // A sweep is a bounded but multi-second blocking call on the poll thread, and
+  // stop() has to wait for whatever it is in the middle of. Do not start one the
+  // shutdown is going to throw away.
+  if (discovery_cancelled()) {
+    return std::nullopt;
+  }
+  const int interval_s = effective_rescan_interval_s(discovery_config_, endpoint_configured_);
+
+  std::string candidate_uri;
+  auto chosen = rescan_guarded(
+      interval_s,
+      []() {
+        return std::chrono::steady_clock::now();
+      },
+      &last_discovery_scan_end_,
+      [this, &candidate_uri]() {
+        return discover_endpoint(
+            discovery_config_, endpoint_configured_, discovery_scan_fn_, discovery_identify_fn_,
+            discovery_reporter(&last_discovery_outcome_),
+            [this]() {
+              return discovery_cancelled();
+            },
+            &candidate_uri, bound_application_uri_);
+      });
+  // The live client config, not client_config_: this runs on the poll thread
+  // and client_config_ is read by the refresh thread in introspect(). The
+  // client owns the endpoint once connect() has been called with it, and its
+  // accessors are mutex-guarded.
+  const std::string current = client_ ? client_->endpoint_url() : client_config_.endpoint_url;
+  if (!chosen) {
+    // Selection had the binding and found nothing carrying it, so the server
+    // this bridge polls is not answering anywhere on the scanned network. The
+    // endpoint stands and the outage with it; the connect the reconnect arm
+    // keeps attempting is the one that recovers when the server comes back.
+    if (!bound_application_uri_.empty()) {
+      rescan_refusals_.fetch_add(1);
+    }
+    return std::nullopt;
+  }
+  if (*chosen == current) {
+    // The address did not move. A DIFFERENT server answering at this address is
+    // caught by the connect that follows (bind_or_drop_session), which is where
+    // the session's own identity is read.
+    return std::nullopt;
+  }
+
+  log_info("OPC-UA discovery: rescan while disconnected adopted endpoint " + *chosen + " (was " + current + ")");
+  return chosen;
+}
+
+nlohmann::json OpcuaPlugin::build_data_response(const std::string & entity_id) const {
+  auto entries = node_map_.entries_for_entity(entity_id);
+  auto snap = poller_->snapshot();
+
+  nlohmann::json items = nlohmann::json::array();
+
+  for (const auto * entry : entries) {
+    nlohmann::json item;
+    item["name"] = entry->data_name;
+    item["display_name"] = entry->display_name;
+    item["node_id"] = entry->node_id_str;
+
+    auto it = snap.values.find(entry->node_id_str);
+    if (it != snap.values.end()) {
+      std::visit(
+          [&item](auto && v) {
+            item["value"] = v;
+          },
+          it->second);
+    } else {
+      item["value"] = nullptr;
+    }
+
+    if (!entry->unit.empty()) {
+      item["unit"] = entry->unit;
+    }
+    item["data_type"] = entry->data_type;
+    item["writable"] = entry->writable;
+
+    items.push_back(std::move(item));
+  }
+
+  nlohmann::json response;
+  response["entity_id"] = entity_id;
+  response["items"] = items;
+  response["connected"] = snap.connected;
+
+  auto ts = std::chrono::system_clock::to_time_t(snap.timestamp);
+  response["timestamp"] = ts;
+
+  return response;
+}
+
+// -- DataProvider interface --
+
+tl::expected<dto::DataListResult, DataProviderErrorInfo> OpcuaPlugin::list_data(const std::string & entity_id) {
+  if (!ctx_ || !poller_) {
+    return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::Internal, "plugin not initialized", 503});
+  }
+
+  // Held while the returned pointers into node_map_ are dereferenced below.
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  auto entries = node_map_.entries_for_entity(entity_id);
+  if (entries.empty()) {
+    return tl::make_unexpected(
+        DataProviderErrorInfo{DataProviderError::EntityNotFound, "No PLC data for entity: " + entity_id, 404});
+  }
+
+  nlohmann::json items = nlohmann::json::array();
+  auto snap = poller_->snapshot();
+
+  for (const auto * entry : entries) {
+    nlohmann::json item;
+    item["id"] = entry->data_name;
+    item["name"] = entry->display_name;
+    item["category"] = "currentData";
+
+    auto it = snap.values.find(entry->node_id_str);
+    if (it != snap.values.end()) {
+      std::visit(
+          [&item](auto && v) {
+            item["value"] = v;
+          },
+          it->second);
+    } else {
+      item["value"] = nullptr;
+    }
+
+    if (!entry->unit.empty()) {
+      item["unit"] = entry->unit;
+    }
+    item["data_type"] = entry->data_type;
+    item["writable"] = entry->writable;
+    items.push_back(std::move(item));
+  }
+
+  return dto::DataListResult{nlohmann::json{{"items", std::move(items)}}};
+}
+
+tl::expected<dto::DataValue, DataProviderErrorInfo> OpcuaPlugin::read_data(const std::string & entity_id,
+                                                                           const std::string & resource_name) {
+  if (!ctx_ || !poller_) {
+    return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::Internal, "plugin not initialized", 503});
+  }
+
+  // Held while ``entry`` (a pointer into node_map_) is dereferenced below.
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  auto * entry = node_map_.find_by_data_name(entity_id, resource_name);
+  if (!entry) {
+    return tl::make_unexpected(DataProviderErrorInfo{
+        DataProviderError::ResourceNotFound, "Data point not found: " + resource_name + " in " + entity_id, 404});
+  }
+
+  auto snap = poller_->snapshot();
+  auto it = snap.values.find(entry->node_id_str);
+
+  nlohmann::json result;
+  result["id"] = entry->data_name;
+  result["name"] = entry->display_name;
+  result["node_id"] = entry->node_id_str;
+
+  if (it != snap.values.end()) {
+    std::visit(
+        [&result](auto && v) {
+          result["value"] = v;
+        },
+        it->second);
+  } else {
+    result["value"] = nullptr;
+  }
+
+  if (!entry->unit.empty()) {
+    result["unit"] = entry->unit;
+  }
+  result["data_type"] = entry->data_type;
+  result["writable"] = entry->writable;
+
+  auto ts = std::chrono::system_clock::to_time_t(snap.timestamp);
+  result["timestamp"] = ts;
+
+  return dto::DataValue{std::move(result)};
+}
+
+tl::expected<dto::DataWriteResult, DataProviderErrorInfo> OpcuaPlugin::write_data(const std::string & entity_id,
+                                                                                  const std::string & resource_name,
+                                                                                  const nlohmann::json & value) {
+#if MEDKIT_OPCUA_READ_ONLY
+  // First statement in the function: the refusal precedes every lookup, so no
+  // request reaches the OPC-UA client. The gateway renders provider errors as
+  // the x-medkit-plugin-error vendor code with this message verbatim.
+  (void)entity_id;
+  (void)resource_name;
+  (void)value;
+  return tl::make_unexpected(
+      DataProviderErrorInfo{DataProviderError::ReadOnly, kReadOnlyBuildRefusal, kReadOnlyBuildStatus});
+#else
+  if (!ctx_ || !poller_) {
+    return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::Internal, "plugin not initialized", 503});
+  }
+
+  // Held for as long as ``entry`` (a pointer into node_map_) is dereferenced,
+  // including across the OPC-UA write below.
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  auto * entry = node_map_.find_by_data_name(entity_id, resource_name);
+  if (!entry) {
+    return tl::make_unexpected(DataProviderErrorInfo{
+        DataProviderError::ResourceNotFound, "Data point not found: " + resource_name + " in " + entity_id, 404});
+  }
+  if (!entry->writable) {
+    return tl::make_unexpected(
+        DataProviderErrorInfo{DataProviderError::ReadOnly, "Data point is read-only: " + resource_name, 400});
+  }
+
+  if (!value.contains("value")) {
+    return tl::make_unexpected(
+        DataProviderErrorInfo{DataProviderError::InvalidValue, "Missing 'value' field in write body", 400});
+  }
+
+  auto parsed = parse_coerce_validate(value["value"], *entry);
+  if (!parsed) {
+    return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::InvalidValue, parsed.error(), 400});
+  }
+
+  auto write_result = client_->write_value(entry->node_id, *parsed, entry->data_type);
+  if (!write_result) {
+    auto wcode = write_result.error().code;
+    if (wcode == OpcuaClient::WriteError::TypeMismatch) {
+      return tl::make_unexpected(
+          DataProviderErrorInfo{DataProviderError::InvalidValue, write_result.error().message, 400});
+    }
+    if (wcode == OpcuaClient::WriteError::AccessDenied) {
+      return tl::make_unexpected(DataProviderErrorInfo{DataProviderError::ReadOnly, write_result.error().message, 403});
+    }
+    return tl::make_unexpected(
+        DataProviderErrorInfo{DataProviderError::TransportError, write_result.error().message, 502});
+  }
+
+  nlohmann::json result;
+  result["id"] = resource_name;
+  result["status"] = "ok";
+  std::visit(
+      [&result](auto && v) {
+        result["value_written"] = v;
+      },
+      *parsed);
+  return dto::DataWriteResult{std::move(result)};
+#endif  // MEDKIT_OPCUA_READ_ONLY
+}
+
+bool OpcuaPlugin::has_data(const std::string & entity_id) const {
+  // Same check list_data uses to 404 - keeps advertised capabilities honest
+  // for entities with no NodeMap entries (the Component, the auto_alarms
+  // fallback App).
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  return !node_map_.entries_for_entity(entity_id).empty();
+}
+
+// -- OperationProvider interface --
+
+tl::expected<dto::Collection<dto::OperationItem>, OperationProviderErrorInfo>
+OpcuaPlugin::list_operations(const std::string & entity_id) {
+  dto::Collection<dto::OperationItem> collection;
+
+  // Held while iterating node_map_ defs / entries (auto_browse may rebuild them).
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  for (const auto & def : node_map_.entity_defs()) {
+    if (def.id != entity_id) {
+      continue;
+    }
+    for (const auto & writable_name : def.writable_names) {
+      auto * entry = node_map_.find_by_data_name(entity_id, writable_name);
+      dto::OperationItem item;
+      item.id = "set_" + writable_name;
+      item.name = entry ? ("Set " + entry->display_name) : ("Set " + writable_name);
+      item.proximity_proof_required = false;
+      item.asynchronous_execution = false;
+      collection.items.push_back(std::move(item));
+    }
+
+#if !MEDKIT_OPCUA_READ_ONLY
+    // Issue #386: emit acknowledge_fault / confirm_fault when the entity
+    // has at least one native AlarmConditionType event subscription. The
+    // fault_code parameter (passed in operation execution body) discriminates
+    // which condition the operator is acting on.
+    //
+    // Not offered by a read-only build. Acknowledging or confirming a condition
+    // changes alarm state on the controller, so it is a write like any other,
+    // and the tree must not advertise what the binary cannot do.
+    bool has_event_alarms = std::any_of(node_map_.event_alarms().begin(), node_map_.event_alarms().end(),
+                                        [&entity_id](const AlarmEventConfig & cfg) {
+                                          return cfg.entity_id == entity_id;
+                                        });
+    if (has_event_alarms) {
+      dto::OperationItem ack;
+      ack.id = "acknowledge_fault";
+      ack.name = "Acknowledge an alarm";
+      ack.proximity_proof_required = false;
+      ack.asynchronous_execution = false;
+      collection.items.push_back(std::move(ack));
+
+      dto::OperationItem confirm;
+      confirm.id = "confirm_fault";
+      confirm.name = "Confirm an alarm condition is addressed";
+      confirm.proximity_proof_required = false;
+      confirm.asynchronous_execution = false;
+      collection.items.push_back(std::move(confirm));
+    }
+#endif
+
+    return collection;
+  }
+
+  return tl::make_unexpected(
+      OperationProviderErrorInfo{OperationProviderError::EntityNotFound, "Entity not found: " + entity_id, 404});
+}
+
+tl::expected<dto::OperationExecutionResult, OperationProviderErrorInfo>
+OpcuaPlugin::execute_operation(const std::string & entity_id, const std::string & operation_name,
+                               const nlohmann::json & parameters) {
+  if (!ctx_ || !poller_) {
+    return tl::make_unexpected(
+        OperationProviderErrorInfo{OperationProviderError::Internal, "plugin not initialized", 503});
+  }
+
+#if MEDKIT_OPCUA_READ_ONLY
+  // Neither branch below reads these: every operation is refused on its name
+  // alone, before any entity lookup or parameter parsing.
+  (void)entity_id;
+  (void)parameters;
+
+  // Acknowledge and Confirm change alarm state on the controller, so they are
+  // write paths and this build carries neither. Refused before any condition
+  // lookup or client call, with the same answer a value write gets - nothing
+  // advertises them either, so this is the backstop for a client that posts the
+  // operation id directly.
+  if (operation_name == "acknowledge_fault" || operation_name == "confirm_fault") {
+    return tl::make_unexpected(
+        OperationProviderErrorInfo{OperationProviderError::Rejected, kReadOnlyBuildRefusal, kReadOnlyBuildStatus});
+  }
+#else
+  // Issue #386: acknowledge_fault and confirm_fault dispatch to OPC-UA
+  // Method calls on the live ConditionId. AcknowledgeableConditionType
+  // declares Acknowledge as method i=9111 and Confirm as method i=9113;
+  // the objectId argument is the ConditionId NodeId of the live instance.
+  if (operation_name == "acknowledge_fault" || operation_name == "confirm_fault") {
+    if (!parameters.contains("fault_code") || !parameters["fault_code"].is_string()) {
+      return tl::make_unexpected(OperationProviderErrorInfo{OperationProviderError::InvalidParameters,
+                                                            "Missing required string parameter: fault_code", 400});
+    }
+    std::string fault_code = parameters["fault_code"].get<std::string>();
+    std::string comment = parameters.value("comment", std::string{});
+
+    // Input validation (bburda review on PR #387). ``fault_code`` lands in
+    // log lines and HTTP error bodies via string concatenation; without
+    // length / charset bounds an authenticated operator can inject
+    // newlines, control chars, or multi-MB blobs into gateway logs.
+    // ``comment`` is forwarded verbatim to the PLC as ``LocalizedText`` -
+    // unbounded length lets the same role spam the PLC's condition log.
+    // 256 chars matches the existing entity-id bound (``is_valid_path_segment``)
+    // and is generous enough for typical ``PLC_OVERPRESSURE_SENSOR_3`` style
+    // identifiers + a one-sentence operator comment.
+    if (!is_valid_path_segment(fault_code)) {
+      return tl::make_unexpected(OperationProviderErrorInfo{OperationProviderError::InvalidParameters,
+                                                            "fault_code must be alphanumeric+_- and 1-256 chars (got " +
+                                                                std::to_string(fault_code.size()) + " chars)",
+                                                            400});
+    }
+    if (comment.size() > 256) {
+      return tl::make_unexpected(
+          OperationProviderErrorInfo{OperationProviderError::InvalidParameters,
+                                     "comment exceeds 256 chars (got " + std::to_string(comment.size()) + ")", 400});
+    }
+
+    auto runtime = poller_->lookup_condition(entity_id, fault_code);
+    if (!runtime) {
+      return tl::make_unexpected(OperationProviderErrorInfo{
+          OperationProviderError::OperationNotFound,
+          "No live condition for fault_code=" + fault_code + " on entity=" + entity_id, 404});
+    }
+
+    constexpr uint32_t kAcknowledgeMethodId = 9111;
+    constexpr uint32_t kConfirmMethodId = 9113;
+    opcua::NodeId method_id(0, operation_name == "acknowledge_fault" ? kAcknowledgeMethodId : kConfirmMethodId);
+
+    if (plugin_debug_enabled()) {
+      std::ostringstream hex_oss;
+      const auto * bytes = runtime->latest_event_id.data();
+      for (size_t i = 0; i < std::min<size_t>(runtime->latest_event_id.length(), 16); ++i) {
+        char buf[3];
+        std::snprintf(buf, sizeof(buf), "%02x", static_cast<unsigned>(bytes[i]) & 0xffu);
+        hex_oss << buf;
+      }
+      RCLCPP_DEBUG_STREAM(opcua_plugin_logger(), operation_name << " EventId len=" << runtime->latest_event_id.length()
+                                                                << " hex=" << hex_oss.str()
+                                                                << " conditionId=" << runtime->condition_id.toString());
+    }
+
+    auto result = client_->call_condition_method(runtime->condition_id, method_id, runtime->latest_event_id, comment);
+    if (!result.has_value()) {
+      auto code = result.error().code;
+      int http = 502;
+      auto err = OperationProviderError::TransportError;
+      if (code == OpcuaClient::MethodError::NotConnected) {
+        http = 503;
+        err = OperationProviderError::Internal;
+      } else if (code == OpcuaClient::MethodError::MethodNotFound) {
+        http = 404;
+        err = OperationProviderError::OperationNotFound;
+      } else if (code == OpcuaClient::MethodError::InvalidArgument) {
+        http = 400;
+        err = OperationProviderError::InvalidParameters;
+      } else if (code == OpcuaClient::MethodError::MethodTimeout) {
+        http = 504;
+        err = OperationProviderError::TransportError;
+      }
+      return tl::make_unexpected(OperationProviderErrorInfo{err, result.error().message, http});
+    }
+
+    nlohmann::json out;
+    out["status"] = "ok";
+    out["operation"] = operation_name;
+    out["fault_code"] = fault_code;
+    out["entity_id"] = entity_id;
+    out["condition_id"] = runtime->condition_id.toString();
+    return dto::OperationExecutionResult{std::move(out)};
+  }
+#endif  // MEDKIT_OPCUA_READ_ONLY
+
+#if MEDKIT_OPCUA_READ_ONLY
+  // Everything past the branch above is the value-write path, and this build
+  // does not contain it either. Nothing advertised reaches here - a read-only
+  // build marks no point writable, so list_operations emits no set_* entry -
+  // and a request aimed straight at one is refused before any node lookup or
+  // client call.
+  return tl::make_unexpected(
+      OperationProviderErrorInfo{OperationProviderError::Rejected, kReadOnlyBuildRefusal, kReadOnlyBuildStatus});
+#else
+  std::string data_name;
+  if (operation_name.substr(0, 4) == "set_") {
+    data_name = operation_name.substr(4);
+  } else {
+    data_name = operation_name;
+  }
+
+  // Held for as long as ``entry`` (a pointer into node_map_) is dereferenced,
+  // including across the OPC-UA write below.
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  auto * entry = node_map_.find_by_data_name(entity_id, data_name);
+  if (!entry) {
+    return tl::make_unexpected(OperationProviderErrorInfo{OperationProviderError::OperationNotFound,
+                                                          "Operation not found: " + operation_name, 404});
+  }
+  if (!entry->writable) {
+    return tl::make_unexpected(
+        OperationProviderErrorInfo{OperationProviderError::Rejected, "Data point is read-only: " + data_name, 400});
+  }
+  if (!parameters.contains("value")) {
+    return tl::make_unexpected(OperationProviderErrorInfo{OperationProviderError::InvalidParameters,
+                                                          "Missing 'value' field in parameters", 400});
+  }
+
+  auto parsed = parse_coerce_validate(parameters["value"], *entry);
+  if (!parsed) {
+    return tl::make_unexpected(
+        OperationProviderErrorInfo{OperationProviderError::InvalidParameters, parsed.error(), 400});
+  }
+
+  auto write_result = client_->write_value(entry->node_id, *parsed, entry->data_type);
+  if (!write_result) {
+    auto wcode = write_result.error().code;
+    if (wcode == OpcuaClient::WriteError::TypeMismatch) {
+      return tl::make_unexpected(
+          OperationProviderErrorInfo{OperationProviderError::InvalidParameters, write_result.error().message, 400});
+    }
+    if (wcode == OpcuaClient::WriteError::AccessDenied) {
+      return tl::make_unexpected(
+          OperationProviderErrorInfo{OperationProviderError::Rejected, write_result.error().message, 403});
+    }
+    return tl::make_unexpected(
+        OperationProviderErrorInfo{OperationProviderError::TransportError, write_result.error().message, 502});
+  }
+
+  nlohmann::json result;
+  result["status"] = "ok";
+  result["operation"] = operation_name;
+  result["node_id"] = entry->node_id_str;
+  std::visit(
+      [&result](auto && v) {
+        result["value_written"] = v;
+      },
+      *parsed);
+  return dto::OperationExecutionResult{std::move(result)};
+#endif  // MEDKIT_OPCUA_READ_ONLY
+}
+
+bool OpcuaPlugin::has_operations(const std::string & entity_id) const {
+  // Mirrors list_operations' own lookup: true for any entity_defs() entry
+  // (writable data points, or acknowledge_fault/confirm_fault on an
+  // event-alarm entity), false for the Component, which has none.
+  std::shared_lock<std::shared_mutex> node_map_lock(node_map_mutex_);
+  const auto & defs = node_map_.entity_defs();
+  return std::any_of(defs.begin(), defs.end(), [&entity_id](const PlcEntityDef & def) {
+    return def.id == entity_id;
+  });
+}
+
+// -- FaultProvider interface --
+
+tl::expected<dto::FaultListResult, FaultProviderErrorInfo> OpcuaPlugin::list_faults(const std::string & entity_id) {
+  if (!ctx_) {
+    return tl::make_unexpected(FaultProviderErrorInfo{FaultProviderError::Internal, "plugin not initialized", 503});
+  }
+
+  // PluginContext::list_entity_faults returns a bare JSON array of fault
+  // objects already scoped to this entity (see its contract). Project each into
+  // the plugin fault-list item shape.
+  auto faults = ctx_->list_entity_faults(entity_id);
+  nlohmann::json items = nlohmann::json::array();
+  if (faults.is_array()) {
+    for (const auto & f : faults) {
+      nlohmann::json item;
+      item["code"] = f.value("fault_code", "");
+      item["severity"] = f.value("severity", 0);
+      item["description"] = f.value("description", "");
+      item["status"] = f.value("status", "");
+      // Fault records carry reporting_sources, not source_id. On this
+      // entity-scoped list prefer the requested entity when it is among the
+      // sources - reporting_sources[0] is ordering-dependent and can name a
+      // different co-reporting entity; fall back to the first source only
+      // when the entity itself never reported.
+      std::string source_id = f.value("source_id", "");
+      if (source_id.empty() && f.contains("reporting_sources") && f["reporting_sources"].is_array()) {
+        for (const auto & src : f["reporting_sources"]) {
+          if (src.is_string() && src.get<std::string>() == entity_id) {
+            source_id = entity_id;
+            break;
+          }
+        }
+        if (source_id.empty() && !f["reporting_sources"].empty() && f["reporting_sources"][0].is_string()) {
+          source_id = f["reporting_sources"][0].get<std::string>();
+        }
+      }
+      item["source_id"] = source_id;
+      // Pass occurrence data through: without it the entity-scoped route
+      // serves faults with no timestamps ("time unknown" in clients) while the
+      // instance-level route has them.
+      for (const char * key : {"first_occurred", "last_occurred", "occurrence_count", "severity_label"}) {
+        if (f.contains(key)) {
+          item[key] = f[key];
+        }
+      }
+      if (f.contains("reporting_sources")) {
+        item["reporting_sources"] = f["reporting_sources"];
+      }
+      items.push_back(std::move(item));
+    }
+  }
+  return dto::FaultListResult{nlohmann::json{{"items", std::move(items)}}};
+}
+
+tl::expected<dto::FaultDetailResult, FaultProviderErrorInfo> OpcuaPlugin::get_fault(const std::string & entity_id,
+                                                                                    const std::string & fault_code) {
+  if (!ctx_) {
+    return tl::make_unexpected(FaultProviderErrorInfo{FaultProviderError::Internal, "plugin not initialized", 503});
+  }
+
+  // list_entity_faults returns a bare JSON array of fault objects scoped to
+  // this entity (see PluginContext contract).
+  auto faults = ctx_->list_entity_faults(entity_id);
+  if (faults.is_array()) {
+    for (const auto & f : faults) {
+      if (f.value("fault_code", "") == fault_code) {
+        return dto::FaultDetailResult{f};
+      }
+    }
+  }
+
+  return tl::make_unexpected(
+      FaultProviderErrorInfo{FaultProviderError::FaultNotFound, "Fault not found: " + fault_code, 404});
+}
+
+tl::expected<dto::FaultClearResult, FaultProviderErrorInfo> OpcuaPlugin::clear_fault(const std::string & entity_id,
+                                                                                     const std::string & fault_code) {
+  if (!ctx_ || !fault_clients_) {
+    return tl::make_unexpected(FaultProviderErrorInfo{FaultProviderError::Internal, "plugin not initialized", 503});
+  }
+
+  // This is the per-entity SOVD route DELETE /{entity}/faults/{code}. The
+  // gateway sets skip_correlation_auto_clear on its own branch of that route so
+  // an operator scoped to one entity cannot cascade-clear symptoms reported by
+  // apps in other entities, and a plugin-owned entity must not be the hole in
+  // that rule: the request goes through this provider instead, so the same flag
+  // has to be set here.
+  send_clear_fault(fault_code, ClearOrigin::ScopedOperator);
+  return dto::FaultClearResult{
+      nlohmann::json{{"status", "cleared"}, {"fault_code", fault_code}, {"entity_id", entity_id}}};
+}
+
+}  // namespace ros2_medkit_gateway
