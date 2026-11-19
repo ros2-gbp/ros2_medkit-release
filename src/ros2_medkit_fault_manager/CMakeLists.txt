@@ -1,0 +1,344 @@
+# Copyright 2025-2026 mfaferek93, bburda
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+cmake_minimum_required(VERSION 3.14)
+project(ros2_medkit_fault_manager)
+
+option(POSTGRES_SUPPORT "Enable PostgreSQL support" OFF)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Shared cmake modules (multi-distro compat, ccache, linting)
+find_package(ros2_medkit_cmake REQUIRED)
+include(ROS2MedkitCompat)
+include(ROS2MedkitCcache)
+include(ROS2MedkitSanitizers)
+include(ROS2MedkitCoverage)
+include(ROS2MedkitLinting)
+include(ROS2MedkitWarnings)
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(ros2_medkit_fault_detection REQUIRED)
+find_package(ros2_medkit_msgs REQUIRED)
+find_package(ros2_medkit_serialization REQUIRED)
+if(POSTGRES_SUPPORT)
+  find_package(PostgreSQL REQUIRED)
+  include(FetchContent)
+
+  # EXCLUDE_FROM_ALL keeps libpqxx out of this package's install. CMake < 3.28 has no such
+  # option in fetchcontent_declare, so the subdirectory is added by hand below.
+  set(_pqxx_exclude_from_all "")
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
+    set(_pqxx_exclude_from_all EXCLUDE_FROM_ALL)
+  endif()
+  fetchcontent_declare(pqxx
+    GIT_REPOSITORY https://github.com/jtv/libpqxx.git
+    GIT_TAG        7.10.7
+    GIT_SHALLOW    TRUE
+    ${_pqxx_exclude_from_all}
+  )
+
+  # Save medkit flags to restore them later. Not required per-se, but doesn't hurt to handle them either
+  set(_medkit_saved_cxx_flags "${CMAKE_CXX_FLAGS}")
+  get_directory_property(_medkit_saved_opts COMPILE_OPTIONS)
+  string(REGEX REPLACE "(^|[ ])-W[^ ]*" " " CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+  set_directory_properties(PROPERTIES COMPILE_OPTIONS "")
+
+  # No warnings-as-errors, include-what-you-use or clang-tidy for pqxx. An empty normal variable
+  # hides a cache value from -D; unset() would expose it. Restored after pqxx.
+  set(_medkit_saved_warning_as_error "${CMAKE_COMPILE_WARNING_AS_ERROR}")
+  set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
+  set(CMAKE_CXX_INCLUDE_WHAT_YOU_USE "")
+  set(CMAKE_CXX_CLANG_TIDY "")
+  # Keep the libpqxx tests out of this build. Its BUILD_DOC is OFF by default; setting it here makes
+  # CMake 3.22 warn about CMP0077.
+  set(SKIP_BUILD_TEST ON)
+
+  # libpqxx must be static: it is not installed. ament on Lyrical defaults BUILD_SHARED_LIBS to ON.
+  set(_medkit_saved_build_shared_libs "${BUILD_SHARED_LIBS}")
+  set(BUILD_SHARED_LIBS OFF)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.28)
+    fetchcontent_makeavailable(pqxx)
+  else()
+    fetchcontent_getproperties(pqxx)
+    if(NOT pqxx_POPULATED)
+      fetchcontent_populate(pqxx)
+      add_subdirectory(${pqxx_SOURCE_DIR} ${pqxx_BINARY_DIR} EXCLUDE_FROM_ALL)
+    endif()
+  endif()
+  set(BUILD_SHARED_LIBS "${_medkit_saved_build_shared_libs}")
+  set(CMAKE_COMPILE_WARNING_AS_ERROR "${_medkit_saved_warning_as_error}")
+  unset(CMAKE_CXX_INCLUDE_WHAT_YOU_USE)
+  unset(CMAKE_CXX_CLANG_TIDY)
+
+  # Restore medkit flags now that pqxx is compiled
+  set(CMAKE_CXX_FLAGS "${_medkit_saved_cxx_flags}")
+  set_directory_properties(PROPERTIES COMPILE_OPTIONS "${_medkit_saved_opts}")
+
+  # Make headers available to SYSTEM
+  # Once CMake3.25 is globally supported (Ubuntu 22.04 ships with CMake3.22)
+  # the snippet below could be replaced with fetchcontent_declare(pqxx ... SYSTEM)
+  foreach(_pqxx_tgt pqxx pqxx_shared pqxx_static)
+    if(TARGET ${_pqxx_tgt})
+      target_compile_options(${_pqxx_tgt} PRIVATE -w)
+      get_target_property(_pqxx_inc ${_pqxx_tgt} INTERFACE_INCLUDE_DIRECTORIES)
+      if(_pqxx_inc)
+        set_target_properties(${_pqxx_tgt} PROPERTIES
+          INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${_pqxx_inc}")
+      endif()
+    endif()
+  endforeach()
+endif()
+
+find_package(SQLite3 REQUIRED)
+find_package(nlohmann_json REQUIRED)
+# OpenSSL EVP SHA-256 for the tamper-evident audit log hash chain
+find_package(OpenSSL REQUIRED)
+# yaml-cpp is required as transitive dependency from ros2_medkit_serialization
+medkit_find_yaml_cpp()
+# rosbag2 for time-window snapshot recording
+find_package(rosbag2_cpp REQUIRED)
+find_package(rosbag2_storage REQUIRED)
+
+medkit_detect_compat_defs()
+
+# ROS-free core: storage, threshold resolver, correlation engine and audit log
+include(cmake/fault_manager_core.cmake)
+
+# Library target (shared between executable and tests)
+set(FAULT_MANAGER_FILES
+    src/capture_thread_pool.cpp
+    src/fault_manager_node.cpp
+    src/pending_topic_watcher.cpp
+    src/snapshot_capture.cpp
+    src/rosbag_capture.cpp
+    src/ros2/fault_msg_conversions.cpp
+    src/ros2/ros_event_sink.cpp
+    src/ros2/ros_log_sink.cpp
+)
+add_library(fault_manager_lib STATIC
+  ${FAULT_MANAGER_FILES}
+)
+
+target_include_directories(fault_manager_lib PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+
+medkit_target_dependencies(fault_manager_lib PUBLIC
+  rclcpp
+  ros2_medkit_msgs
+  ros2_medkit_serialization
+  rosbag2_cpp
+  rosbag2_storage
+)
+
+target_link_libraries(fault_manager_lib PUBLIC
+  fault_manager_core
+  ros2_medkit_fault_detection::ros2_medkit_fault_detection
+)
+
+medkit_apply_compat_defs(fault_manager_lib)
+
+# Executable target
+add_executable(fault_manager_node src/main.cpp)
+target_link_libraries(fault_manager_node fault_manager_lib)
+
+# Install targets
+install(TARGETS fault_manager_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(DIRECTORY include/
+  DESTINATION include
+)
+
+install(DIRECTORY launch config
+  DESTINATION share/${PROJECT_NAME}
+)
+
+# Testing
+if(BUILD_TESTING)
+  find_package(ament_lint_auto REQUIRED)
+  find_package(ament_cmake_gtest REQUIRED)
+  find_package(launch_testing_ament_cmake REQUIRED)
+  find_package(std_msgs REQUIRED)
+
+  medkit_lint_config(.clang-format ament_cmake_clang_format_CONFIG_FILE)
+  list(APPEND AMENT_LINT_AUTO_EXCLUDE ament_cmake_uncrustify ament_cmake_cpplint ament_cmake_clang_tidy)
+  ament_lint_auto_find_test_dependencies()
+
+  ros2_medkit_clang_tidy()
+
+  include(ROS2MedkitTestDomain)
+
+  # Manifest test: the storage plugins declared as exec/test dependencies.
+  # Creates no ROS node, so it needs no domain.
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_rosbag_storage_dependency test/test_rosbag_storage_dependency.py
+    TIMEOUT 60)
+  set_tests_properties(test_rosbag_storage_dependency PROPERTIES LABELS "unit")
+  medkit_test_needs_no_domain(test_rosbag_storage_dependency)
+
+  # Unit tests
+  # Each GTest target that instantiates ROS 2 nodes takes a ROS_DOMAIN_ID from this
+  # package's pool so it cannot interfere with launch_testing integration tests that run
+  # concurrently in the same CTest invocation and launch their own fault_manager_node
+  # subprocess.
+  medkit_add_gtest(test_fault_manager test/test_fault_manager.cpp)
+  target_link_libraries(test_fault_manager fault_manager_lib)
+  medkit_target_dependencies(test_fault_manager rclcpp ros2_medkit_msgs std_msgs)
+
+  # SQLite storage tests
+  medkit_add_gtest(test_sqlite_storage test/test_sqlite_storage.cpp)
+  target_link_libraries(test_sqlite_storage fault_manager_lib)
+  medkit_target_dependencies(test_sqlite_storage rclcpp ros2_medkit_msgs)
+
+  # PostgreSQL storage tests
+if(POSTGRES_SUPPORT)
+  medkit_add_gtest(test_postgres_storage test/test_postgres_storage.cpp)
+  target_link_libraries(test_postgres_storage fault_manager_lib)
+  medkit_target_dependencies(test_postgres_storage rclcpp ros2_medkit_msgs)
+endif()
+
+  # Rosbag retention parity: every assertion runs against both storage backends.
+  medkit_add_gtest(test_rosbag_storage_parity test/test_rosbag_storage_parity.cpp)
+  target_link_libraries(test_rosbag_storage_parity fault_manager_lib)
+  medkit_target_dependencies(test_rosbag_storage_parity rclcpp ros2_medkit_msgs)
+
+  # Fault audit log tests (hash chain, verify, rotation, reopen)
+  medkit_add_gtest(test_fault_audit_log test/test_fault_audit_log.cpp)
+  target_link_libraries(test_fault_audit_log fault_manager_lib)
+
+  # Recording manifest (file list, sizes, sha256). Plain C++ core, no ROS node.
+  medkit_add_gtest(test_recording_manifest test/test_recording_manifest.cpp)
+  target_link_libraries(test_recording_manifest fault_manager_core)
+  medkit_test_needs_no_domain(test_recording_manifest)
+
+  # Snapshot capture tests
+  medkit_add_gtest(test_snapshot_capture test/test_snapshot_capture.cpp)
+  target_link_libraries(test_snapshot_capture fault_manager_lib)
+  medkit_target_dependencies(test_snapshot_capture rclcpp ros2_medkit_msgs std_msgs)
+
+  # Pending topic watcher tests (topics a capture waits for until they appear)
+  medkit_add_gtest(test_pending_topic_watcher test/test_pending_topic_watcher.cpp)
+  target_link_libraries(test_pending_topic_watcher fault_manager_lib)
+  medkit_target_dependencies(test_pending_topic_watcher rclcpp std_msgs)
+
+  # Rosbag capture tests. The suite drives real post-roll windows (multi-second
+  # buffer fills and timer waits), so it needs more than the 60s default.
+  medkit_add_gtest(test_rosbag_capture test/test_rosbag_capture.cpp TIMEOUT 180)
+  target_link_libraries(test_rosbag_capture fault_manager_lib)
+  medkit_target_dependencies(test_rosbag_capture rclcpp ros2_medkit_msgs std_msgs)
+
+  # Correlation config parser tests
+  medkit_add_gtest(test_correlation_config_parser test/test_correlation_config_parser.cpp)
+  target_link_libraries(test_correlation_config_parser fault_manager_lib)
+
+  # Pattern matcher tests
+  medkit_add_gtest(test_pattern_matcher test/test_pattern_matcher.cpp)
+  target_link_libraries(test_pattern_matcher fault_manager_lib)
+
+  # Correlation engine tests
+  medkit_add_gtest(test_correlation_engine test/test_correlation_engine.cpp)
+  target_link_libraries(test_correlation_engine fault_manager_lib)
+
+  # Entity threshold resolver tests
+  medkit_add_gtest(test_entity_thresholds test/test_entity_thresholds.cpp)
+  target_link_libraries(test_entity_thresholds fault_manager_lib)
+  medkit_target_dependencies(test_entity_thresholds rclcpp ros2_medkit_msgs)
+
+  # Fault-code threshold resolver tests
+  medkit_add_gtest(test_fault_code_thresholds test/test_fault_code_thresholds.cpp)
+  target_link_libraries(test_fault_code_thresholds fault_manager_lib)
+  medkit_target_dependencies(test_fault_code_thresholds rclcpp ros2_medkit_msgs)
+
+  # Integration tests
+  install(DIRECTORY test
+    DESTINATION share/${PROJECT_NAME}
+  )
+
+  medkit_add_launch_test(test_integration test/integration/test_integration.test.py TIMEOUT 60
+    LABELS "integration")
+
+  medkit_add_launch_test(test_rosbag_integration test/integration/test_rosbag_integration.test.py TIMEOUT 150
+    LABELS "integration")
+
+  # Launches without snapshots.rosbag.format, so the parameter default (mcap)
+  # is what is under test rather than an operator's explicit choice.
+  medkit_add_launch_test(test_rosbag_default_format test/integration/test_rosbag_default_format.test.py TIMEOUT 150
+    LABELS "integration")
+
+  medkit_add_launch_test(test_entity_thresholds_integration test/integration/test_entity_thresholds_integration.test.py
+    TIMEOUT 60 LABELS "integration")
+
+  medkit_add_launch_test(test_fault_code_thresholds_integration
+    test/integration/test_fault_code_thresholds_integration.test.py TIMEOUT 60 LABELS "integration")
+
+  medkit_add_launch_test(test_fault_code_healing_restart
+    test/integration/test_fault_code_healing_restart.test.py TIMEOUT 120 LABELS "integration")
+
+  # Drives healing with the event counts a one-event-per-transition reporter
+  # actually sends: one FAILED per raise, one PASSED per clear. Parametrized over
+  # healing_threshold, so the node launches twice, and one case holds a settled
+  # fault for a quiet period - hence the timeout.
+  medkit_add_launch_test(test_debounce_and_healing test/integration/test_debounce_and_healing.test.py
+    TIMEOUT 120 LABELS "integration")
+
+  # Time-based confirmation has to reach the event stream, not just the store:
+  # the SSE feed and the trigger subscribers key off the published event, and
+  # black-box capture is enqueued alongside it.
+  medkit_add_launch_test(test_auto_confirm_visibility test/integration/test_auto_confirm_visibility.test.py
+    TIMEOUT 120 LABELS "integration")
+
+  medkit_add_launch_test(test_rosbag_entity_scope test/integration/test_rosbag_entity_scope.test.py TIMEOUT 120
+    LABELS "integration")
+
+  # The only suite running above max_bags_per_fault=1: drives confirm / clear /
+  # confirm on one code and asserts both recordings survive and stay separately
+  # addressable. Six occurrences plus their post-roll windows, hence the timeout.
+  medkit_add_launch_test(test_rosbag_history test/integration/test_rosbag_history.test.py TIMEOUT 240
+    LABELS "integration")
+
+  # Parametrized over both storage formats (sqlite3 + mcap), so the launch
+  # runs twice inside one ctest invocation.
+  medkit_add_launch_test(test_rosbag_boundary test/integration/test_rosbag_boundary.test.py TIMEOUT 240
+    LABELS "integration")
+
+  # Drives the DEFAULT "entity" topic mode, where a boundary recording carries a
+  # filter, over two full post-fault windows plus discovery.
+  medkit_add_launch_test(test_rosbag_boundary_scope test/integration/test_rosbag_boundary_scope.test.py TIMEOUT 180
+    LABELS "integration")
+
+  # Core orchestration under parallel callers. Plain C++ core, no ROS node.
+  medkit_add_gtest(test_fault_manager_core_concurrency test/test_fault_manager_core_concurrency.cpp)
+  target_link_libraries(test_fault_manager_core_concurrency fault_manager_core)
+  medkit_test_needs_no_domain(test_fault_manager_core_concurrency)
+
+  # CaptureThreadPool unit tests
+  medkit_add_gtest(test_capture_thread_pool test/test_capture_thread_pool.cpp)
+  target_link_libraries(test_capture_thread_pool fault_manager_lib)
+  medkit_target_dependencies(test_capture_thread_pool rclcpp)
+
+  ros2_medkit_relax_vendor_warnings()
+endif()
+
+# Defined only when ON: the sources test it with #ifdef.
+if(POSTGRES_SUPPORT)
+  target_compile_definitions(fault_manager_lib PUBLIC POSTGRES_SUPPORT)
+endif()
+ament_package()
