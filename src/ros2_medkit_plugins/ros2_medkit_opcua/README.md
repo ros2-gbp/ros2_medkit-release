@@ -1,0 +1,1295 @@
+# ros2_medkit_opcua
+
+Gateway plugin that bridges OPC-UA capable PLCs (OpenPLC, Siemens S7, Beckhoff, Allen-Bradley, etc.) into the SOVD entity tree. Enables unified diagnostics for mixed ROS 2 + industrial PLC deployments through a single REST API, with PLC alarms routed to `ros2_medkit_fault_manager` and numeric PLC values optionally bridged to ROS 2 `std_msgs/Float32` topics.
+
+Follows the same plugin pattern as `ros2_medkit_graph_provider`: implements `GatewayPlugin` + `IntrospectionProvider` against the `get_routes()` plugin API, loaded at runtime by `ros2_medkit_gateway` via `dlopen`.
+
+## What it does
+
+- Connects to any OPC-UA capable PLC server over `opc.tcp`
+- Emits SOVD entities (area, component, apps) from a YAML-driven node map, or
+  discovers them automatically by browsing the live address space
+  (`auto_browse`, see below) - zero node-map config required
+- Exposes PLC values as the `x-plc-data` vendor collection
+- Ships read-only by default: the shipped binary contains no compiled path that
+  writes a value or acknowledges a condition, and exports nothing from the OPC UA
+  stack (see [Read-only and write-capable builds](#read-only-and-write-capable-builds))
+- In a write-capable build, allows writing setpoints via `x-plc-operations` with
+  type-aware coercion and range validation
+- Reports the connection state, poll metrics and the build's write surface via `x-plc-status`
+- Maps threshold-based PLC alarms to SOVD faults on the owning entity
+- Optionally publishes numeric PLC values to ROS 2 `std_msgs/Float32` topics
+
+## Architecture
+
+```
+                    OPC-UA (TCP :4840)
+PLC Runtime  <─────────────────────────>  OPC-UA Plugin (.so)
+  IEC 61131-3 program                      │
+  Cyclic execution (100ms)                 │  Polls all configured nodes
+  Variables exposed as OPC-UA nodes        │  Maps to SOVD entity tree
+                                           │  Alarm thresholds -> fault reporting
+                                           │
+                                           ▼
+                                    ros2_medkit Gateway
+                                      REST API :8080
+                                           │
+                                    ┌──────┴──────┐
+                                    │             │
+                              SOVD REST      Fleet Gateway
+                              (direct)       (aggregation)
+                                    │             │
+                                Dashboard    Multi-device view
+```
+
+The plugin connects to any PLC with an OPC-UA server over TCP. No ROS 2 dependency between the plugin and the PLC - communication is pure OPC-UA. The plugin is loaded by the gateway at runtime via `dlopen()` and registers vendor REST endpoints for PLC data access and control.
+
+## SOVD Entity Model
+
+The plugin creates a hierarchical entity tree from a YAML node map configuration:
+
+```
+Area: plc_systems
+  └── Component: openplc_runtime
+        ├── App: tank_process
+        │     Data: tank_level (mm), tank_temperature (C), tank_pressure (bar)
+        │     Faults: PLC_HIGH_TEMP, PLC_LOW_LEVEL, PLC_OVERPRESSURE
+        ├── App: fill_pump
+        │     Data: pump_speed (%)
+        │     Operations: set_pump_speed
+        └── App: drain_valve
+              Data: valve_position (%)
+              Operations: set_valve_position
+```
+
+## Asset identity (x-medkit.identity)
+
+The plugin auto-populates the PLC component's asset-identity nameplate from the
+live server and serves it as `x-medkit.identity` on the component (see
+`docs/api/rest.rst` for the JSON shape). Two sources are read, best-effort:
+
+- `Server/ServerStatus/BuildInfo` (present on every compliant server):
+  `ManufacturerName`, `ProductName`, `SoftwareVersion`, `BuildNumber` (carried
+  as the `extra.buildNumber` key).
+- The OPC UA DI companion nameplate (`http://opcfoundation.org/UA/DI/`, only
+  when the server exposes that namespace): `Manufacturer`, `Model`,
+  `SerialNumber`, `HardwareRevision`, `SoftwareRevision` from the first device
+  under `Objects/DeviceSet` that carries identification properties. DI values
+  are device-specific and win over the server-level BuildInfo per field.
+
+The read happens once per session - on the first introspect after a connect -
+and is refreshed after every reconnect: the cached nameplate is tied to the
+OPC UA session, so a PLC reboot, firmware update, or device swap is picked up
+on the next discovery refresh instead of latching the first read forever.
+
+**Trust-gated precedence.** How the live nameplate ranks against a
+hand-authored manifest `identity:` block depends on whether the session
+authenticates the server:
+
+- Secured channel (`security_mode: Sign`/`SignAndEncrypt`) **and**
+  `reject_untrusted: true`: the component is tagged with the protocol source
+  `opcua`, which outranks `manifest` in the identity merge - an authenticated
+  live read overrides stale manifest fields.
+- Anything else (`SecurityPolicy=None`, or `reject_untrusted: false` /
+  accept-any cert): the nameplate is spoofable by a rogue endpoint, so the
+  component keeps the generic `plugin` source, which ranks below `manifest` -
+  the read fills fields the operator left empty but never overrides them.
+
+Per-field `_provenance` records `opcua` in both cases, so consumers always see
+where a value was read even when it merged with low authority.
+
+Note: identity (model, serial number, firmware/software versions) is served
+unauthenticated on the default gateway configuration (`auth.enabled` defaults
+to `false`) like every other discovery resource - it is a device fingerprint,
+useful for reconnaissance. Enable gateway authentication (`auth.enabled: true`)
+or front the API with an authenticating proxy to gate access to it.
+
+## Read-only and write-capable builds
+
+Whether this box can change a controller is a property of the binary, not of a
+configuration file. `MEDKIT_OPCUA_READ_ONLY` is a CMake cache option and
+defaults to **ON**:
+
+```bash
+# The default: read-only. No OPC-UA write path in the object.
+colcon build --packages-up-to ros2_medkit_opcua
+
+# Write-capable, for development against a PLC you are allowed to drive.
+colcon build --packages-select ros2_medkit_opcua \
+  --cmake-args -DMEDKIT_OPCUA_READ_ONLY=OFF
+```
+
+In the default read-only build:
+
+- **What is absent from the object**, each name asserted by `nm` in
+  `test_opcua_build_variant`:
+  - every C++ function that composes an OPC UA Write - `OpcuaClient::write_value`,
+    the vendor route handler `OpcuaPlugin::handle_plc_operations`, the value
+    coercion they share, and the `open62541pp` templates and service functions
+    they reach (`Node<Client>::writeValueScalar`, `Node<Client>::writeValue`,
+    `services::write`, `services::writeAttribute<Client>`);
+  - the entry point that issues a Part 9 condition method,
+    `OpcuaClient::call_condition_method`;
+  - open62541's own `UA_Client_write*` / `UA_Server_write*` primitives, dropped
+    by `-Wl,--exclude-libs,ALL` and `-Wl,--gc-sections` over
+    `-ffunction-sections -fdata-sections` because nothing references them once
+    the C++ write path is gone;
+  - every OPC UA symbol in the dynamic symbol table. The module exports the six
+    plugin entry points and C++ vague-linkage symbols, and nothing matching
+    `UA_*` or `opcua::*`, so `dlsym` reaches none of the machinery below.
+
+- **What remains inside the object, and why no route reaches it.** open62541 is
+  one static library, so removing the write path does not remove the transport
+  it shared. Still present: the generic request dispatcher
+  `__UA_Client_Service`, which the read, browse and ConditionRefresh paths all
+  use; the binary encoders (23 `*_encodeBinary` symbols), which serialize every
+  message type including the ones below; and the generated `UA_TYPES`
+  descriptors, which the table references as a whole so the linker cannot drop
+  individual entries - among them `WriteRequest`, `WriteValue`, `WriteResponse`,
+  `AddNodes`, `DeleteNodes`, `AddReferences`, `SetMonitoringMode`,
+  `SetPublishingMode` and `TransferSubscriptions` (`HistoryUpdate`: absent).
+  Descriptors are data, not a code path: no function in the object builds any of
+  those requests, none of these symbols is exported, and the plugin registers
+  three GET routes in a read-only build, so nothing in the REST contract
+  supplies a NodeId, a method id or an attribute id to reach them.
+
+- Two OPC UA calls that do change server-side state are deliberately **kept** in
+  both variants, because they change no controller data: `ConditionRefresh`,
+  which asks the server to replay conditions it already holds, and subscription
+  and monitored-item creation, which the read path needs to receive values and
+  alarms at all.
+- No data point is ever `writable`. A node-map entry that says `writable: true`
+  is ignored with one startup warning naming the build property, and the
+  address-space walk never consults the server's `CurrentWrite` bit whatever
+  `infer_writable` says.
+- Nothing advertises a write: no `x-plc-operations` capability on any entity, no
+  `set_<name>` entry in `/operations`, and the `POST .../x-plc-operations/...`
+  route is not registered (it answers 404).
+- **Alarm `acknowledge_fault` and `confirm_fault` are gone too.** A method call
+  that changes alarm state on the server is a write to the controller, and the
+  read-only build forbids every write path, not only value writes. The
+  `OpcuaClient` entry point that issues the Part 9 Acknowledge / Confirm calls
+  is not compiled, neither operation is listed on an event-alarm entity, and a
+  client that posts one anyway is refused. `ConditionRefresh` is unaffected and
+  stays in both variants: it asks the server to replay conditions it already
+  holds and changes nothing.
+- `PUT /{type}/{id}/data/{name}` and
+  `POST /{type}/{id}/operations/{name}/executions` answer **501** before any
+  node lookup, condition lookup or client call, with vendor code
+  `x-medkit-plugin-error` and a message naming `MEDKIT_OPCUA_READ_ONLY`. 501 is
+  the status SOVD uses for an operation the entity does not support; 403 is
+  reserved for a valid token with insufficient permissions, and no credential
+  reaches a write path that is not in the binary.
+
+A write-capable build restores everything above; nothing else differs.
+
+## REST API
+
+### Vendor Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/apps/{id}/x-plc-data` | All OPC-UA values for entity (with units, types, timestamps) |
+| GET | `/apps/{id}/x-plc-data/{name}` | Single data point value |
+| POST | `/apps/{id}/x-plc-operations/set_{name}` | Write value to PLC (`{"value": 75.0}`) - write-capable build only; not registered otherwise |
+| GET | `/components/{id}/x-plc-status` | Connection state, poll stats, active alarms, and `write_capable` - the write surface of the plugin object itself |
+
+### Standard SOVD (provided by gateway)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/v1/areas` | Lists `plc_systems` area |
+| GET | `/api/v1/components` | Lists `openplc_runtime` component |
+| GET | `/api/v1/apps` | Lists PLC applications (tank_process, fill_pump, etc.) |
+| GET | `/api/v1/apps/{id}/faults` | Active PLC alarms mapped to SOVD faults |
+
+### Example Responses
+
+**Live PLC data:**
+```json
+GET /api/v1/apps/tank_process/x-plc-data
+
+{
+  "entity_id": "tank_process",
+  "connected": true,
+  "timestamp": 1774185903,
+  "items": [
+    {"name": "tank_level", "value": 742.5, "unit": "mm", "data_type": "float", "writable": true},
+    {"name": "tank_temperature", "value": 31.8, "unit": "C", "data_type": "float", "writable": true},
+    {"name": "tank_pressure", "value": 2.95, "unit": "bar", "data_type": "float", "writable": false}
+  ]
+}
+```
+
+`writable` is `false` on every item in the default read-only build, whatever the
+node map or the server says.
+
+**Write to PLC:**
+```json
+POST /api/v1/apps/fill_pump/x-plc-operations/set_pump_speed
+{"value": 80.0}
+
+{"status": "ok", "operation": "set_pump_speed", "node_id": "ns=2;i=4", "value_written": 80}
+```
+
+**PLC connection status:**
+```json
+GET /api/v1/components/openplc_runtime/x-plc-status
+
+{
+  "component_id": "openplc_runtime",
+  "connected": true,
+  "endpoint_url": "opc.tcp://openplc:4840/openplc/opcua",
+  "server_description": "OpenPLC Runtime",
+  "mode": "poll",
+  "write_capable": false,
+  "poll_count": 142,
+  "error_count": 0,
+  "node_count": 5,
+  "active_alarms": []
+}
+```
+
+`write_capable` is the build, not a setting: `false` in the default read-only
+build, `true` only in one built with `-DMEDKIT_OPCUA_READ_ONLY=OFF`. An absent
+`x-plc-operations` capability alone does not say this, because a write-capable
+build whose node map marks nothing writable shows the same absence.
+
+## Finding Node IDs on your PLC
+
+The plugin identifies PLC tags by OPC-UA node IDs in the canonical string
+format (`ns=N;i=M` numeric, `ns=N;s=tag` string, `ns=N;g=...` GUID, or
+`ns=N;b=...` opaque). To discover the correct node IDs for a real PLC
+without guessing, use one of the standard OPC-UA browser tools:
+
+- **UaExpert** - free GUI browser from Unified Automation. Download at
+  <https://www.unified-automation.com/downloads/uaexpert.html>. Connect
+  to your PLC's `opc.tcp://` endpoint, navigate the address space tree,
+  right-click any Variable node, copy the NodeId property into the YAML
+  map below.
+
+- **`asyncua` command line** - `pip install asyncua` and then
+  `python -m asyncua.tools.uals -u opc.tcp://your-plc:4840` walks the
+  address space from a terminal, no GUI required.
+
+- **Vendor toolchains** - Siemens TIA Portal's OPC-UA configuration
+  exports DB/variable node IDs in the `ns=3;s="..."` format. Beckhoff
+  TwinCAT 3 XAE displays them as `ns=4;s=MAIN.Tank.level`. Allen-Bradley
+  users typically deploy Kepware or Ignition as an OPC-UA gateway which
+  auto-maps tag names.
+
+`config/tank_demo_nodes.yaml` ships a commented example with
+ready-to-paste templates for OpenPLC, Siemens S7-1500, Beckhoff TwinCAT,
+Allen-Bradley via Kepware and KUKA KR C5. Copy one of those blocks as a
+starting point.
+
+## Configuration
+
+### Node Map (YAML)
+
+Maps OPC-UA NodeIds to SOVD entities. One file per PLC setup.
+
+```yaml
+area_id: plc_systems
+area_name: PLC Systems
+component_id: openplc_runtime
+component_name: OpenPLC Runtime
+
+nodes:
+  - node_id: "ns=2;i=1"          # OPC-UA NodeId (numeric or string)
+    entity_id: tank_process       # SOVD app this belongs to
+    data_name: tank_level         # Data point name in REST API
+    display_name: Tank Level
+    unit: mm
+    data_type: float
+    writable: true                # Allow writes via x-plc-operations. Ignored in
+                                  # the default read-only build (one startup
+                                  # warning, the point stays read-only).
+    min_value: 0.0                # Optional: range validation for writes
+    max_value: 100.0
+    alarm:                        # Optional: numeric threshold -> SOVD fault
+      fault_code: PLC_LOW_LEVEL
+      severity: WARNING
+      message: Tank level below minimum
+      threshold: 100.0
+      above_threshold: false      # Alarm when value < threshold
+
+  # Raise qualifier: the condition must hold before the point raises a fault,
+  # so one noisy reading does not become a real fault. Works with `alarm:`,
+  # `status_bits:` and `fault_enum:`. See the note below.
+  - node_id: "ns=2;s=Tank.Pressure"
+    entity_id: tank_process
+    data_name: tank_pressure
+    data_type: float
+    raise_after_samples: 3         # optional: 3 polls in a row (1..10000, default 1)
+    raise_after_ms: 2000           # optional: held for 2 s without a break (0..3600000, default 0)
+    alarm:
+      fault_code: PLC_TANK_OVERPRESSURE_HIGH
+      threshold: 6.0
+
+  # Status-word bit decode: one integer register, one fault per named bit.
+  # Mutually exclusive per node with `alarm:` / `fault_enum:`.
+  - node_id: "ns=2;s=Pump.StatusWord"
+    entity_id: pump
+    data_name: status_word
+    data_type: int
+    status_word_width: 16          # optional: source register width in bits.
+                                   # Masks off sign-extended high bits so a
+                                   # signed 16-bit word read with its top bit
+                                   # set does not fire spurious faults above
+                                   # bit 15. Range 1..64. See the note below.
+    status_bits:
+      - bit: 3                     # bit position, 0 = least significant
+        fault_code: PUMP_OVERLOAD
+        severity: ERROR
+        message: Pump motor overload
+      - bit: 7
+        fault_code: FILTER_DIRTY
+        severity: WARNING          # message defaults to the fault_code
+
+  # Fault-code enum: a register value selects at most one fault + text.
+  - node_id: "ns=2;s=Vfd.FaultCode"
+    entity_id: vfd
+    data_name: fault_code
+    data_type: int
+    fault_enum:
+      ok_value: 0                  # value meaning "no fault" (default 0)
+      # Catch-all for a non-ok register value that matches no listed code
+      # (firmware revisions routinely add codes the config has not enumerated).
+      # All three keys are optional:
+      #   unknown_fault_code: code raised for the unmapped value. Defaults to a
+      #                       deterministic <ENTITY>_<DATA_NAME>_UNMAPPED.
+      #   unknown_severity:   SOVD bucket for it (default ERROR).
+      #   unknown_message:    text (default "unmapped fault code <N>").
+      unknown_fault_code: VFD_UNKNOWN_FAULT
+      unknown_severity: WARNING
+      unknown_message: Undocumented VFD fault code
+      codes:
+        - code: 10
+          fault_code: VFD_OVERVOLTAGE
+          severity: ERROR
+          message: DC bus overvoltage
+        - code: 11
+          fault_code: VFD_OVERCURRENT
+          severity: ERROR
+
+# The three modes (`alarm`, `status_bits`, `fault_enum`) are evaluated by the
+# shared `ros2_medkit_fault_detection` module so every protocol plugin maps raw
+# values to faults identically. They are mutually exclusive on a single node.
+#
+# Status words: prefer exposing the register as an UNSIGNED OPC-UA type (Byte /
+# UInt16 / UInt32 / UInt64). A signed type (Int16/Int32) whose top bit is set is
+# sign-extended when widened to the 64-bit decode register, which sets every bit
+# above the register width and raises spurious bit faults. When you cannot change
+# the server type, set `status_word_width:` (1..64) on the node instead: the
+# loader masks the raw value to that many low bits before decoding, so the
+# sign-extended high bits are dropped in-config. `bit:` positions are 0-based and
+# must be < 64 (and < `status_word_width` when set); higher positions are dead
+# config, so the loader logs a warning and skips that bit rule while still loading
+# the rest of the config.
+#
+# Raise qualifier (`raise_after_samples`, `raise_after_ms`):
+#   - polling: a sample is one successful read, so `raise_after_samples: N`
+#     raises on the Nth read in a row, (N-1) x `poll_interval_ms` after the
+#     first. When both are set, both must be met. A failed read is not a sample
+#     and does not complete `raise_after_ms`; the wait continues on the next
+#     successful read.
+#   - subscriptions: the server sends a value when it changes, not each poll,
+#     so there are no samples to count. `raise_after_samples: N` becomes a wait
+#     of (N-1) x `poll_interval_ms` from the data change that starts it, or
+#     `raise_after_ms` when that is longer. Changes of other points do not
+#     start a wait, and a point that has not reported since a reconnect is not
+#     looked at until it does. Keep the wait longer than
+#     `subscription_interval_ms`, since a change arrives once per publish.
+# The check runs once per `poll_interval_ms`, so a raise can come up to one poll
+# interval after the wait ends. With subscriptions and a
+# `subscription_interval_ms` shorter than the poll, a waiting fault is also
+# checked every `subscription_interval_ms`, so it ends on time. A single healthy reading restarts the
+# wait. A lost connection also restarts it, since nothing was seen while the link
+# was down. Only the raise waits: the clear is immediate. Each bit of a status
+# word and each code of an enum waits on its own. A fault that is still waiting
+# is not listed in `active_alarms` on `x-plc-status`. Out-of-range values are
+# clamped with a warning.
+#
+# Fault codes must be globally unique across ALL fault sources - every `alarm` /
+# `status_bits` / `fault_enum` entry AND every `event_alarms` entry (including
+# each of its `mappings[].fault_code`) - regardless of which entity owns them. The fault manager keys and clears faults by
+# fault_code alone, so a code reused on two sources (even on different entities,
+# even one polled and one event-driven) would flap raise/clear or clear the other
+# source's fault. The loader rejects the whole file at load with an actionable
+# error naming both sources.
+
+# Native OPC-UA AlarmConditionType events (issue #386). Subscribes to alarms
+# defined inside the PLC (Siemens Program_Alarm / ProDiag, Beckhoff TF6100,
+# CodeSys 3.5+, Rockwell via FactoryTalk Linx). Mutually exclusive per entry
+# with the threshold-based alarm form above.
+event_alarms:
+  # Simple form: one source -> one fault.
+  - alarm_source: "ns=4;s=Alarms.Overpressure"
+    entity_id: tank_process
+    fault_code: PLC_TANK_OVERPRESSURE
+
+  # Multi-alarm form (issue #389): one source emits many conditions (e.g. the
+  # Server object as a catch-all, or one Object owning several Program_Alarms)
+  # routed to distinct faults by condition identity. `mappings` are evaluated
+  # in order; the first whose non-empty match fields all match the observed
+  # event wins (`match_message` is a substring match, the rest equality),
+  # falling back to the source-level `fault_code` (if set).
+  - alarm_source: "ns=0;i=2253"          # Server object (system-wide)
+    entity_id: line_1
+    fault_code: PLC_GENERIC_ALARM        # catch-all fallback (optional)
+    mappings:
+      - condition_name: "Overpressure"   # match ConditionType.ConditionName
+        fault_code: PLC_OVERPRESSURE
+        severity_override: ERROR
+        message: "Tank overpressure"
+      - source_node: "ns=3;s=PumpA"      # or match by event SourceNode
+        event_type: "ns=0;i=2915"        # and/or EventType (AND-combined)
+        fault_code: PLC_PUMP_A_FAULT
+      - match_message: "Overtemperature"  # or match a Message substring - the
+        fault_code: PLC_OVERTEMP          # practical discriminator for PLCs (e.g.
+        severity_override: ERROR          # Siemens S7-1500) whose Program_Alarms
+                                          # share one EventType + SourceNode and
+                                          # differ only by alarm text
+    # Append vendor associated values (Siemens Program_Alarm SD_1..SD_n) to the
+    # fault description as "label=value".
+    associated_values:
+      - "SD_1"
+      - name: "SD_2"
+        label: "Setpoint"
+```
+
+Mapping precedence: a mapping with more (non-empty) match fields is matched
+only when all of them match the observed event; declaration order breaks ties.
+`condition_name` / `source_node` / `event_type` are equality matches;
+`match_message` is a case-sensitive substring match on the event Message.
+An event matching no mapping uses the source-level `fault_code`; if that is also
+empty the event is ignored. Exception: a non-condition event (a plain BaseEvent
+/ system message whose `ConditionId` resolves to null - e.g. a SIMATIC "CPU not
+in RUN" arriving on a `ns=0;i=2253` catch-all) is dropped before mapping
+resolution runs, so it never falls through to the source-level `fault_code` and
+that catch-all code is never raised for it (see "System messages" under
+`auto_alarms` below). A mapping-level `severity_override` / `message` overrides
+the source-level one; otherwise the source-level value is inherited.
+
+In a write-capable build the plugin auto-registers `acknowledge_fault` and
+`confirm_fault` operations on every entity that has at least one `event_alarms`
+entry. The default read-only build offers neither and refuses both - see
+[Read-only and write-capable builds](#read-only-and-write-capable-builds).
+Invoke them with:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/apps/tank_process/operations/acknowledge_fault/executions \
+     -H 'Content-Type: application/json' \
+     -d '{"fault_code":"PLC_OVERPRESSURE","comment":"operator on radio"}'
+```
+
+See `design/index.rst` for the full state machine table and vendor matrix.
+
+### auto_browse (zero-config discovery)
+
+Instead of (or on top of) a hand-written `nodes:` list, the plugin can build
+the SOVD entity tree itself by recursively browsing the connected server's
+address space. This is what makes a discovered endpoint (see the discovery
+plugin) usable with no PLC-specific config at all: `endpoint_url` +
+`auto_browse: true` is enough.
+
+The walk starts at the standard `Objects` folder (`i=85`, which is where the
+OPC-UA DI companion namespace also hangs `DeviceSet`) and recurses forward
+along hierarchical references:
+
+- **Object** nodes become a path segment; an Object becomes its own SOVD App
+  only once it (directly) owns at least one supported Variable - a pure
+  folder Object with only child Objects is walked through but never shows up
+  as an entity of its own. Hierarchy is preserved in the generated
+  `entity_id`/name as a path (e.g. `plc_1_db_test` / `PLC_1 / DB_Test`), not
+  as a separate parent-entity field - the plugin's SOVD model stays the flat
+  Area -> Component -> App tree it already produces from a hand-written node
+  map.
+- **Variable** nodes become data points. Their DataType is read and mapped to
+  a medkit `data_type` (`Boolean`->`bool`; `SByte`/`Byte`/`Int16`/`UInt16`/
+  `Int32`/`UInt32`/`Int64`/`UInt64`->`int`; `Float`/`Double`->`float`;
+  `String`/`DateTime`->`string`); anything else (structured/enumerated/vendor
+  types) is skipped, not guessed at.
+- Noise filtering: ns=0 (the standard/infrastructure namespace - the `Server`
+  object, `ServerCapabilities`, `Types`, `Views`, ...) is denied by default so
+  it never enters the tree, while the DI/vendor namespaces underneath
+  `Objects` are walked normally. A depth limit and a total-node budget bound
+  the walk against a pathological or very large address space; hitting either
+  logs an operator warning that the resulting tree may be incomplete.
+- **The walk itself never writes to the server.** Whether a discovered point is
+  exposed as writable depends on the build and on `infer_writable`: in the
+  default read-only build every auto-discovered point loads with
+  `writable: false` and the server's `CurrentWrite` bit is never read. In a
+  write-capable build `infer_writable` (default `true`) marks a point writable
+  exactly when the server says this session may write it; set it to `false` to
+  require an explicit `nodes:` entry instead.
+- **Explicit config always wins.** An auto-browsed entry for a NodeId that
+  already has a hand-written `nodes:` entry is dropped; auto_browse only fills
+  in what the node map does not already cover (or the whole tree, when there
+  is no node map at all).
+
+Enable it either in the node-map YAML:
+
+```yaml
+auto_browse: true   # all-default knobs (root=Objects folder, depth 8, 5000 nodes, deny ns=0)
+
+# or with explicit knobs:
+auto_browse:
+  enabled: true
+  root_nodes: ["i=85"]        # default: Objects folder. Point elsewhere (e.g. a
+                               # specific DeviceSet/Object) to scope the walk.
+  max_depth: 8                # recursion depth cap from a root (1..64)
+  max_nodes: 5000              # total node budget for the walk (1..200000)
+  namespace_allow: []          # non-empty = only these namespaces are eligible
+  namespace_deny: [0]          # ignored when namespace_allow is set
+  read_initial_values: true    # read each candidate Variable once; drop it if
+                                # the read fails (reachability check)
+```
+
+or purely via the plugin's ROS param / JSON config, which is what lets a
+discovered endpoint go straight to a populated tree with no node-map file:
+
+```yaml
+plugins.opcua.endpoint_url: "opc.tcp://192.168.1.10:4840"
+plugins.opcua.auto_browse.enabled: true
+plugins.opcua.auto_browse.infer_writable: true   # write-capable builds only
+```
+
+`infer_writable` is accepted in both forms - the node-map YAML's `auto_browse:`
+block and the ROS param above. It defaults to `true`, and in a read-only build
+it has no effect: every discovered point stays read-only. Setting it explicitly
+there logs one startup warning naming the setting, so it can be found and
+removed; leaving the key alone logs nothing, because the default is not a
+request anybody made.
+
+The JSON/ROS-param form takes precedence over whatever the node-map YAML's
+`auto_browse:` block set, mirroring how environment variables override the
+rest of the plugin's YAML config.
+
+### Zero-config native A&C (`auto_alarms`)
+
+`event_alarms:` above requires a hand-written mapping per alarm. `auto_alarms`
+needs none: enable it and every AlarmConditionType event on the subscribed
+source (default the Server object, `i=2253` - the same system-wide catch-all
+used in the `event_alarms` examples) becomes a fault automatically, with no
+`condition_name` / `source_node` / `fault_code` mapping to write.
+
+```yaml
+# Bare boolean - all defaults.
+auto_alarms: true
+```
+
+```yaml
+# Map form - every key optional.
+auto_alarms:
+  enabled: true
+  source_node_id: "i=2253"       # EventNotifier to subscribe (default: Server object)
+  entity_id: "plc_alarms"        # fallback SOVD entity (default: "<component_id>_alarms")
+  auto_clear: true               # clear immediately on ActiveState=false, bypassing
+                                  # Acknowledge/Confirm (see below)
+  severity_bands:                # OPC-UA Severity (1-1000) -> SOVD bucket
+    critical: 801
+    error: 501
+    warning: 201
+  include: []                    # substring allow-list on ConditionName/SourceName/Message
+  exclude: ["CPU not in RUN"]    # substring deny-list, checked first
+```
+
+Default `off`. Unknown keys are warned and ignored, not silently dropped.
+
+Instead of (or on top of) the node-map YAML, `auto_alarms` can be set purely
+via the plugin's ROS param / JSON config, which is what lets a discovered
+endpoint go straight to native faults with no node-map file at all:
+
+```yaml
+plugins.opcua.endpoint_url: "opc.tcp://192.168.1.10:4840"
+plugins.opcua.auto_alarms: true   # or the same map form as above
+```
+
+The JSON/ROS-param form takes precedence over whatever the node-map YAML's
+`auto_alarms:` block set (same precedence env vars use for the rest of the
+plugin config). Explicit `event_alarms:` mappings still win over
+auto-derivation at the poller regardless of how `auto_alarms` was enabled.
+This completes the zero-config chain: discovery (endpoint) ->
+`auto_browse` (SOVD tree) -> `auto_alarms` (native faults), each param-driven,
+no node-map file required.
+
+**Fault derivation** (no config, per observed event):
+- `fault_code`: `PLC_ALARM_<slug>_<hash(SourceNode)>` from `ConditionName` when
+  present, else from `SourceName`, else `PLC_ALARM_<hash>` of
+  SourceNode + EventType + Message. The SourceNode is folded into every tier so
+  two distinct conditions sharing a ConditionName/SourceName but sitting on
+  different sources (e.g. two identical FB instances each raising
+  "Overpressure") never collapse onto one code - the fault manager keys/clears
+  by code alone, so a collision would let one condition's clear wipe the
+  other's still-active fault. Message is NOT folded into the slug tiers, so a
+  condition whose Message differs between its active and inactive notifications
+  still maps to one code. The hash tier additionally folds in the Message
+  deliberately - a real Siemens S7-1500 multiplexes every `Program_Alarm` of
+  one FB through a single SourceNode (e.g. `i=1845`) with no
+  ConditionName/SourceName, distinguished only by Message text ("pa" vs "pa2");
+  without the Message in the hash those two alarms would collapse onto one
+  fault_code. A given condition derives its code once (at first observation)
+  and keeps it for its whole lifecycle, so its raise and clear always agree.
+- `entity`: the node-map entity that owns the event's SourceNode when it
+  matches a `nodes:` entry, else `auto_alarms.entity_id`.
+- `severity`: the event's raw `Severity` (1-1000) mapped through
+  `severity_bands`.
+- `description`: the event's `Message`, verbatim.
+
+**System messages:** some servers deliver non-alarm notifications on the same
+EventNotifier as real alarms - a Siemens Server object also emits SIMATIC
+system messages (e.g. `"CPU not in RUN"`) over `i=2253`. Per OPC-UA Part 9
+§5.5.2.13 only a true Condition instance carries a ConditionId; a system
+message resolves it to `NodeId.Null`. The bridge drops those events for every
+alarm source - explicit `event_alarms` (including a source-level `fault_code`
+catch-all) and `auto_alarms` alike - before any mapping resolution or
+auto-derivation, so they never surface as a fault. On an explicit source it also
+logs a one-time warning (a real alarm that genuinely lacks a ConditionId would
+otherwise be dropped silently). Use `exclude` for anything that still needs
+filtering by text (e.g. a server that does set a ConditionId on system
+events).
+
+**Precedence:** explicit `event_alarms` mappings are tried first; `auto_alarms`
+covers whatever they do not match. On the same source (e.g. both configured
+on `i=2253`) no duplicate subscription is created - unmatched events on an
+`event_alarms` source simply fall through to auto-derivation when
+`auto_alarms` is enabled for that source.
+
+**Acknowledge/Confirm:** `auto_clear` (default `true`) clears an auto-derived
+alarm as soon as it goes inactive, bypassing the Acknowledge/Confirm workflow
+entirely - there is no `acknowledge_fault` SOVD operation for a zero-config
+alarm to receive an Ack through, so without this it would latch forever on a
+server that requires one (as most do). Set `auto_clear: false` to require the
+poller's normal Acknowledge/Confirm gating before it clears - since a
+zero-config alarm has no SOVD `acknowledge_fault` operation of its own,
+Acked/Confirmed must come from the OPC-UA server side instead (an HMI/SCADA
+system or another OPC-UA client acknowledging the condition directly).
+
+### Gateway Parameters
+
+```yaml
+ros2_medkit_gateway:
+  ros__parameters:
+    plugins: ["opcua"]
+    plugins.opcua.endpoint_url: "opc.tcp://plc-host:4840/path"
+    plugins.opcua.node_map_path: "/path/to/nodes.yaml"
+    plugins.opcua.poll_interval_ms: 1000
+    plugins.opcua.prefer_subscriptions: false
+    plugins.opcua.auto_browse: true
+    plugins.opcua.auto_alarms: true
+```
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `endpoint_url` | `opc.tcp://localhost:4840` | OPC-UA server endpoint |
+| `node_map_path` | (none) | Path to node map YAML (optional when `auto_browse` or `auto_alarms` is enabled - see above) |
+| `auto_browse` | `false` | Boolean or object; recursively discover the SOVD tree from the live address space instead of (or in addition to) `node_map_path` - see above |
+| `auto_alarms` | `false` | Boolean or object; subscribe a server EventNotifier and auto-derive a fault per AlarmCondition with no per-alarm `event_alarms` mapping - the zero-config native A&C surface (see above) |
+| `poll_interval_ms` | `1000` | Polling interval in ms (clamped to [100, 60000]) |
+| `prefer_subscriptions` | `false` | Use OPC-UA subscriptions instead of polling |
+| `subscription_interval_ms` | `500` | Publishing interval for OPC-UA subscriptions when `prefer_subscriptions: true`. Between two polls the client is also iterated at this interval (at least 20 ms apart, at most once per poll), so changes arrive at this cadence and not once per `poll_interval_ms` |
+| `condition_replay_strategy` | `auto` | Active-condition replay on reconnect: `method`, `read`, `auto`, `off` (see below) |
+| `require_confirm_for_clear` | `true` | Require both Acknowledge AND Confirm before a native alarm auto-clears. Set `false` for Confirm-less servers (e.g. Siemens S7-1500) so alarms clear on Acknowledge alone (see below) |
+| `comms_lost_fault_enabled` | `true` | Raise a component-scoped `PLC_COMMS_LOST` fault when the connection stays down, and clear it on every successful connect (issue #496) |
+| `comms_lost_debounce_ms` | `5000` | Continuous down time before `PLC_COMMS_LOST` is raised (debounces reconnect blips; clamped to [0, 3600000] ms, with a warning) |
+| `comms_lost_severity` | `ERROR` | SOVD severity bucket for the `PLC_COMMS_LOST` fault |
+| `fault_service_timeout_ms` | `5000` | How long a fault-store read may stay outstanding before the `PLC_COMMS_LOST` decision is owed again (out of range [100, 600000] ms is refused with a warning and the previous value is kept) |
+| `discovery.enabled` | `false` | Opt-in read-only PLC network discovery (auto endpoint). See below |
+| `discovery.binding_file` | `/var/lib/ros2_medkit/opcua/binding` | Where the bound server's `ApplicationUri` is kept, so the binding survives a restart. Read and written only while `endpoint_url` is unset. Empty disables persistence and makes every process's first adoption unconstrained. One file per plugin instance. Env: `OPCUA_DISCOVERY_BINDING_FILE` |
+
+### OPC-UA client security (SecurityPolicy, certificates, user auth)
+
+By default the client connects with `SecurityPolicy=None` and an `Anonymous`
+user (unencrypted, unauthenticated). This is fine for an isolated lab LAN but
+not for a hardened server. The following parameters enable a signed/encrypted
+SecureChannel with a client application-instance certificate, a server trust
+store, and a user identity. All are opt-in; leaving them unset reproduces the
+legacy behaviour.
+
+```yaml
+plugins.opcua.security_policy: "Basic256Sha256"       # None | Basic256Sha256 | Aes128Sha256RsaOaep | Aes256Sha256RsaPss
+plugins.opcua.security_mode: "SignAndEncrypt"          # None | Sign | SignAndEncrypt
+plugins.opcua.client_cert_path: "/etc/ros2_medkit/opcua/client_cert.der"  # X.509 v3, DER
+plugins.opcua.client_key_path:  "/etc/ros2_medkit/opcua/client_key.pem"   # private key, PEM
+plugins.opcua.application_uri:  "urn:selfpatch:medkit:opcua-client"        # MUST match the cert SAN URI
+plugins.opcua.trust_list_paths: ["/etc/ros2_medkit/opcua/server_cert.der"]  # DER trust store
+plugins.opcua.reject_untrusted: true                   # false = accept ANY server cert (INSECURE, lab only; not trust-on-first-use, nothing pinned)
+plugins.opcua.user_auth_mode: "UsernamePassword"       # Anonymous | UsernamePassword | X509
+plugins.opcua.username: "medkit"
+plugins.opcua.password: "..."                           # inject from a secret store at deploy time
+plugins.opcua.user_cert_path: "/etc/ros2_medkit/opcua/user_cert.der"  # X509 user token only
+```
+
+Notes:
+- A non-None `security_policy` requires `client_cert_path` + `client_key_path`;
+  a secured connection with no cert fails fast (before contacting the server).
+- `application_uri` must equal the URI entry in the client certificate's
+  SubjectAltName or the server rejects the channel with
+  `BadCertificateUriInvalid`.
+- The client cert (its public part) must be added to the server's trusted
+  client list, and the server cert (DER) added to `trust_list_paths`, unless
+  `reject_untrusted: false`.
+- The encryption backend (OpenSSL) is compiled in; a build without it logs an
+  error and refuses any secured profile.
+
+### Read-only PLC network discovery (auto endpoint)
+
+A diag-box plugged into a plant LAN can auto-find an OPC-UA PLC instead of
+requiring a hand-configured `endpoint_url`. Discovery is **opt-in and disabled
+by default**; enabling it runs a bounded, read-only active scan and hands the
+best OPC-UA data server to the normal connect + introspect path.
+
+```yaml
+plugins.opcua.discovery:
+  enabled: false               # master switch (default false)
+  mode: "active"               # active | passive | both (only active implemented)
+  subnets: ["192.168.1.0/24"]  # CIDR list; empty => derive the host's local /24
+  ports: [4840]                # TCP ports probed (4840 = OPC-UA; others = leads)
+  connect_timeout_ms: 600      # per-port TCP connect timeout
+  scan_concurrency: 100        # bounded, polite concurrent connect count
+  identify_timeout_ms: 6000    # per GetEndpoints identify
+  # re-scan cadence while disconnected. Omit the key for the built-in 30 s,
+  # or set it to 0 to keep discovery on but never re-scan (start-up scan only).
+  interval_s: 30
+  anonymous_none_only: true    # only auto-connect None/Anonymous servers
+  # where the bound server's ApplicationUri is kept across restarts; "" disables
+  binding_file: /var/lib/ros2_medkit/opcua/binding
+```
+
+Environment overrides (Docker / appliance): `OPCUA_DISCOVERY_ENABLED`,
+`OPCUA_DISCOVERY_SUBNETS` (comma-separated CIDRs), `OPCUA_DISCOVERY_INTERVAL_S`,
+`OPCUA_DISCOVERY_BINDING_FILE`.
+Leaving `interval_s` (and `OPCUA_DISCOVERY_INTERVAL_S`) unset means "no cadence
+stated" and takes the 30 s default. An explicit `0` is honoured as written and
+turns the recurring sweep off. A negative value is refused with a warning and
+leaves the cadence unset.
+
+How it works:
+1. Bounded concurrent TCP connect sweep of the configured ports across the
+   subnet (nothing beyond a connect - no payload sent to non-OPC-UA ports).
+2. For each open `:4840`, a read-only OPC-UA `GetEndpoints` identify extracts
+   the endpoint URL, ApplicationUri, ProductUri, security policies, and whether
+   a None/Anonymous endpoint is offered.
+3. Results are deduplicated by ApplicationUri (fallback ip:port) and classified:
+   OPC-UA **data server** (ApplicationType 0/2, browseable) vs **discovery
+   server / LDS** (type 3, never browsed) vs **non-OPC-UA lead** (e.g. an open
+   `:102` S7comm port, recorded but not identified).
+4. When discovery is on **and no `endpoint_url` is configured**, the plugin
+   auto-selects the best None/Anonymous data server (deterministic, lowest
+   ip:port) and connects to the **scanned ip:port** - not the advertised
+   EndpointUrl, which a server may report as a non-resolvable hostname.
+5. While no session is established, the reconnect loop scans again every
+   `interval_s` (default 30 s), measured from the END of the previous sweep, and
+   adopts the server it is **bound** to at whatever address it now answers on,
+   logging the swap at INFO. The re-scan is consulted once per reconnect attempt, and those are
+   spaced by an exponential backoff, so the backoff ceiling is capped at
+   `interval_s` while discovery is re-scanning, which is what makes the stated
+   cadence the real one: uncapped it would be `max(interval_s, backoff)`. This
+   covers the common race where the gateway and the PLC boot together: the
+   startup scan finds nothing because the PLC is still coming up, and without a
+   re-scan the plugin would retry the fallback endpoint until someone restarted
+   it.
+6. On the first session after such an adoption, a config-less deployment (no
+   node map) re-derives the SOVD component identity from the device itself, so
+   the component stops being served under the provisional `opcua-<host>` name it
+   got when nothing answered. The change is logged at INFO. A rename the connect
+   hook makes happens before the session subscribes, so the conditions the
+   server replays are hosted on the new entity; a rename a later poll makes
+   happens after, which is the residual described below.
+
+   The rename is ruled by what the read produced. A device nameplate takes over
+   from an `opcua-<host>` stand-in; a name the device gave us keeps its place. A
+   read without a nameplate moves one stand-in to another, which is the adoption
+   case where the endpoint changed, and leaves a device-given name alone: the
+   first device-info read of a fresh session can come back empty while the PLC's
+   address space is still filling in.
+
+   The read budget is: **one read at connect** (in `set_context`, for the first
+   session), then per session **up to four in the connect hook** - the first
+   plus three more, 250 ms apart - and **up to five poll reads**. A first
+   session therefore costs at most 1 + 4 + 5 = 10 reads, and every later one at
+   most 9. After that the stand-in stands for the session, and the question is
+   asked again on the next one. A shutdown ends the connect burst without
+   waiting it out and without renaming: the residual is up to one 250 ms pause
+   plus one device-info read already in flight. Plugin start-up pays the burst
+   once, and only when the device answers the first read without a nameplate.
+
+   The stand-ins a fault can have been reported under are the **first eight
+   distinct** ones a process assigns; a stand-in re-adopted later keeps its
+   place.
+
+   When the rename happens, the alarm routing the event path uses is refreshed
+   and the conditions the poller already pinned are moved to the new
+   `<component_id>_alarms` entity. One residual: a condition that changes state
+   between its pin and the rename is reported once under the old entity.
+
+### What the plugin is bound to
+
+The **binding** is the OPC-UA `ApplicationUri` of the server the plugin actually
+held a session with, read off that session (the `ServerArray`, whose first entry
+is that URI). On the discovery path it is written to `discovery.binding_file`
+(default `/var/lib/ros2_medkit/opcua/binding`) the moment it is established and
+read back in `configure()` before the first sweep, so it **is kept across
+restarts**: a process that comes back looks for the server it was bound to and
+no other. With `endpoint_url` configured the file is neither read nor written:
+the operator has named the server, and re-pointing `endpoint_url` at a
+replacement and restarting is the whole gesture.
+
+- The **start-up sweep and every re-scan look for that server and no other**,
+  at any address: the bound `ApplicationUri` is an input to the selection, so a
+  foreign server does not win by sorting lower. A sweep that finds no hit
+  carrying it selects nothing, the endpoint stands and the `PLC_COMMS_LOST`
+  fault stands with it.
+- A **different server at the bound address** is caught when a session comes
+  up: the live `ApplicationUri` is read, the mismatch is logged at WARN, the
+  session is dropped, no link-state clear is sent, and the reconnect loop keeps
+  trying. The check runs on every session the reconnect arm opens. A session
+  open62541 re-opens on its own after a channel drop is caught wherever
+  `run_iterate` runs, which is every shape with native alarms on, or
+  data-change subscription mode active (the event pump, the poll cycle and,
+  in subscription mode, the steps between two polls all iterate): after each
+  iterate the client reads its session state, and a session that fell below
+  ACTIVATED after having been active is disconnected explicitly, so the next
+  session is the arm's, checked against the binding, with the native alarm
+  and data-change subscriptions re-created on it.
+  That is what makes a swap visible where nothing reads a value: the
+  config-less deployment with native alarms and no node map, at any poll
+  cadence. open62541 re-opens a session only from `run_iterate`, so with native
+  alarms off in poll mode nothing is re-opened underneath: a node map's scalar read fails
+  with a connection-closed code, the client is marked down, and the arm's next
+  session is checked the same way. The re-created subscription carries device
+  alarms; that is proven for a swap followed by the bound server's return and
+  for a plain reboot of the bound server, both config-less with native alarms.
+- While a foreign server answers at the bound address, the reconnect arm probes
+  that address at the backoff cadence (capped at `discovery.interval_s` while
+  re-scanning is on), refuses the foreign server each time, and adopts the
+  bound server the moment it answers there again. The plugin remembers the last
+  eight refused URIs and logs a URI once while it is remembered; the list is
+  cleared as soon as the bound server is reached.
+- A PLC that **moved** - new address, same `ApplicationUri` - is re-adopted,
+  which is what the re-scan is for.
+- **Replacing a PLC is a recommissioning**. On the discovery path: remove the
+  binding file (or set `discovery.binding_file` to an empty string) and
+  restart; the refusal WARN names the file. With `endpoint_url` configured:
+  point it at the new PLC and restart. Adopting a different PLC silently would
+  re-point every SOVD entity at hardware nobody asked for and would clear the
+  outage as if the link had healed.
+
+The binding is kept across restarts; removing the file and restarting clears
+it. The binding that was loaded, and the file it came from, are logged at INFO
+on start.
+
+A persisted URI naming a server that is nowhere on the subnet keeps the plugin
+disconnected: it re-scans at the cadence, reports a foreign server once while
+it is among the last eight refused, and holds the outage. There is no expiry -
+an identity that moved silently
+is the thing this exists to catch.
+
+An operator-configured `endpoint_url` runs no discovery and neither reads nor
+writes the binding file. Its binding lives in memory for the life of the
+process: after a drop, a server at the configured address that answers with a
+different `ApplicationUri` is refused until the plugin restarts, and the next
+process binds to whichever server answers there first.
+
+Two cases have no binding, and in each the next adoption is unconstrained:
+
+1. Nothing has ever been connected and no binding file was found.
+2. A server that publishes **no `ApplicationUri`**: there is nothing to bind to,
+   so after a drop a re-scan accepts whichever server answers. This is logged at
+   WARN when such a server is adopted, and nothing is written to the file. Such
+   a server is adoptable only while no binding is held; with a binding it is
+   refused like any other mismatch.
+
+The file holds one line, the URI. A UTF-8 byte-order mark and surrounding
+whitespace are stripped, a CRLF line ending is accepted, and anything after the
+first line is ignored. A first line holding a NUL or another control character
+is refused with a WARN naming the file and reads as no binding. A URI holding a
+line break is refused at the write with a WARN, since it would read back
+truncated. The file is written through a temporary in the same directory that
+is flushed to disk before it is renamed over the path; a path that is a symlink
+is followed, so its target is what gets replaced. A binding that cannot be
+written - a directory that cannot be created or is not writable - is reported
+at WARN naming the path. The session is unaffected; what is lost is the next
+process's constraint.
+
+The file belongs to **one plugin instance**. A second gateway on the same host,
+or a second instance of this plugin in one gateway, bound to a different PLC
+must set its own `discovery.binding_file`; two instances on the default path
+overwrite each other's binding. The shipped image creates
+`/var/lib/ros2_medkit` for the fault manager database and declares no volume
+for it, so a binding that has to outlive a re-created container needs that
+directory mounted (`docker restart` keeps the writable layer; a new
+`docker run` starts without it).
+
+Re-scanning stops as soon as a session is up, and never starts at all when an
+`endpoint_url` is configured.
+
+Safety / OT posture:
+- Everything is read-only: TCP connect + `GetEndpoints` only. No writes, no
+  subscriptions, no second long-lived session.
+- The scan is NOT one-shot: while the plugin has no session it repeats every
+  `interval_s` (default 30 s) for as long as it stays disconnected. Set
+  `interval_s: 0` (or `OPCUA_DISCOVERY_INTERVAL_S=0`) to keep discovery on with
+  the start-up scan only, or `enabled: false` to switch it off entirely.
+- A sweep is cancellable, so a stop does not have to wait out a subnet the size
+  of a /16. The start-up sweep runs while the gateway node is still being
+  constructed, so what ends it is `SIGINT` / `SIGTERM`. `gateway_node` holds
+  both signals back until startup ends, and the plugin sees one that is pending.
+  The gateway then exits. A re-scan sweep runs on the poll thread and is ended by
+  a signal through `rclcpp::ok()` or by the plugin's own `shutdown()`.
+- An explicitly configured `endpoint_url` (or `OPCUA_ENDPOINT_URL`) always wins;
+  discovery then does nothing, so it never opens a second session on a PLC the
+  plugin already polls.
+- Secured-only servers (no None/Anonymous endpoint) are surfaced in the log as
+  leads requiring operator credentials - never auto-connected or probed. A
+  re-scan whose outcome has not changed reports at DEBUG, so a recurring sweep
+  does not bury the rest of the log under the same report.
+- The scan is bounded (short connect timeout, capped concurrency) and CIDRs
+  wider than /16 are rejected to prevent an accidental broad sweep.
+
+Note on passive discovery: a stock Siemens S7-1500 neither multicast-announces
+(mDNS `_opcua-tcp._tcp`) nor registers with an OPC-UA LDS, so passive sources
+find nothing there; the active scan is what discovers it. Passive mDNS / LDS
+`FindServers` sources (useful on Kepware / Prosys / GDS estates) and
+multi-endpoint registration are planned follow-ups. This iteration delivers the
+active-scan core and a single "auto endpoint" mode.
+
+### Active-condition replay on reconnect (issue #389/#478)
+
+When the gateway (re)subscribes after a drop or restart, conditions that are
+already active on the server would otherwise not be re-reported (only live
+transitions flow). The standard recovery is OPC-UA `ConditionRefresh`. Per
+Part 9 §5.5.7 it is a method of the **ConditionType** node (`i=2782`), so the
+Call is issued there (not the Server object) - calling it on the Server object
+was the root cause of `BadNodeIdUnknown` rejections, including on Siemens
+S7-1500, which documents `ConditionRefresh` as supported (only the optional
+`ConditionRefresh2` is not). With the corrected target, `ConditionRefresh` is
+expected to work on conformant servers and the read fallback should rarely be
+needed. The `condition_replay_strategy` parameter controls recovery:
+
+| Value | Behaviour |
+|-------|-----------|
+| `method` | Call `ConditionRefresh` only (warns if rejected) |
+| `read` | Skip the method; browse each `alarm_source`, read current condition state, reconcile the fault set |
+| `auto` (default) | Try `ConditionRefresh`; on rejection fall back to `read` |
+| `off` | No replay (only live transitions surface) |
+
+The read fallback browses each `alarm_source` for AlarmCondition instances -
+both hierarchical Object children and targets of the `HasCondition` reference
+(`i=9006`), recursing one level - and reads their state. It mirrors
+`ConditionRefresh` semantics: only conditions with `Retain==true` form the
+active set, a `Disabled` condition (`EnabledState/Id=false`) is never treated
+as active, and a transient read failure keeps the condition rather than
+dropping it.
+
+**Safety guarantee (#478):** the read fallback NEVER clears a tracked fault for
+a source that has not positively exposed at least one Condition instance node.
+An EventNotifier-only server (e.g. S7-1500, which models no per-condition
+instance nodes) makes the browse return zero conditions; rather than wiping the
+active alarm set, the gateway preserves the last-known faults, logs an operator
+warning that read-fallback is unsupported on this server, and keeps live
+transitions flowing. Use `ConditionRefresh` (`method`/`auto`) on such servers.
+The read fallback does not recover the live `EventId`, so an operator
+ack/confirm may need the next live event before it succeeds.
+
+### Confirm-less servers and `require_confirm_for_clear` (issue #478)
+
+By default a native alarm auto-clears only after the operator has both
+Acknowledged AND Confirmed it (OPC-UA Part 9 §5.7). Some servers do not
+implement the optional `Confirm` transition - Siemens S7-1500 supports
+`Acknowledge` / `ConditionRefresh` / `AddComment` but not `Confirm`, so
+`ConfirmedState` never becomes true and an inactive alarm would latch forever.
+Set `require_confirm_for_clear: false` (or `OPCUA_REQUIRE_CONFIRM_FOR_CLEAR=0`)
+so the alarm clears on `Acknowledge` alone. The default (`true`) is unchanged
+and spec-strict; the relaxed path still requires acknowledgement and needs
+real-S7-1500 validation.
+
+### Connection loss and `PLC_COMMS_LOST` (issue #496)
+
+When the OPC-UA connection stays down for `comms_lost_debounce_ms` continuously,
+the plugin raises one component-scoped `PLC_COMMS_LOST` fault (a shorter blip
+during a normal reconnect does not flap it).
+
+Every successful connect - the initial one and every later reconnect - puts a
+decision about the standing `PLC_COMMS_LOST` on the poll thread. The fault
+manager keys faults by fault code and persists them, which cuts both ways: a
+fault raised before a gateway restart is still standing while the new process
+has no memory of it, so the decision cannot rest on this process's own memory;
+and a gateway that also loads another field-bus bridge shares the one
+`PLC_COMMS_LOST` code with it, so this link coming back says nothing about the
+other bridge's link.
+
+So the plugin asks the fault manager who reported the standing fault, and clears
+it only when **every** reporting source is an id this process could have
+reported under: the component id it serves, the last few `opcua-<host>` stand-ins
+it assigned in this process, the stand-ins of the endpoint it started on and of
+the one it is connected to, and the node-map default a YAML without a
+`component_id` reports under. The endpoint stand-ins cover a previous process
+that never reached its PLC: it reported under the stand-in of the configured
+`endpoint_url`, or of the client default `opc.tcp://localhost:4840` when
+discovery had found nothing, and the next process derives the same id from the
+same configuration. A PLC that changed address between the two processes is not
+covered: that row is cleared by an operator. `ClearFault` carries no source and clears the whole
+row, so a fault whose sources include a foreign one is left standing and the
+decision is logged at INFO. A `PLC_COMMS_LOST` that two bridges raised is cleared
+by an operator; the fault manager has no per-source de-assert.
+
+The decision is driven from the poll thread and only while the session is up, so
+a clear is never sent against a link that is down; an answer that arrives after
+the link dropped is held until the next connect. A store that cannot be reached,
+a probe that goes unanswered within `fault_service_timeout_ms`, and a clear the
+bounded pending-dispatch buffer had to give up under load all leave the decision
+owed, and the next poll takes it again.
+
+Node map entries also support an optional `ros2_topic` field to override the auto-generated ROS 2 topic name for the PLC value bridge:
+
+```yaml
+nodes:
+  - node_id: "ns=2;i=1"
+    entity_id: tank_process
+    data_name: tank_level
+    ros2_topic: /custom/plc/tank_level   # optional, overrides auto-generated /plc/tank_process/tank_level
+```
+
+### Operation Naming Convention
+
+Write operations use the `set_` prefix convention:
+- Node map defines `data_name: pump_speed`
+- REST operation: `POST /apps/fill_pump/x-plc-operations/set_pump_speed`
+- The `set_` prefix is stripped to find the matching node map entry
+- Operations without `set_` prefix also work (matches `data_name` directly)
+
+### Environment Variables (override YAML config)
+
+| Variable | Description |
+|----------|-------------|
+| `OPCUA_ENDPOINT_URL` | OPC-UA server URL |
+| `OPCUA_NODE_MAP_PATH` | Path to node map YAML |
+| `OPCUA_SECURITY_POLICY` | `None` / `Basic256Sha256` / `Aes128Sha256RsaOaep` / `Aes256Sha256RsaPss` |
+| `OPCUA_SECURITY_MODE` | `None` / `Sign` / `SignAndEncrypt` |
+| `OPCUA_CLIENT_CERT` / `OPCUA_CLIENT_KEY` | Client cert (DER) / key (PEM) paths |
+| `OPCUA_APPLICATION_URI` | Client application URI (must match cert SAN) |
+| `OPCUA_TRUST_LIST` | Colon-separated DER trust-store paths |
+| `OPCUA_REJECT_UNTRUSTED` | `false`/`0`/`no` to accept any server cert (lab only) |
+| `OPCUA_USER_AUTH` | `Anonymous` / `UsernamePassword` / `X509` |
+| `OPCUA_USERNAME` / `OPCUA_PASSWORD` | Username-password identity |
+| `OPCUA_USER_CERT` | X.509 user-token cert (DER) |
+| `OPCUA_CONDITION_REPLAY` | `method` / `read` / `auto` / `off` |
+| `OPCUA_REQUIRE_CONFIRM_FOR_CLEAR` | `0`/`false`/`no`/`off` to clear native alarms on Acknowledge alone (Confirm-less servers) |
+| `OPCUA_COMMS_LOST_ENABLED` | `0`/`false`/`no`/`off` to disable the `PLC_COMMS_LOST` fault |
+| `OPCUA_COMMS_LOST_DEBOUNCE_MS` | Continuous down time (ms) before `PLC_COMMS_LOST` is raised. A value above 3600000 ms is clamped, with a warning, as on the JSON path; a non-numeric or negative value is refused with a warning and the existing value is kept |
+| `OPCUA_DISCOVERY_BINDING_FILE` | Path the bound server's `ApplicationUri` is kept in while `endpoint_url` is unset (empty disables persistence) |
+
+## Hardware Deployment
+
+### Robot + PLC on the same LAN
+
+```
+┌──────────────┐  WiFi/ETH  ┌──────────────┐  ETH  ┌──────────────┐
+│  Robot       │◄───────────►│  Edge RPi    │◄─────►│  PLC         │
+│  (Jetson)   │             │              │       │  (Siemens/   │
+│              │             │  Fleet GW    │       │   Beckhoff/  │
+│  ros2_medkit │             │  :9090       │       │   OpenPLC)   │
+│  :8080       │             │              │       │              │
+└──────────────┘             │  ros2_medkit │       │  OPC-UA      │
+                             │  + OPC-UA    │       │  :4840       │
+                             │  plugin      │       └──────────────┘
+                             │  :8080       │
+                             └──────────────┘
+```
+
+Fleet gateway aggregates robot and PLC diagnostics. Operator sees both in one dashboard.
+
+### Robot directly connected to PLC
+
+```
+┌──────────────────────┐  ETH  ┌──────────────┐
+│  Robot               │◄─────►│  PLC         │
+│                      │       │  OPC-UA :4840│
+│  ros2_medkit gateway │       └──────────────┘
+│  + OPC-UA plugin     │
+│  :8080               │
+│                      │
+│  ROS 2 nodes + PLC   │
+│  in one entity tree  │
+└──────────────────────┘
+```
+
+Plugin runs on the robot itself. ROS 2 faults and PLC alarms appear side by side.
+
+### Compatible PLCs
+
+Any PLC with an OPC-UA server works out of the box:
+
+| PLC | OPC-UA Support | Notes |
+|-----|---------------|-------|
+| Siemens S7-1500 | Built-in | Most common in EU industry |
+| Allen-Bradley CompactLogix | Built-in | Common in US |
+| Beckhoff TwinCAT | Built-in | Popular in motion control |
+| Schneider M340/M580 | Built-in | Process automation |
+| OpenPLC v4 | Plugin (asyncua) | Open-source, used in our demo |
+| Older PLCs (S7-300, etc.) | Via Modbus->OPC-UA bridge | Requires additional software |
+
+### What you need
+
+1. PLC with OPC-UA server enabled (most modern PLCs have this)
+2. Network connectivity between robot/edge device and PLC (Ethernet, same subnet)
+3. Node map YAML matching your PLC program variables
+4. See Security Limitations below regarding OPC-UA auth
+
+### What you DON'T need
+
+- No ROS 2 on the PLC
+- No modification to the PLC program
+- No special hardware adapters
+- No proprietary PLC software licenses
+
+## Development
+
+### Build
+
+```bash
+# From ros2_medkit repo root
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select ros2_medkit_opcua
+colcon test --packages-select ros2_medkit_opcua
+
+# Write-capable variant (default is read-only)
+colcon build --packages-select ros2_medkit_opcua \
+  --cmake-args -DMEDKIT_OPCUA_READ_ONLY=OFF
+colcon test --packages-select ros2_medkit_opcua
+```
+
+`test_opcua_build_variant` inspects the built `.so` with `nm` and asserts it
+matches the variant it was configured for, so the same `colcon test` command
+checks the opposite property in each build.
+
+### Docker Integration Tests
+
+The plugin ships a self-contained OpenPLC tank demo in `docker/` that exercises the full stack end-to-end. CI runs this suite on every PR that touches the plugin; it is also runnable locally from any developer laptop.
+
+`MEDKIT_OPCUA_VARIANT` selects the write surface of the image under test and
+the expectations applied to it, so the two cannot drift. CI runs both legs.
+
+```bash
+cd src/ros2_medkit_plugins/ros2_medkit_opcua/docker
+
+# Start OpenPLC + gateway (builds everything). Default: the read-only image.
+bash scripts/start.sh
+MEDKIT_OPCUA_VARIANT=write-capable bash scripts/start.sh
+
+# Manual testing
+curl -s http://localhost:8080/api/v1/apps/tank_process/x-plc-data | jq .
+
+# Automated tests against a running pair
+bash scripts/run_integration_tests.sh
+MEDKIT_OPCUA_VARIANT=write-capable bash scripts/run_integration_tests.sh
+
+# Build, start, test and clean up in one go
+bash scripts/test_all.sh
+MEDKIT_OPCUA_VARIANT=write-capable bash scripts/test_all.sh
+
+# Stop
+bash scripts/stop.sh
+```
+
+A separate scenario covers the config-less discovery start-up race, which the
+suite above cannot see because it pins `OPCUA_ENDPOINT_URL` and so
+short-circuits discovery. It starts the gateway before any server, with
+discovery on and no endpoint configured, then brings a server up and asserts
+the gateway adopts it without a restart:
+
+```bash
+bash src/ros2_medkit_plugins/ros2_medkit_opcua/docker/scripts/run_discovery_race_test.sh
+```
+
+### Test Coverage
+
+| Category | read-only | write-capable | What it validates |
+|----------|-----------|---------------|-------------------|
+| Entity discovery | 5 | 5 | Areas, components, apps from PLC node map |
+| PLC connection | 3 | 3 | OPC-UA connected, zero errors, and `write_capable` matching the image's build |
+| Live data | 3 | 3 | Tank level, temperature, pressure have values |
+| Advertised write surface | 2 | 2 | x-plc-operations capability and the set_* operation, absent / present |
+| Write control | 6 | 3 | read-only: the vendor route 404s, the SOVD write is refused with the vendor code and a message naming the build property, and both tags read back unchanged on the PLC. write-capable: pump speed and valve position written, pump speed read back |
+| Error handling | 8 | 8 | Both variants, one case per layer: an unknown entity on the vendor data route is 404 `entity-not-found`, from the plugin handler's own call into the gateway's entity validator, and a malformed body on `PUT /data` is 400 `invalid-request` from the gateway's data handler, which parses the body before delegating the write. read-only: an unknown data point read back as the plugin's own 404, and a write to an unknown point refused as the build before any lookup. write-capable: the vendor route names the operation it could not find, and parses the body itself |
+| SOVD /data | 2 | 2 | The standard data collection serves the same points |
+| **Total** | **29** | **26** | |
+
+## Security
+
+The client supports a signed/encrypted SecureChannel (`SecurityPolicy`
+Basic256Sha256 / Aes128 / Aes256, `MessageSecurityMode` Sign / SignAndEncrypt),
+a client application-instance certificate, a server trust store with
+reject-untrusted, and user identity (Anonymous / Username-Password / X.509).
+See "OPC-UA client security" above for configuration.
+
+**The default remains `SecurityPolicy=None` + `Anonymous` (unencrypted,
+unauthenticated)** for backward compatibility and isolated-LAN demos; enable a
+secured profile for any network exposed to untrusted traffic. The plugin logs
+the effective security profile at startup and warns when running unsecured or
+with `reject_untrusted: false`.
+
+Northbound (gateway REST) hardening is documented separately in the gateway's
+`design/hardening.rst` and the `gateway_params.secure.yaml` field profile.
+
+Write operations include configurable `min_value`/`max_value` range validation to prevent out-of-range values being sent to PLC actuators.
+
+## Alarm-to-Fault Bridge
+
+PLC alarms (threshold-based) are automatically mapped to SOVD faults:
+
+```
+PLC variable (e.g., TankTemperature = 95C)
+    │
+    ▼  threshold check (> 80C)
+Alarm active: PLC_HIGH_TEMP
+    │
+    ▼  ROS 2 service call
+ros2_medkit fault_manager
+    │
+    ▼  appears in SOVD API
+GET /api/v1/apps/tank_process/faults
+  -> [{fault_code: "PLC_HIGH_TEMP", severity: "ERROR", ...}]
+```
+
+When the value returns below threshold, the plugin calls the fault manager's
+`~/clear_fault` service (`/fault_manager/clear_fault`) for that fault code. That
+is the same service an operator's
+`DELETE /api/v1/apps/{app_id}/faults/{fault_code}` ends up calling, so a device
+de-assert is a clear like any other. It drops the fault's value snapshots unless
+`snapshots.retain_on_clear` is set, and its rosbag recording unless
+`snapshots.rosbag.auto_cleanup` is off or `snapshots.rosbag.max_bags_per_fault`
+keeps a history.
+
+## Key Design Decisions
+
+- **Poll mode by default** - OPC-UA subscriptions require a client event loop thread. Polling at 1s interval is simpler and sufficient for diagnostics use cases.
+- **Type-aware writes** - Plugin reads the OPC-UA node's data type before writing to avoid type mismatches (e.g., writing float32 to a REAL node, not float64).
+- **Node map driven** - All entity mapping is in YAML config, not code. Same plugin binary works with any PLC by changing the config file.
+- **Env var overrides** - `OPCUA_ENDPOINT_URL` and `OPCUA_NODE_MAP_PATH` override YAML config for Docker deployment flexibility.
+- **Fault-service clients on the plugin's own thread** - the `ReportFault`, `ClearFault` and `GetFault` clients live in a callback group the gateway's executor never collects and are pumped by a thread the plugin owns, so they are created, dispatched and destroyed on the plugin's threads; a plugin shut down while another creates an entity on the same node never runs a client destructor on a gateway executor thread.
+- **Read-only is a build property, not a setting** - the shipped binary contains no OPC-UA write path, and CI proves it by inspecting the object rather than by reading a configuration value. A setting can be flipped on a running box; an absent symbol cannot.
+
+## License
+
+Apache License 2.0. See the `LICENSE` file at the repository root for the full text.
+
+Copyright 2026 mfaferek93
+
+## Third-party Dependencies
+
+| Library | License | Notes |
+|---------|---------|-------|
+| [open62541pp](https://github.com/open62541pp/open62541pp) v0.16.0 | MPLv2 | OPC-UA C++ client, linked as library (no source modification) |
+| [nlohmann/json](https://github.com/nlohmann/json) | MIT | JSON serialization |
+| [yaml-cpp](https://github.com/jbeder/yaml-cpp) | MIT | Node map YAML parser |
+| [OpenSSL](https://www.openssl.org/) | Apache-2.0 | TLS support for OPC-UA secure channels |
+
+MPLv2 is a weak copyleft license that permits linking from Apache-2.0 code without triggering source disclosure obligations for the linking application, as long as the MPLv2-licensed library itself is not modified.
+
+## Contributing
+
+Issues and pull requests welcome through the main [ros2_medkit](https://github.com/selfpatch/ros2_medkit) repository. See the project-level `CONTRIBUTING.md` for coding style, test expectations, and review process.
