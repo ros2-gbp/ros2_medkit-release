@@ -1,0 +1,39 @@
+ros-humble-ros2-medkit-sovd-service-interface (0.7.2-1jammy) jammy; urgency=high
+
+  * No changes. Version aligned with the rest of the stack
+
+ -- "bburda" <bartoszburda93@gmail.com>  Thu, 19 Nov 2026 00:00:00 -0000
+
+ros-humble-ros2-medkit-sovd-service-interface (0.7.1-1jammy) jammy; urgency=high
+
+  * No changes. Version aligned with the rest of the stack
+
+ -- "bburda" <bartoszburda93@gmail.com>  Wed, 18 Nov 2026 00:00:00 -0000
+
+ros-humble-ros2-medkit-sovd-service-interface (0.7.0-1jammy) jammy; urgency=high
+
+  * A cyclic-subscription request naming a resource path the collection cannot stream is refused instead of being accepted and never delivering
+  * The sampler declaration stays inside the gateway, so the service interface no longer carries a second copy of it
+  * Build and test only: the package is instrumented for coverage (#582 <https://github.com/selfpatch/ros2_medkit/pull/582>), and its tests take a DDS domain at run time from the shared allocator (#597 <https://github.com/selfpatch/ros2_medkit/pull/597>)
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Thu, 27 Aug 2026 00:00:00 -0000
+
+ros-humble-ros2-medkit-sovd-service-interface (0.6.0-1jammy) jammy; urgency=high
+
+  * ``list_entity_faults`` handles a fault ``status`` returned as an object (not just a string), supporting peer-fault aggregation across daisy-chained gateways (#419 <https://github.com/selfpatch/ros2_medkit/pull/419>)
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Mon, 22 Jun 2026 00:00:00 -0000
+
+ros-humble-ros2-medkit-sovd-service-interface (0.5.0-1jammy) jammy; urgency=high
+
+  * Initial release - gateway plugin that exposes the medkit entity tree and fault data over standard ROS 2 services, so other ROS 2 nodes can query entities and faults without going through the HTTP API (#330 <https://github.com/selfpatch/ros2_medkit/issues/330>)
+  * Creates ROS 2 services under a configurable prefix (default ``/medkit``): ``list_entities``, ``list_entity_faults``, and ``get_capabilities``; a ``get_entity_data`` service is also registered but currently returns "not implemented" (use the HTTP REST API for topic data) pending (#351 <https://github.com/selfpatch/ros2_medkit/issues/351>)
+  * Runs as a gateway MODULE plugin with read-only ``PluginContext`` access to the entity cache and fault manager; implements no provider interfaces
+  * Shutdown guards and ``noexcept`` destructors reset ROS resources before member destruction to prevent teardown crashes
+  * Contributors: @bburda, @mfaferek93
+
+ -- "bburda" <bartoszburda93@gmail.com>  Mon, 08 Jun 2026 00:00:00 -0000
+
+
