@@ -1,207 +1,172 @@
-<!-- The logo, header and diagram live in the selfpatch/.github repository (profile/design/ros2_medkit.html), so this repository carries no image binaries. Change them there, and keep each image's alt text here in step with its words. -->
+# ros2_medkit_integration_tests
 
-<a href="https://selfpatch.ai"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/logo-dark.png"><img src="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/logo-light.png" alt="selfpatch.ai" height="30"></picture></a>
+Integration tests, demo nodes, and shared test utilities for ros2_medkit.
 
-<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/header-dark.png"><img src="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/header-light.png" alt="ros2_medkit: see what broke on any ROS 2 robot, from one REST API." width="100%"></picture>
+## Overview
 
-[![CI](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml/badge.svg)](https://github.com/selfpatch/ros2_medkit/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/selfpatch/ros2_medkit/branch/main/graph/badge.svg)](https://codecov.io/gh/selfpatch/ros2_medkit)
-[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://selfpatch.github.io/ros2_medkit/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![ROS 2 Jazzy | Humble | Lyrical](https://img.shields.io/badge/ROS%202-Jazzy%20%7C%20Humble%20%7C%20Lyrical-blue)](https://docs.ros.org/en/jazzy/)
-[![Discord](https://img.shields.io/badge/Discord-Join%20Us-7289DA?logo=discord&logoColor=white)](https://discord.gg/6CXPMApAyq)
+This package contains everything needed to validate the ros2_medkit system
+end-to-end:
 
-ros2_medkit gives your ROS 2 robot a diagnostics REST API. It finds every node, topic, service and
-action by itself, and turns failures - error logs, failed actions, `/diagnostics` - into clear
-faults: what broke, where, how bad, with a snapshot and a rosbag of the moment it happened.
-No changes to your code.
+- **Demo nodes** -- automotive-themed C++ nodes (sensors, actuators, services,
+  actions) that produce realistic ROS 2 traffic for testing
+- **Feature tests** -- focused tests that validate individual API features
+  (data access, operations, faults, SSE, CORS, auth, etc.)
+- **Scenario tests** -- end-to-end stories that exercise multi-step workflows
+  (fault lifecycle, action execution, discovery modes, subscriptions, etc.)
+- **Shared test library** (`ros2_medkit_test_utils`) -- base test case,
+  launch helpers, and assertion utilities shared across all test files
 
-<a name="run-it-in-5-minutes"></a>
+## Package Structure
 
-## Quick start
+```
+ros2_medkit_integration_tests/
+  demo_nodes/           # C++ demo node sources
+  launch/               # demo_nodes.launch.py
+  ros2_medkit_test_utils/
+    __init__.py
+    constants.py        # DEFAULT_PORT, timeouts
+    coverage.py         # GCOV_PREFIX helpers for CI
+    gateway_test_case.py  # GatewayTestCase base class
+    launch_helpers.py   # create_test_launch(), DEMO_NODE_REGISTRY
+  test/
+    features/           # Focused API feature tests
+    scenarios/          # End-to-end workflow tests
+```
 
-1. Get [Docker](https://docs.docker.com/get-started/get-docker/), if you don't have it yet.
-
-2. While your robot is running, start ros2_medkit on its computer:
-
-   ```bash
-   docker run --rm --network host --ipc host \
-     -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}" \
-     -e RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}" \
-     ghcr.io/selfpatch/ros2_medkit-jazzy:latest \
-     ros2 launch ros2_medkit_gateway bringup.launch.py
-   ```
-
-   On Humble or Lyrical, change `jazzy` to `humble` or `lyrical`.
-
-3. See what it found:
-
-   ```bash
-   curl localhost:8080/api/v1/apps     # every node on your robot
-   curl localhost:8080/api/v1/faults   # everything that has failed
-   ```
-
-   Or browse the whole API at [localhost:8080/api/v1/docs](http://localhost:8080/api/v1/docs).
-
-> [!TIP]
-> That's it. ros2_medkit is now watching your robot, and every new failure shows up as a fault.
-
-**No robot at hand?** The sensor demo runs on any laptop and lets you break things on purpose
-(it needs `curl` and `jq`):
+## Running Tests
 
 ```bash
-git clone https://github.com/selfpatch/selfpatch_demos.git
-cd selfpatch_demos/demos/sensor_diagnostics
-./run-demo.sh     # web UI on http://localhost:3000
-./inject-nan.sh   # break a sensor, then watch the fault appear
+# Build everything
+colcon build --symlink-install
+source install/setup.bash
+
+# All integration tests
+colcon test --packages-select ros2_medkit_integration_tests
+colcon test-result --verbose
+
+# Single test
+colcon test --packages-select ros2_medkit_integration_tests \
+  --ctest-args -R test_data_read
+
+# Feature tests only
+colcon test --packages-select ros2_medkit_integration_tests \
+  --ctest-args -L feature
+
+# Scenario tests only
+colcon test --packages-select ros2_medkit_integration_tests \
+  --ctest-args -L scenario
 ```
 
-<details>
-<summary>What a fault looks like</summary>
+## Demo Nodes
 
-<br>
-
-After a Nav2 goal is aborted:
-
-```jsonc
-// GET /api/v1/faults
-{
-  "items": [
-    { "fault_code": "ACTION_NAVIGATE_TO_POSE_ABORTED",
-      "severity_label": "ERROR", "status": "CONFIRMED",
-      "reporting_sources": ["/bt_navigator"] }
-  ],
-  "x-medkit": { "count": 1 }
-}
-```
-
-Each fault also keeps a snapshot of the moment it happened and a rosbag of the seconds around it:
+Launch all demo nodes for manual testing or the web UI:
 
 ```bash
-curl localhost:8080/api/v1/apps/bt_navigator/faults/ACTION_NAVIGATE_TO_POSE_ABORTED
-curl -O -J localhost:8080/api/v1/apps/bt_navigator/bulk-data/rosbags/ACTION_NAVIGATE_TO_POSE_ABORTED
+ros2 launch ros2_medkit_integration_tests demo_nodes.launch.py
 ```
 
-</details>
+| Node | Namespace | Type | Description |
+|------|-----------|------|-------------|
+| `temp_sensor` | `/powertrain/engine` | Publisher | Engine temperature (2 Hz) |
+| `rpm_sensor` | `/powertrain/engine` | Publisher | RPM readings (2 Hz) |
+| `pressure_sensor` | `/chassis/brakes` | Publisher | Brake pressure (2 Hz) |
+| `status_sensor` | `/body/door/front_left` | Publisher | Door open/closed (0.5 Hz) |
+| `lidar_sensor` | `/perception/lidar` | Publisher + Fault reporter | LaserScan with fault detection |
+| `actuator` | `/chassis/brakes` | Subscriber + Publisher | Brake actuator (command/feedback) |
+| `controller` | `/body/lights` | Subscriber + Publisher | Light controller (command/status) |
+| `calibration` | `/powertrain/engine` | Service | Trigger-based calibration |
+| `long_calibration` | `/powertrain/engine` | Action | Fibonacci-based long-running action |
+| `dual_calibration` | `/testrig/dual` | Services + Actions | `left/calibrate` and `right/calibrate`, `left/sweep` and `right/sweep` - one provider carrying each operation short name twice, so the ROS path is the only id that separates the copies |
 
-<details>
-<summary>Watch faults live, or add the web UI</summary>
+### Crash reports
 
-<br>
+Every demo binary installs a fatal-signal handler before anything else runs.
+Most get it from `run_demo_node()` in
+`include/ros2_medkit_integration_tests/demo_node_main.hpp`; the two that cannot
+use that helper - `unresponsive_param_node` and `managed_lifecycle_node`, which
+own their shutdown sequence - call `install_crash_backtrace()` themselves. A node killed by `SIGSEGV`,
+`SIGBUS` or `SIGABRT` writes its stack to stderr, so launch_testing captures it
+with the rest of the process output:
+
+```
+MEDKIT-CRASH signal=SIGSEGV
+/path/to/demo_brake_pressure_sensor(+0x129cb) [0x5603199349cb]
+/opt/ros/<distro>/lib/libfastdds.so.3(...) [0x...]
+MEDKIT-CRASH end
+```
+
+Grep a CI log for `MEDKIT-CRASH` to find one. Frames from our own binaries come
+back as `binary(+0xOFFSET)` because the release build has no exported symbols;
+resolve them with `addr2line -e <binary> <offset>`. The process still dies from
+the original signal, so the exit status a test asserts on is unchanged.
+
+This exists because a node that dies during startup otherwise leaves nothing at
+all: no output, and no core file, since a container cannot set the host's
+`core_pattern`.
+
+## Writing New Tests
+
+### Feature Test Template
+
+Feature tests validate a single API capability:
+
+```python
+from ros2_medkit_test_utils.gateway_test_case import GatewayTestCase
+from ros2_medkit_test_utils.launch_helpers import create_test_launch
+
+def generate_test_description():
+    return create_test_launch(
+        demo_nodes=['temp_sensor'],
+        fault_manager=False,
+    )
+
+class TestMyFeature(GatewayTestCase):
+    MIN_EXPECTED_APPS = 1
+    REQUIRED_APPS = {'temp_sensor'}
+
+    def test_something(self):
+        data = self.get_json('/apps')
+        self.assertGreater(len(data['items']), 0)
+```
+
+### Scenario Test Template
+
+Scenario tests exercise multi-step workflows with numbered test methods:
+
+```python
+class TestMyScenario(GatewayTestCase):
+    MIN_EXPECTED_APPS = 2
+    REQUIRED_APPS = {'lidar_sensor'}
+
+    def test_01_first_step(self):
+        """Step 1 description. @verifies REQ_XXX"""
+        ...
+
+    def test_02_second_step(self):
+        """Step 2 depends on step 1."""
+        ...
+```
+
+### Key GatewayTestCase Methods
+
+- `get_json(path)` -- GET request, assert 200, return parsed JSON
+- `delete_request(path, expected_status)` -- DELETE with status check
+- `assert_entity_exists(entity_type, entity_id)` -- GET entity, assert exists
+- `assert_entity_list_contains(entity_type, ids)` -- assert IDs in list
+- `wait_for_fault(endpoint, fault_code)` -- poll until fault appears
+- `wait_for_operation(endpoint, op_id)` -- poll until operation discovered
+- `create_execution(endpoint, op_id, input_data)` -- POST to create execution
+- `wait_for_execution_status(endpoint, statuses)` -- poll execution status
+
+## Requirements Traceability
+
+Tests are tagged with `# @verifies REQ_XXX` in docstrings. Run the
+verification script to update the traceability matrix:
 
 ```bash
-# Faults as they happen
-curl -N localhost:8080/api/v1/faults/stream
-
-# A dashboard in the browser: open http://localhost:3000, click Connect, enter http://localhost:8080
-docker run -p 3000:80 ghcr.io/selfpatch/ros2_medkit_web_ui:latest
+python scripts/generate_verification.py
 ```
-
-The browser calls the gateway from a different origin, so the gateway must allow that origin via
-CORS. The Docker image and `bringup.launch.py` allow `http://localhost:3000` and
-`http://localhost:5173`. The origin must match exactly: `http://127.0.0.1:3000` is not
-`http://localhost:3000`. To allow other origins, pass the full list, for example
-`cors_allowed_origins:=http://localhost:3000,http://127.0.0.1:3000` (it replaces the defaults).
-
-See the [web UI tutorial](https://selfpatch.github.io/ros2_medkit/tutorials/web-ui.html) and the
-[Postman collection](postman/).
-
-</details>
-
-<details>
-<summary>Install without Docker</summary>
-
-<br>
-
-ros2_medkit is on its way into the official ROS packages. Once it reaches your distro:
-
-```bash
-sudo apt install ros-jazzy-ros2-medkit-gateway   # or ros-humble- / ros-lyrical-
-ros2 launch ros2_medkit_gateway bringup.launch.py
-```
-
-To build from source or use Pixi, follow the
-[installation guide](https://selfpatch.github.io/ros2_medkit/installation.html).
-
-</details>
-
-<details>
-<summary>Troubleshooting</summary>
-
-<br>
-
-- Robot missing? Run ros2_medkit on the robot's computer, or one on the same network, from a
-  terminal where your ROS 2 setup works.
-- Opening it from another computer? Add `server_host:=0.0.0.0` to the end of the command in
-  step 2, on a network you trust, and use the robot's IP address instead of `localhost`.
-- Running it in a container without `--network host`? `bringup.launch.py` binds the REST API to
-  `127.0.0.1`, which is then the container's own loopback, and the published port answers with
-  `Connection reset by peer` or an empty reply. Add `server_host:=0.0.0.0` and publish the port as
-  `-p 127.0.0.1:8080:8080`, which keeps the API, unauthenticated by default, off the LAN.
-- No faults from `/diagnostics`? Add `enable_diagnostic_bridge:=true` to the end of the command
-  in step 2.
-- Still stuck? See [troubleshooting](https://selfpatch.github.io/ros2_medkit/troubleshooting.html)
-  or ask on [Discord](https://discord.gg/6CXPMApAyq).
-
-</details>
-
-## How it works
-
-<picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/how-it-works-dark.png"><img src="https://raw.githubusercontent.com/selfpatch/.github/main/profile/assets/ros2_medkit/how-it-works-light.png" alt="How it works. Your robot: error logs, failed actions, /diagnostics, and your own nodes through FaultReporter. ros2_medkit listens to logs, actions and diagnostics, records each fault with its history, a snapshot and a rosbag, and serves it all on one REST API, with every node it found. You read it from a browser, curl, the web UI or an AI assistant." width="100%"></picture>
-
-ros2_medkit listens to what your robot already publishes, so it works without code changes. For
-more control, report faults from your own nodes with the
-[`FaultReporter`](src/ros2_medkit_fault_reporter) client, see the
-[integration tutorial](https://selfpatch.github.io/ros2_medkit/tutorials/integration.html).
-The API follows SOVD (ISO 17978), the diagnostics standard from the automotive world.
-
-## Features
-
-- Finds every node, topic, service and action, with no config
-- Turns error logs, failed actions and `/diagnostics` into faults
-- Confirms each fault, keeps its history and clears it once it's fixed
-- Saves a snapshot and a rosbag of the moment each fault happened
-- Reads any topic as JSON, calls services and actions, and reads and sets parameters
-- Streams faults as they happen
-- Software updates through a plugin, and sign-in with per-user permissions
-- Rosbags open in whatever tool you already use to browse robot data
-
-<a name="vs-standard-ros-2-diagnostics"></a>
-
-## Compared with standard ROS 2 diagnostics
-
-ros2_medkit builds on them. It reads `/diagnostics` too, so keep your `diagnostic_updater` code.
-
-| | Standard ROS 2 diagnostics | ros2_medkit |
-|---|---|---|
-| Where you see it | A desktop app next to the robot | A REST API, from anywhere |
-| Code changes | Each node reports its own health | None needed |
-| What you get | OK, WARN, ERROR or STALE, right now | A fault that is confirmed, tracked and cleared once fixed |
-| When it breaks | Nothing is saved | A snapshot and a rosbag |
-| History | None | Saved, so you can look back |
-| Covers | ROS only | ROS today, PLCs and vehicle controllers through the same API |
-| AI assistants | No | Yes, through MCP |
-
-## Ecosystem
-
-- [ros2_medkit_web_ui](https://github.com/selfpatch/ros2_medkit_web_ui) - see your robot and its faults in the browser
-- [ros2_medkit_mcp](https://github.com/selfpatch/ros2_medkit_mcp) - let an AI assistant look into your robot
-- [ros2_medkit_clients](https://github.com/selfpatch/ros2_medkit_clients) - Python and TypeScript clients
-- [selfpatch_demos](https://github.com/selfpatch/selfpatch_demos) - ready-made demo robots, from a mobile robot to an arm
-
-## Documentation
-
-- [Documentation](https://selfpatch.github.io/ros2_medkit/) and the [step-by-step tutorial](https://selfpatch.github.io/ros2_medkit/getting_started.html)
-- [REST API reference](https://selfpatch.github.io/ros2_medkit/api/rest.html) and the [Postman collection](postman/)
-
-## Contributing
-
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md), pick a
-[good first issue](https://github.com/selfpatch/ros2_medkit/labels/good%20first%20issue), or ask on
-[Discord](https://discord.gg/6CXPMApAyq) and in [Discussions](https://github.com/selfpatch/ros2_medkit/discussions).
-Report security issues privately, see [SECURITY.md](SECURITY.md).
 
 ## License
 
-Apache License 2.0, see [LICENSE](LICENSE). ros2_medkit is built and maintained by
-[selfpatch.ai](https://selfpatch.ai).
+Apache-2.0
