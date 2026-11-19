@@ -1,0 +1,50 @@
+ros-lyrical-ros2-medkit-topic-beacon (0.7.2-1resolute) resolute; urgency=high
+
+  * No changes. Version aligned with the rest of the stack
+
+ -- "bburda" <bartoszburda93@gmail.com>  Thu, 19 Nov 2026 00:00:00 -0000
+
+ros-lyrical-ros2-medkit-topic-beacon (0.7.1-1resolute) resolute; urgency=high
+
+  * Configuration values are bounded: ``max_messages_per_second`` at 10000 (0.7.0 took any larger value, ``+inf`` too), ``beacon_ttl_sec`` and ``beacon_expiry_sec`` at 2147483647 s, and ``max_hints`` at 1..2147483647 (#660 <https://github.com/selfpatch/ros2_medkit/pull/660>)
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Wed, 18 Nov 2026 00:00:00 -0000
+
+ros-lyrical-ros2-medkit-topic-beacon (0.7.0-1resolute) resolute; urgency=high
+
+  * Build and test only: every integration launch test runs on its own DDS domain, taken when the test starts and released when it ends, so a crash frees the domain the same way an ordinary exit does (#551 <https://github.com/selfpatch/ros2_medkit/pull/551>, #597 <https://github.com/selfpatch/ros2_medkit/pull/597>). The usable band excludes the domains whose RTPS port slice falls inside the kernel ephemeral port range, where any process on the machine can steal a port and kill a node with a bind failure
+  * Build: the package is instrumented for coverage (#582 <https://github.com/selfpatch/ros2_medkit/pull/582>)
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Thu, 27 Aug 2026 00:00:00 -0000
+
+ros-lyrical-ros2-medkit-topic-beacon (0.6.0-1resolute) resolute; urgency=high
+
+  * No functional changes; version bump for the coordinated 0.6.0 release.
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Mon, 22 Jun 2026 00:00:00 -0000
+
+ros-lyrical-ros2-medkit-topic-beacon (0.5.0-1resolute) resolute; urgency=high
+
+  * Migrated ``TopicBeaconPlugin`` to the ``get_routes()`` plugin API
+  * Added shutdown guards and ``noexcept`` destructors (with ``override``) that reset rclcpp resources before member destruction, preventing teardown SIGSEGV
+  * Added post-shutdown guard unit tests
+  * Build: adopt the centralized ``ROS2MedkitWarnings`` cmake module
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Mon, 08 Jun 2026 00:00:00 -0000
+
+ros-lyrical-ros2-medkit-topic-beacon (0.4.0-1resolute) resolute; urgency=high
+
+  * Initial release - topic-based beacon discovery plugin
+  * ``TopicBeaconPlugin`` with push-based topic subscription for entity enrichment
+  * ``x-medkit-topic-beacon`` vendor extension REST endpoint
+  * Stamp-based TTL for topic beacon hints
+  * Diagnostic logging for beacon hint processing
+  * Contributors: @bburda
+
+ -- "bburda" <bartoszburda93@gmail.com>  Fri, 20 Mar 2026 00:00:00 -0000
+
+
