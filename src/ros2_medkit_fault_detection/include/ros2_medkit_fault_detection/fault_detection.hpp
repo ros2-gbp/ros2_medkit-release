@@ -1,0 +1,460 @@
+// Copyright 2026 mfaferek93
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+/// Shared fault-detection model for ros2_medkit protocol plugins.
+///
+/// A single, protocol-agnostic evaluator maps a raw value read from any
+/// source (OPC UA, S7, Modbus, ADS, ...) into the set of faults it implies,
+/// using one of three composable detection modes:
+///
+///   * threshold   - numeric above/below a setpoint.
+///   * status word - decode named bits of an integer status register.
+///   * fault enum  - map a fault-code register value to a fault code + text.
+///
+/// The evaluator (``evaluate``) is a pure function of ``(value, rule)`` and
+/// has no ROS / protocol dependencies, so it is trivially unit-testable and
+/// safe to compile into a dlopen-loaded plugin MODULE. Raise/clear edge
+/// detection is layered on top via ``FaultTransitionTracker``, and an optional
+/// ``RaiseQualifierFilter`` in between makes a rule wait for a condition to
+/// persist before it raises.
+///
+/// Header-only on purpose: protocol plugins are built as MODULE libraries
+/// that resolve gateway symbols from the host process at load time
+/// (``--unresolved-symbols=ignore-all``); a separately linked shared library
+/// would not be present in that host, so the detection logic is compiled
+/// directly into each plugin instead.
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <variant>
+#include <vector>
+
+namespace ros2_medkit::fault_detection {
+
+/// A raw value read from a protocol source.
+using Value = std::variant<bool, std::int64_t, double, std::string>;
+
+/// The identity + presentation of a fault a rule can raise.
+struct FaultSpec {
+  std::string fault_code;
+  std::string severity{"ERROR"};  // "INFO" / "WARNING" / "ERROR" / "CRITICAL"
+  std::string message;            // human-readable text; defaults to fault_code
+};
+
+/// Numeric threshold: raise ``fault`` when the value crosses ``threshold``.
+struct ThresholdRule {
+  FaultSpec fault;
+  double threshold{0.0};
+  bool above{true};  // true: active when value > threshold; false: value < threshold
+};
+
+/// One named bit of a status word.
+struct BitRule {
+  unsigned bit{0};  // bit position, 0 = least significant
+  FaultSpec fault;
+};
+
+/// Status-word decode: one integer register, many named-bit faults.
+struct StatusWordRule {
+  std::vector<BitRule> bits;
+  /// Source register width in bits. 0 = treat the decoded value as a full
+  /// 64-bit word (no masking). When set in [1, 63] the raw value is masked to
+  /// that width before decode, so a signed register read with its sign bit set
+  /// (which sign-extends into int64) does not light up spurious high bits.
+  unsigned width{0};
+};
+
+/// One entry of a fault-code enum register.
+struct EnumRule {
+  std::int64_t code{0};
+  FaultSpec fault;
+};
+
+/// Fault-code enum decode: a register value selects at most one fault.
+struct EnumMapRule {
+  std::vector<EnumRule> codes;
+  std::int64_t ok_value{0};  // value meaning "no fault" (no rule raised)
+  /// Catch-all raised when the register reports a non-ok value that matches no
+  /// configured code (firmware revisions routinely add codes the config has
+  /// not enumerated). Empty ``fault_code`` disables the catch-all. When its
+  /// ``message`` is empty the evaluator fills in "unmapped fault code <N>".
+  FaultSpec unknown_fault{};
+};
+
+/// One of the composable detection modes for a single mapped point.
+using DetectionRule = std::variant<ThresholdRule, StatusWordRule, EnumMapRule>;
+
+/// A fault the evaluator says is currently active or inactive for a value.
+/// The evaluator reports the full set of faults a rule governs (so a cleared
+/// fault is reported as ``active == false``); edge detection is done by
+/// ``FaultTransitionTracker``.
+struct FaultSignal {
+  std::string fault_code;
+  std::string severity;
+  std::string message;
+  bool active{false};
+};
+
+namespace detail {
+
+/// Coerce a value to double. bool -> 0/1, integers/doubles as-is. Strings are
+/// not numerically comparable here and yield ``false`` (handled by caller).
+inline bool as_double(const Value & v, double & out) {
+  return std::visit(
+      [&out](auto && x) -> bool {
+        using T = std::decay_t<decltype(x)>;
+        if constexpr (std::is_same_v<T, bool>) {
+          out = x ? 1.0 : 0.0;
+          return true;
+        } else if constexpr (std::is_same_v<T, std::int64_t> || std::is_same_v<T, double>) {
+          out = static_cast<double>(x);
+          return true;
+        } else {
+          return false;  // string
+        }
+      },
+      v);
+}
+
+/// Coerce a value to a 64-bit integer for bit / enum decode. bool -> 0/1,
+/// int as-is, double rounded to nearest. Non-finite doubles (NaN / inf) and
+/// doubles outside the int64 range are *undecidable* and yield ``false`` so the
+/// caller can hold state rather than fabricate garbage bits / enum codes (e.g.
+/// llround(+inf) is INT64_MAX, which would light up every status-word bit).
+/// Strings are not decodable.
+inline bool as_int(const Value & v, std::int64_t & out) {
+  return std::visit(
+      [&out](auto && x) -> bool {
+        using T = std::decay_t<decltype(x)>;
+        if constexpr (std::is_same_v<T, bool>) {
+          out = x ? 1 : 0;
+          return true;
+        } else if constexpr (std::is_same_v<T, std::int64_t>) {
+          out = x;
+          return true;
+        } else if constexpr (std::is_same_v<T, double>) {
+          // -2^63 (INT64_MIN, exact in double) .. 2^63 (one past INT64_MAX).
+          constexpr double kMin = -9223372036854775808.0;
+          constexpr double kMax = 9223372036854775808.0;
+          if (!std::isfinite(x) || x < kMin || x >= kMax) {
+            return false;
+          }
+          out = static_cast<std::int64_t>(std::llround(x));
+          return true;
+        } else {
+          return false;  // string
+        }
+      },
+      v);
+}
+
+inline FaultSignal make_signal(const FaultSpec & spec, bool active) {
+  FaultSignal s;
+  s.fault_code = spec.fault_code;
+  s.severity = spec.severity.empty() ? std::string{"ERROR"} : spec.severity;
+  s.message = spec.message.empty() ? spec.fault_code : spec.message;
+  s.active = active;
+  return s;
+}
+
+}  // namespace detail
+
+/// Evaluate a value against one detection rule.
+///
+/// Returns the full set of faults the rule governs, each flagged active or
+/// inactive. A threshold rule yields one signal; a status-word rule yields one
+/// per configured bit; an enum rule yields one per configured code (the
+/// matching code active, the rest inactive) plus an optional catch-all, so a
+/// transition tracker can clear the previous code and raise the new one.
+///
+/// Undecidable input holds state. A value that cannot be coerced for the rule -
+/// a non-finite double (NaN / inf, e.g. a disconnected analog sensor or a
+/// div-by-zero on the PLC) or an uncoercible value (a string, a failed numeric
+/// conversion) - yields an *empty* vector: the evaluator emits NO signal, so a
+/// ``FaultTransitionTracker`` preserves the prior state instead of clearing a
+/// standing fault. A bad read must never mask a real alarm.
+inline std::vector<FaultSignal> evaluate(const Value & value, const DetectionRule & rule) {
+  std::vector<FaultSignal> out;
+
+  std::visit(
+      [&](auto && r) {
+        using T = std::decay_t<decltype(r)>;
+
+        if constexpr (std::is_same_v<T, ThresholdRule>) {
+          if (std::holds_alternative<bool>(value)) {
+            // A boolean point honours the direction: above=true is
+            // alarm-on-true, above=false is alarm-on-false (a normally-closed
+            // contact, a watchdog-OK / ready bit whose FAULT state is false).
+            const bool b = std::get<bool>(value);
+            out.push_back(detail::make_signal(r.fault, r.above ? b : !b));
+          } else {
+            double d = 0.0;
+            if (detail::as_double(value, d) && std::isfinite(d)) {
+              out.push_back(detail::make_signal(r.fault, r.above ? (d > r.threshold) : (d < r.threshold)));
+            }
+            // else: undecidable (string / NaN / inf) -> emit nothing, hold last state.
+          }
+
+        } else if constexpr (std::is_same_v<T, StatusWordRule>) {
+          std::int64_t raw = 0;
+          if (!detail::as_int(value, raw)) {
+            return;  // undecidable -> emit nothing, hold last state
+          }
+          auto mask = static_cast<std::uint64_t>(raw);
+          if (r.width > 0 && r.width < 64) {
+            mask &= (1ULL << r.width) - 1ULL;  // ignore sign-extended high bits
+          }
+          for (const auto & b : r.bits) {
+            const bool active = b.bit < 64 && (((mask >> b.bit) & 0x1ULL) != 0ULL);
+            out.push_back(detail::make_signal(b.fault, active));
+          }
+
+        } else if constexpr (std::is_same_v<T, EnumMapRule>) {
+          std::int64_t code = 0;
+          if (!detail::as_int(value, code)) {
+            return;  // undecidable -> emit nothing, hold last state
+          }
+          const bool healthy = code == r.ok_value;
+          bool matched = false;
+          for (const auto & e : r.codes) {
+            const bool active = !healthy && code == e.code;
+            matched = matched || active;
+            out.push_back(detail::make_signal(e.fault, active));
+          }
+          // Catch-all so a non-ok value with no configured label stays visible
+          // rather than reading as healthy.
+          if (!r.unknown_fault.fault_code.empty()) {
+            const bool active = !healthy && !matched;
+            FaultSignal s = detail::make_signal(r.unknown_fault, active);
+            if (active && r.unknown_fault.message.empty()) {
+              s.message = "unmapped fault code " + std::to_string(code);
+            }
+            out.push_back(std::move(s));
+          }
+        }
+      },
+      rule);
+
+  return out;
+}
+
+/// Stateful raise/clear edge detector over a stream of evaluator outputs.
+///
+/// Feed each ``evaluate`` result through ``apply``; it returns only the
+/// signals whose active state changed since the last call (the raise and
+/// clear transitions), which a plugin forwards to the fault manager as
+/// report / clear. Keyed by ``fault_code``, so it tracks threshold, bit and
+/// enum faults uniformly.
+///
+/// Contract: a single tracker may be shared across many points only if every
+/// ``fault_code`` is globally unique. Because the key is the code alone, two
+/// points emitting the same code would alternately raise and clear it each
+/// cycle. Consumers that share one tracker (e.g. the OPC UA poller across all
+/// node-map entries) must enforce that uniqueness at config-load time.
+class FaultTransitionTracker {
+ public:
+  std::vector<FaultSignal> apply(const std::vector<FaultSignal> & signals) {
+    std::vector<FaultSignal> changes;
+    for (const auto & s : signals) {
+      auto it = last_active_.find(s.fault_code);
+      const bool known = it != last_active_.end();
+      if (!known || it->second != s.active) {
+        last_active_[s.fault_code] = s.active;
+        // A fault unknown-and-inactive is not a transition (nothing was ever
+        // raised); only emit a clear for a fault we had previously raised.
+        if (s.active || known) {
+          changes.push_back(s);
+        }
+      }
+    }
+    return changes;
+  }
+
+  /// Current active state of a fault (false if never seen).
+  bool active(const std::string & fault_code) const {
+    auto it = last_active_.find(fault_code);
+    return it != last_active_.end() && it->second;
+  }
+
+ private:
+  std::unordered_map<std::string, bool> last_active_;
+};
+
+/// How long a condition must hold before a rule may raise its fault.
+///
+/// ``evaluate`` judges one value, so a single noisy sample raises a fault. A
+/// qualifier makes the rule wait: the condition has to be seen on
+/// ``min_samples`` fresh samples in a row, and it has to stay true for
+/// ``min_duration`` without a break. When both are set, both must be met. The
+/// default (1 sample, 0 ms) raises on the first active sample, which is the
+/// behavior without a qualifier.
+///
+/// Only the raise waits. A clear still goes through on the first inactive
+/// sample, so a real recovery is never delayed.
+struct RaiseQualifier {
+  std::uint32_t min_samples{1};
+  std::chrono::milliseconds min_duration{0};
+
+  /// True when the qualifier does not delay anything.
+  bool immediate() const {
+    return min_samples <= 1 && min_duration.count() <= 0;
+  }
+
+  /// The same rule for a source that reports changes only (a subscription).
+  /// Such a source sends nothing while a value holds, so it has no samples to
+  /// count. ``min_samples`` samples ``sample_period`` apart span
+  /// ``(min_samples - 1) * sample_period``, so that becomes the wait, or
+  /// ``min_duration`` when it is longer. A ``sample_period`` that is not
+  /// positive turns the samples into no wait. The product saturates instead of
+  /// overflowing.
+  RaiseQualifier for_change_notifications(std::chrono::milliseconds sample_period) const {
+    RaiseQualifier out;
+    out.min_duration = min_duration;
+    if (min_samples > 1 && sample_period.count() > 0) {
+      const auto steps = static_cast<std::chrono::milliseconds::rep>(min_samples - 1);
+      const auto max = std::chrono::milliseconds::max().count();
+      const auto span = sample_period.count() > max / steps ? std::chrono::milliseconds::max()
+                                                            : std::chrono::milliseconds(sample_period.count() * steps);
+      out.min_duration = std::max(min_duration, span);
+    }
+    return out;
+  }
+};
+
+/// Applies a ``RaiseQualifier`` to evaluator output, between ``evaluate`` and
+/// ``FaultTransitionTracker``:
+///
+///     auto signals = evaluate(value, rule);
+///     auto qualified = filter.apply(signals, qualifier, now, fresh);
+///     auto edges = tracker.apply(qualified);
+///
+/// While a fault waits to qualify, its signal goes out as inactive, so the
+/// tracker raises nothing and a status view shows the fault as not active.
+/// Once it qualifies, the signal passes through until the condition goes away.
+///
+/// ``fresh`` tells the filter whether this call carries a new sample of the
+/// point. Only a fresh sample counts toward ``min_samples``. A call that is not
+/// fresh still lets ``min_duration`` complete, so a caller that is told about
+/// changes only (a subscription) can call again on a timer and a condition
+/// that holds steady still raises once its time is up. A caller must not pass
+/// ``fresh = false`` for a value it could not read: that is unknown, not
+/// unchanged, and should not be passed at all.
+///
+/// A signal that is missing from a call (the evaluator returned nothing for an
+/// undecidable value) keeps its waiting state as it is. A bad read neither
+/// raises a fault nor throws away the time already waited.
+///
+/// Keyed by ``fault_code``, with the same uniqueness contract as
+/// ``FaultTransitionTracker``.
+class RaiseQualifierFilter {
+ public:
+  using Clock = std::chrono::steady_clock;
+
+  std::vector<FaultSignal> apply(const std::vector<FaultSignal> & signals, const RaiseQualifier & qualifier,
+                                 Clock::time_point now, bool fresh = true) {
+    if (qualifier.immediate()) {
+      // Nothing to wait for: pass through untouched, keep no state.
+      return signals;
+    }
+    std::vector<FaultSignal> out;
+    out.reserve(signals.size());
+    for (const auto & s : signals) {
+      if (!s.active) {
+        // Condition gone: drop any waiting or raised state, so the next raise
+        // has to qualify again from the start.
+        states_.erase(s.fault_code);
+        out.push_back(s);
+        continue;
+      }
+      auto it = states_.find(s.fault_code);
+      if (it == states_.end()) {
+        if (!fresh) {
+          // A repeat of a value nobody saw arrive starts nothing: the time
+          // before it was not observed.
+          out.push_back(inactive(s));
+          continue;
+        }
+        it = states_.emplace(s.fault_code, State{now, 0, false}).first;
+      }
+      State & st = it->second;
+      if (!st.raised) {
+        if (fresh && st.samples < qualifier.min_samples) {
+          ++st.samples;
+        }
+        const bool enough_samples = st.samples >= qualifier.min_samples;
+        // Compare in milliseconds: converting a large min_duration to the
+        // clock's nanoseconds would overflow.
+        const bool long_enough =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - st.since) >= qualifier.min_duration;
+        st.raised = enough_samples && long_enough;
+      }
+      out.push_back(st.raised ? s : inactive(s));
+    }
+    return out;
+  }
+
+  /// Forget every fault that is still waiting to qualify. Faults that already
+  /// qualified stay raised. Call it when the source stops being observed (a
+  /// lost connection), so time spent blind is not counted toward a raise.
+  void reset_pending() {
+    for (auto it = states_.begin(); it != states_.end();) {
+      if (it->second.raised) {
+        ++it;
+      } else {
+        it = states_.erase(it);
+      }
+    }
+  }
+
+  /// True while some fault is waiting to qualify. A caller that is only told
+  /// about changes uses this to decide whether it needs to call again on a timer.
+  bool has_pending() const {
+    for (const auto & entry : states_) {
+      if (!entry.second.raised) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// True while ``fault_code`` is waiting to qualify.
+  bool pending(const std::string & fault_code) const {
+    auto it = states_.find(fault_code);
+    return it != states_.end() && !it->second.raised;
+  }
+
+ private:
+  struct State {
+    Clock::time_point since;  // first active sample of this run
+    std::uint32_t samples;    // fresh active samples seen in this run, capped at min_samples
+    bool raised;              // the qualifier was met and the signal passes through
+  };
+
+  static FaultSignal inactive(const FaultSignal & s) {
+    FaultSignal copy = s;
+    copy.active = false;
+    return copy;
+  }
+
+  std::unordered_map<std::string, State> states_;
+};
+
+}  // namespace ros2_medkit::fault_detection
