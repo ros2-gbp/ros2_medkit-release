@@ -1,0 +1,12 @@
+Source: ros-lyrical-ros2-medkit-serialization
+Section: misc
+Priority: optional
+Maintainer: "bburda" <bartoszburda93@gmail.com>
+Build-Depends: debhelper (>= 9.0.0), nlohmann-json3-dev, ros-lyrical-ament-cmake, ros-lyrical-ament-cmake-clang-format <!nocheck>, ros-lyrical-ament-cmake-clang-tidy <!nocheck>, ros-lyrical-ament-cmake-gtest <!nocheck>, ros-lyrical-ament-lint-auto <!nocheck>, ros-lyrical-ament-lint-common <!nocheck>, ros-lyrical-geometry-msgs <!nocheck>, ros-lyrical-rclcpp, ros-lyrical-rcpputils, ros-lyrical-rcutils, ros-lyrical-ros2-medkit-cmake, ros-lyrical-rosidl-runtime-c, ros-lyrical-rosidl-runtime-cpp, ros-lyrical-rosidl-typesupport-introspection-c, ros-lyrical-rosidl-typesupport-introspection-cpp, ros-lyrical-sensor-msgs <!nocheck>, ros-lyrical-std-msgs <!nocheck>, ros-lyrical-std-srvs <!nocheck>, ros-lyrical-test-msgs <!nocheck>, ros-lyrical-yaml-cpp-vendor, ros-lyrical-ros-workspace
+Homepage: https://index.ros.org/p/ros2_medkit_serialization/#lyrical
+Standards-Version: 3.9.2
+
+Package: ros-lyrical-ros2-medkit-serialization
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, nlohmann-json3-dev, ros-lyrical-rclcpp, ros-lyrical-rcpputils, ros-lyrical-rcutils, ros-lyrical-rosidl-runtime-c, ros-lyrical-rosidl-runtime-cpp, ros-lyrical-rosidl-typesupport-introspection-c, ros-lyrical-rosidl-typesupport-introspection-cpp, ros-lyrical-yaml-cpp-vendor, ros-lyrical-ros-workspace
+Description: Runtime JSON to ROS 2 message serialization library
